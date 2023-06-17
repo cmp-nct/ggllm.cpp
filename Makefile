@@ -190,6 +190,31 @@ ggml-opencl.o: ggml-opencl.cpp ggml-opencl.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 endif # LLAMA_CLBLAST
 
+ROCM_PATH=/opt/rocm
+
+ifdef LLAMA_HIBLAS
+	CFLAGS    += -I$(ROCM_PATH)/include -DGGML_USE_CUBLAS
+	CXXFLAGS  += -I$(ROCM_PATH)/include -DGGML_USE_CUBLAS
+	LDFLAGS   += -L$(ROCM_PATH)/lib -lhiprtc -lpthread -lhipsolver -lrocalution_hip -lamd_comgr -lhipsparse -lrocalution -lrocrand -lamdhip64 -lrocblas -lamdocl64 -lhipblas -lhsakmt -lhsa-runtime64 -lhipfft -lhipfort-amdgcn -lhipfort-nvptx -lhiprand -lhiprtc-builtins -lhiprtc -lrocm-core -lroctracer64 -lMIOpen -loam -lrocm-dbgapi -lroctx64  -lrccl -lrocm_smi64 
+	OBJS      += ggml-cuda.o
+	HIPCC      = hipcc
+	HIPCCFLAGS = -march=native
+
+ifdef LLAMA_HIP_DMMV_X
+	HIPCCFLAGS += -DGGML_CUDA_DMMV_X=$(LLAMA_HIP_DMMV_X)
+else
+	HIPCCFLAGS += -DGGML_CUDA_DMMV_X=32
+endif # LLAMA_CUDA_DMMV_X
+ifdef LLAMA_HIP_DMMV_Y
+	HIPCCFLAGS += -DGGML_CUDA_DMMV_Y=$(LLAMA_HIP_DMMV_Y)
+else
+	HIPCCFLAGS += -DGGML_CUDA_DMMV_Y=1
+endif # LLAMA_HIP_DMMV_Y
+ggml-cuda.o: ggml-cuda.hip ggml-cuda.h
+	$(HIPCC) $(HIPCCFLAGS) $(CXXFLAGS) -Wno-pedantic -c $< -o $@
+
+endif # LLAMA_HIBLAS
+
 ifdef LLAMA_METAL
 	CFLAGS   += -DGGML_USE_METAL -DGGML_METAL_NDEBUG
 	CXXFLAGS += -DGGML_USE_METAL
