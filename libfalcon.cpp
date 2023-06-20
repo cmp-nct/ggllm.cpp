@@ -45,6 +45,11 @@
 #include <sstream>
 #include <numeric>
 
+#if defined(_MSC_VER)
+// disable "possible loss of data" 
+#pragma warning(disable: 4244 4267)
+#endif
+
 #define LLAMA_USE_SCRATCH
 #define LLAMA_MAX_SCRATCH_BUFFERS 16
 

@@ -219,10 +219,19 @@ extern "C" {
 #else
     typedef uint16_t ggml_fp16_t;
 #endif
-    typedef long LONG;
-    typedef volatile LONG atomic_int;
-    typedef atomic_int atomic_bool;
 
+// we need atomic support for the param struct - this needs to be improved
+#if defined(_WIN32) 
+    typedef volatile long atomic_int;
+    typedef atomic_int atomic_bool;
+#else
+    #ifndef __cplusplus
+    #include <stdatomic.h>
+    #else
+    typedef volatile long atomic_int;
+    typedef atomic_int atomic_bool;
+    #endif
+#endif
     // convert FP16 <-> FP32
     GGML_API float       ggml_fp16_to_fp32(ggml_fp16_t x);
     GGML_API ggml_fp16_t ggml_fp32_to_fp16(float x);

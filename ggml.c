@@ -44,8 +44,10 @@
 #if defined(_WIN32)
 
 #include <windows.h>
-
-
+#ifndef atomic_int
+typedef volatile LONG atomic_int;
+typedef atomic_int atomic_bool;
+#endif
 
 static void atomic_store(atomic_int* ptr, LONG val) {
     InterlockedExchange(ptr, val);
