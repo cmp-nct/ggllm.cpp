@@ -1530,6 +1530,7 @@ void ggml_cuda_update_gpu_status(int device_id) {
                 CUDA_CHECK(cudaGetDeviceProperties(&g_system_gpu_status.device_props[id], id));
             }
         }
+        g_system_gpu_status.total_vram = 0;
         g_system_gpu_status.total_free_vram = 0;
         for (int id = 0; id < g_system_gpu_status.num_devices; ++id) {
             CUDA_CHECK(cudaSetDevice(id));
