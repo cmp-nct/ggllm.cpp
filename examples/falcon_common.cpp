@@ -329,6 +329,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                     params.tensor_split[i] = 0.0f;
                 }
             }
+            ggml_cuda_set_tensor_split_prepare(params.tensor_split,split_arg.size());
 #else
       fprintf(stderr, "warning: falcon.cpp was compiled without cuBLAS. It is not possible to set a tensor split.\n");
 #endif // GGML_USE_CUBLAS

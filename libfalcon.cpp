@@ -1194,8 +1194,8 @@ static void falcon_model_load_internal(
 
     (void) main_gpu;
 #if defined(GGML_USE_CUBLAS)
-if (n_gpu_layers > 0)
-    fprintf(stderr, "%s: using CUDA for GPU acceleration\n", __func__);
+    if (n_gpu_layers > 0)
+        fprintf(stderr, "%s: using CUDA for GPU acceleration\n", __func__);
     ggml_cuda_set_main_device(main_gpu);
 #define LLAMA_BACKEND_OFFLOAD       GGML_BACKEND_GPU
 #define LLAMA_BACKEND_OFFLOAD_SPLIT GGML_BACKEND_GPU_SPLIT
@@ -1208,24 +1208,27 @@ if (n_gpu_layers > 0)
 #define LLAMA_BACKEND_OFFLOAD_SPLIT GGML_BACKEND_CPU
 #endif
 
-    size_t vram_total=0;
-    size_t vram_free=0;
-    const size_t vram_reserved=512*MB;    // that amount of VRAM is to stay free on GPU (headroom for other processes - may be reduced in pure server environments)
-    size_t vram_overhead = 1250*MB; // this amount of vram is estimated for non weight storage buffers on VRAM (no big difference between 7B and 40B, needs to increase when  more work is offloaded in the future)
+    
+    const size_t vram_reserved=512*MB;    // that amount of VRAM is to stay free on GPU (needs to become a user parameter)
+    size_t vram_overhead = 1250*MB; // this amount of vram is estimated for non weight storage buffers on VRAM
+    size_t vram_free = 0; // for vram simulation below
+    size_t vram_total = 0; // for vram simulation below
 #if defined(GGML_USE_CUBLAS)
+    const GPUStatus *system_gpu_status = ggml_cuda_get_system_gpu_status();
+    vram_free = system_gpu_status->total_free_vram;
+    vram_total = system_gpu_status->total_vram;
     // cublas is used in 32 bit mode, temporary cuda storage/conversion buffers are needed for batch ingestion ( could be run in 16 bit mode without performance downgrade and save half the VRAM)
     if (model.type == FALCON_40B && n_batch > 1)
     {
-        vram_overhead += (1024 + 288 + 256) * MB;
-        fprintf(stderr, "%s: INFO: using n_batch (-b) > 1 will require additional VRAM of: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
+        vram_overhead += (1024 + 288 + 256) * MB; // todo: when can manually create one 1024 buffer manually, saves 500+mb vram
+        fprintf(stderr, "%s: INFO: using n_batch > 1 will require additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
     }
     if (model.type == FALCON_7B && n_batch > 1)
     {
-        vram_overhead += (315 + 80 + 78) * MB;
-        fprintf(stderr, "%s: INFO: using n_batch (-b) > 1 will require additional VRAM of: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
+        vram_overhead += (315 + 80 + 78) * MB; // todo: manually create a 315mb buffer, saves 160mb vram
+        fprintf(stderr, "%s: INFO: using n_batch > 1 will require additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
     }
-    cudaMemGetInfo(&vram_free, &vram_total); // this should go in ggml-cuda.cu but I don't want to make Johannes life harder by modifying that yet
-    fprintf(stderr, "%s: VRAM free: %7.2f MB  of %7.2f MB (in use: %7.2f MB)\n", __func__, vram_free/MB*1.0, vram_total/MB*1.0, (vram_total-vram_free)/MB*1.0);
+    fprintf(stderr, "%s: VRAM free: %7.2f MB  of %7.2f MB (in use: %7.2f MB)\n", __func__, system_gpu_status->total_free_vram/MB*1.0, system_gpu_status->total_vram/MB*1.0, (system_gpu_status->total_vram-system_gpu_status->total_free_vram)/MB*1.0);
 #endif
 
     // prepare memory for the weights
@@ -1410,7 +1413,9 @@ if (n_gpu_layers > 0)
 
     #if defined(GGML_USE_CUBLAS)
     //size_t vram_free_simulated = vram_free;
-    cudaMemGetInfo(&vram_free, &vram_total); // this should go in ggml-cuda.cu but I don't want to make Johannes life harder by modifying that yet
+    ggml_cuda_update_gpu_status(-1);
+    vram_free = system_gpu_status->total_free_vram;
+    vram_total= system_gpu_status->total_vram;
     fprintf(stderr, "%s: VRAM free: %7.2f MB  of %7.2f MB (used: %7.2f MB)\n", __func__, vram_free/MB*1.0, vram_total/MB*1.0, (vram_total-vram_free)/MB*1.0);
 
     #endif
