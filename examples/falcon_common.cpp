@@ -322,13 +322,20 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             std::sregex_token_iterator it{arg_next.begin(), arg_next.end(), regex, -1};
             std::vector<std::string> split_arg{it, {}};
             GGML_ASSERT(split_arg.size() <= LLAMA_MAX_DEVICES);
-
+            bool all_zero = true;
             for (size_t i = 0; i < LLAMA_MAX_DEVICES; ++i) {
                 if (i < split_arg.size()) {
                     params.tensor_split[i] = std::stof(split_arg[i]);
+                    if (params.tensor_split[i] != 0.0f) {
+                        all_zero = false;
+                    }
                 } else {
                     params.tensor_split[i] = 0.0f;
                 }
+            }
+            if (all_zero) {
+                fprintf(stderr, "Error: all tensor split proportions are zero\n");
+                exit(1);
             }
             ggml_cuda_set_tensor_split_prepare(params.tensor_split,split_arg.size());
 #else
@@ -417,6 +424,21 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
     if (escape_prompt) {
         process_escapes(params.prompt);
     }
+
+
+      bool all_zero = true;
+        for (size_t i = 0; i < LLAMA_MAX_DEVICES; ++i) {
+            if (params.tensor_split[i] != 0.0f) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (!all_zero) {
+            if (params.tensor_split[params.main_gpu] == 0.0f) {
+                fprintf(stderr, "Error: main GPU cannot have a tensor split proportion of zero.\n");
+                exit(1);
+            }
+        }
 
     return true;
 }

@@ -2,8 +2,9 @@ cmake_minimum_required(VERSION 3.12) # Don't bump this version for no reason
 # If CUDA toolkit is not found using msvc compiler switch to Community Edition (same compiler, just other kit..)
 project("ggllm.cpp" C CXX)
 add_definitions(-DGGML_PERF=1) # use "--debug-timings 1-3" to enable timing output
-include_directories("C:/program files/NVIDIA GPU Computing Toolkit/CUDA/v12.0/include")
-include_directories("C:/program files/NVIDIA GPU Computing Toolkit/CUDA/v12.0/lib/x64")
+# include_directories("C:/program files/NVIDIA GPU Computing Toolkit/CUDA/v12.0/include")
+# include_directories("C:/program files/NVIDIA GPU Computing Toolkit/CUDA/v12.0/lib/x64")
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if (NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)

@@ -14615,7 +14615,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
     if (tensor->src0->backend != GGML_BACKEND_CPU) 
-    printf("%s src0->backend != GGML_BACKEND_CPU (%s; %s)\n", ggml_op_name  (tensor->op),tensor->name,tensor->src0->src0->name);
+        printf("%s src0->backend != GGML_BACKEND_CPU (%s, %s)\n", ggml_op_name(tensor->op),tensor->name, tensor->src0->name);
     GGML_ASSERT(tensor->src0->backend == GGML_BACKEND_CPU);
     GGML_ASSERT(tensor->src1 == NULL || tensor->src1->backend == GGML_BACKEND_CPU);
 #endif // GGML_USE_CUBLAS

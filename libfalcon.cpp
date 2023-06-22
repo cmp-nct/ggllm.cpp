@@ -1269,7 +1269,8 @@ static void falcon_model_load_internal(
         if (n_gpu_layers == 0) offload_output = false;
 
         if (offload_output) { // NOLINT
-            backend_norm = LLAMA_BACKEND_OFFLOAD; // not used yet but tiny tensor
+            // backend_norm = LLAMA_BACKEND_OFFLOAD; // this requires REPEAT on GPU (in f7b)
+            backend_norm = GGML_BACKEND_CPU; 
             backend_output = LLAMA_BACKEND_OFFLOAD_SPLIT;
         } else {
             backend_norm = GGML_BACKEND_CPU;
