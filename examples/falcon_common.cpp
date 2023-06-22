@@ -306,7 +306,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
 #ifdef GGML_USE_CUBLAS
             params.main_gpu = std::stoi(argv[i]);
 #else
-      fprintf(stderr, "warning: llama.cpp was compiled without cuBLAS. It is not possible to set a main GPU.\n");
+      fprintf(stderr, "warning: falcon.cpp was compiled without cuBLAS. It is not possible to set a main GPU.\n");
 #endif
         } else if (arg == "--tensor-split" || arg == "-ts") {
             if (++i >= argc) {
@@ -330,7 +330,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 }
             }
 #else
-      fprintf(stderr, "warning: llama.cpp was compiled without cuBLAS. It is not possible to set a tensor split.\n");
+      fprintf(stderr, "warning: falcon.cpp was compiled without cuBLAS. It is not possible to set a tensor split.\n");
 #endif // GGML_USE_CUBLAS
         } else if (arg == "--no-mmap") {
             params.use_mmap = false;

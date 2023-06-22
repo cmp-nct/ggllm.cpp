@@ -69,7 +69,7 @@ extern "C" {
         bool sorted;
     } llama_token_data_array;
 
-    typedef void (*llama_progress_callback)(float progress, void *ctx);
+    typedef void (*falcon_progress_callback)(float progress, void *ctx, char *status);
 
     struct falcon_context_params {
         int n_ctx;                             // text context
@@ -89,7 +89,7 @@ extern "C" {
         bool embedding;  // embedding mode only
 
         // called with a progress value between 0 and 1, pass NULL to disable
-        llama_progress_callback progress_callback;
+        falcon_progress_callback progress_callback;
         // context pointer passed to the progress callback
         void * progress_callback_user_data;
     };

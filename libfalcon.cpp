@@ -768,7 +768,7 @@ struct llama_model_loader {
         }
     }
 
-    void load_all_data(llama_progress_callback progress_callback, void *  progress_callback_user_data, llama_mlock * lmlock) {
+    void load_all_data(falcon_progress_callback progress_callback, void *  progress_callback_user_data, llama_mlock * lmlock) {
         size_t data_size = 0;
         size_t prefetch_size = 0;
         size_t lock_size = 0;
@@ -789,7 +789,15 @@ struct llama_model_loader {
         size_t done_size = 0;
         for (falcon_load_tensor & lt : tensors_map.tensors) {
             if (progress_callback) {
-                progress_callback((float) done_size / data_size, progress_callback_user_data);
+                char *status="";
+                if (lt.ggml_tensor->backend == GGML_BACKEND_CPU) 
+                    status = "Loading tensor (CPU)";
+                else if (lt.ggml_tensor->backend == GGML_BACKEND_GPU)
+                    status = "Loading tensor (GPU-Main)";
+                else if (lt.ggml_tensor->backend == GGML_BACKEND_GPU_SPLIT)
+                    status = "Loading tensor (GPU-Split)";
+
+                progress_callback((float) done_size / data_size, progress_callback_user_data,status);
             }
             LLAMA_ASSERT(lt.ggml_tensor); // unused tensors should have been caught by load_data already
             lt.data = (uint8_t *) lt.ggml_tensor->data;
@@ -1084,7 +1092,7 @@ static void falcon_model_load_internal(
         bool use_mmap,
         bool use_mlock,
         bool vocab_only,
-        llama_progress_callback progress_callback,
+        falcon_progress_callback progress_callback,
         void * progress_callback_user_data) {
 
     lctx.t_start_us = ggml_time_us(); 
@@ -1253,9 +1261,12 @@ if (n_gpu_layers > 0)
        
         ggml_backend backend_norm;
         ggml_backend backend_output;
-        // disabled norm/output offloading until further tests, causes silent crash at the moment
-        if (n_gpu_layers > int(n_layer) && false) { // NOLINT
-            backend_norm = LLAMA_BACKEND_OFFLOAD;
+        // output layer offloading is on by default now, it's one of the biggest CPU consumers
+        bool offload_output = true;
+        if (n_gpu_layers == 0) offload_output = false;
+
+        if (offload_output) { // NOLINT
+            backend_norm = LLAMA_BACKEND_OFFLOAD; // not used yet but tiny tensor
             backend_output = LLAMA_BACKEND_OFFLOAD_SPLIT;
         } else {
             backend_norm = GGML_BACKEND_CPU;
@@ -1279,6 +1290,7 @@ if (n_gpu_layers > 0)
         {
             vram_weights += ggml_nbytes(model.lm_head);
             vram_free -= ggml_nbytes(model.lm_head);
+            fprintf(stderr, "%s: Offloading Output head tensor (%ld MB)\n", __func__, ggml_nbytes(model.lm_head)/MB);
         }
 
         int i_gpu_start = n_layer - n_gpu_layers;
@@ -1370,9 +1382,6 @@ if (n_gpu_layers > 0)
 
         fprintf(stderr, "%s: offloading %d of %d layers to GPU, weights offloaded %7.2f MB\n",
                 __func__, n_gpu, hparams.n_layer, vram_weights / 1024.0 / 1024.0);
-        if (n_gpu_layers > (int) hparams.n_layer) {
-            fprintf(stderr, "%s: offloading output layer to GPU\n", __func__);
-        }
         fprintf(stderr, "%s: estimated VRAM usage: %zu MB\n",
                 __func__, (vram_weights + vram_scratch + vram_overhead + MB - 1) / MB); // round up
 #else
@@ -1388,6 +1397,7 @@ if (n_gpu_layers > 0)
     (void) tensor_split;
 #if defined(GGML_USE_CUBLAS)
     {
+        // optional tensor split by custom parameters if defined
         ggml_cuda_set_tensor_split(tensor_split);
     }
 #endif
@@ -1395,7 +1405,7 @@ if (n_gpu_layers > 0)
     ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &lctx.model.mlock_mmap : NULL);
 
     if (progress_callback) {
-        progress_callback(1.0f, progress_callback_user_data);
+        progress_callback(1.0f, progress_callback_user_data,"Tensors populated");
     }
 
     #if defined(GGML_USE_CUBLAS)
@@ -1426,7 +1436,7 @@ static bool falcon_model_load(
         bool use_mmap,
         bool use_mlock,
         bool vocab_only,
-        llama_progress_callback progress_callback,
+        falcon_progress_callback progress_callback,
         void *progress_callback_user_data) {
     try {
         falcon_model_load_internal(fname, lctx, n_ctx, n_batch, n_gpu_layers, main_gpu, tensor_split, memory_type,
@@ -1521,7 +1531,7 @@ static bool falcon_eval_internal(
     offload_func_t offload_func_kqv = llama_nop;
 
 #ifdef GGML_USE_CUBLAS
-        // todo: use either a flag in model/params or a backend test to determine if norm/output are on GPU
+        // todo: instead of n_layer use either a flag in model/params or a backend test to determine if norm/output are on GPU
         if (n_gpu_layers > n_layer) {
             offload_func_nr = ggml_cuda_assign_buffers;
         }
@@ -1535,7 +1545,7 @@ static bool falcon_eval_internal(
         offload_func_t offload_func = llama_nop;
 
 #ifdef GGML_USE_CUBLAS
-        if (il >= i_gpu_start && il < i_gpu_last) {
+        if (il >= i_gpu_start && il <= i_gpu_last) {
             offload_func = ggml_cuda_assign_buffers; // sets the output backend to GPU
         }
 #endif // GGML_USE_CUBLAS
@@ -1831,7 +1841,8 @@ static bool falcon_eval_internal(
             if ((first && debug_timings <=2) || debug_timings > 2)
             {
                 first = false;
-                ggml_graph_print_impl(&gf,true,false,GGML_OP_NONE); // GGML_OP_MUL_MAT
+                // ggml_graph_print_impl(&gf,true,false,GGML_OP_MUL_MAT); // GGML_OP_MUL_MAT / GGML_OP_NONE
+                ggml_graph_print_impl(&gf,true,false,GGML_OP_NONE); // GGML_OP_MUL_MAT / GGML_OP_NONE
             }
         }
         // requires GGML_PERF to be defined for actual timing information
@@ -2751,15 +2762,37 @@ struct falcon_context * falcon_init_from_file(
 
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
-        params.progress_callback_user_data = &cur_percentage;
-        params.progress_callback = [](float progress, void * ctx) {
-            unsigned * cur_percentage_p = (unsigned *) ctx;
+        params.progress_callback_user_data = &cur_percentage; // not sure why this is so complicated ? I left it for now
+        params.progress_callback = [](float progress, void * ctx, char *status) {
             unsigned percentage = (unsigned) (100 * progress);
-            while (percentage > *cur_percentage_p) {
+            unsigned * cur_percentage_p = (unsigned *) ctx;
+            static const int bar_width = 50;
+            bool completed = false;
+            if (percentage >= 100) {
+                completed = true;
+                if (!strlen(status))
+                status = "Completed";
+            }
+
+            if (percentage > *cur_percentage_p) {
                 *cur_percentage_p = percentage;
-                fprintf(stderr, ".");
+                fprintf(stderr, "\r["); // using '\r' to overwrite the current line
+                int progress_position = percentage * bar_width / 100;
+                for (int i = 0; i < bar_width; ++i) {
+                    if (i < progress_position) {
+                        fprintf(stderr, "=");
+                    } else if (i == progress_position) {
+                        fprintf(stderr, ">");
+                    } else {
+                        fprintf(stderr, "-");
+                    }
+                }
+
+                fprintf(stderr, "] %3u%%  %-30s", percentage, status);
+
+                
                 fflush(stderr);
-                if (percentage >= 100) {
+                if (completed) {
                     fprintf(stderr, "\n");
                 }
             }

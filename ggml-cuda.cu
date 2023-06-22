@@ -1505,6 +1505,7 @@ static size_t g_scratch_offset = 0;
 
 static int g_device_count = -1;
 static int g_main_device = 0;
+// Note: tensor_split defines the breakpoints. {0,0.5} means to offload on GPU 0 until 50% global vram used
 static float g_tensor_split[GGML_CUDA_MAX_DEVICES] = {0};
 
 static cublasHandle_t g_cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
@@ -1513,7 +1514,8 @@ static cudaStream_t g_cudaStreams_main[GGML_CUDA_MAX_DEVICES] = { nullptr };
 
 void ggml_init_cublas() {
     static bool initialized = false;
-
+    int currentDevice = 0;
+    CUDA_CHECK(cudaGetDevice(&currentDevice));
     if (!initialized) {
         CUDA_CHECK(cudaGetDeviceCount(&g_device_count));
         GGML_ASSERT(g_device_count <= GGML_CUDA_MAX_DEVICES);
@@ -1524,8 +1526,13 @@ void ggml_init_cublas() {
             CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
             fprintf(stderr, "  Device %d: %s\n", id, prop.name);
             g_tensor_split[id] = total_vram;
-            total_vram += prop.totalGlobalMem;
+            size_t vram_free, vram_total;
+            CUDA_CHECK(cudaSetDevice(id));
+            CUDA_CHECK(cudaMemGetInfo(&vram_free, &vram_total)); 
+            // total_vram += prop.totalGlobalMem; // that won't work if memory is occupied on one GPU (which is always the case on desktops)
+            total_vram += vram_free;
         }
+
         for (int id = 0; id < g_device_count; ++id) {
             g_tensor_split[id] /= total_vram;
         }
@@ -1540,6 +1547,7 @@ void ggml_init_cublas() {
             CUBLAS_CHECK(cublasCreate(&g_cublas_handles[id]));
             CUBLAS_CHECK(cublasSetMathMode(g_cublas_handles[id], CUBLAS_TF32_TENSOR_OP_MATH));
         }
+        CUDA_CHECK(cudaSetDevice(currentDevice));
 
         // configure logging to stdout
         // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
@@ -1547,7 +1555,7 @@ void ggml_init_cublas() {
         initialized = true;
     }
 }
-
+// expect array of floats where to split each device id, if all 0.0 then no change to default split
 void ggml_cuda_set_tensor_split(const float * tensor_split) {
     bool all_zero = true;
     for (int i = 0; i < g_device_count; ++i) {
