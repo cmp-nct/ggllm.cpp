@@ -305,6 +305,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             }
 #ifdef GGML_USE_CUBLAS
             params.main_gpu = std::stoi(argv[i]);
+            ggml_cuda_set_main_device(params.main_gpu);
 #else
       fprintf(stderr, "warning: falcon.cpp was compiled without cuBLAS. It is not possible to set a main GPU.\n");
 #endif

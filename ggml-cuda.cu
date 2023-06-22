@@ -1503,7 +1503,7 @@ static void * g_scratch_buffer = nullptr;
 static size_t g_scratch_size = 1024*1024*1024; // 1 GB by default
 static size_t g_scratch_offset = 0;
 
-// Note: tensor_split defines the breakpoints. {0,0.5} means to offload on GPU 0 until 50% global vram used
+// Note: tensor_split defines the breakpoints of tensors that can be split {0,0.5}
 static float g_tensor_split[GGML_CUDA_MAX_DEVICES] = {0};
 static GPUStatus g_system_gpu_status;
 
@@ -1558,6 +1558,18 @@ void ggml_cuda_update_gpu_status(int device_id) {
             CUDA_CHECK(cudaSetDevice(currentDevice));
         }
     }
+    
+#if 1
+    // required for proper vram distribution but split tensors require memory on primary GPU which could be disabled
+    // remove unused GPUs from available calculation
+    for (int id = 0; id < g_system_gpu_status.num_devices; ++id) {
+        if (g_tensor_split[id] >= 1.0 || (id > 0 && g_tensor_split[id] == g_tensor_split[id-1])) {
+            g_system_gpu_status.total_vram -= g_system_gpu_status.device_vram_total[id];
+            g_system_gpu_status.total_free_vram -= g_system_gpu_status.device_vram_free[id];
+        }
+        
+    }
+#endif
 }
 void ggml_cuda_print_gpu_status(const GPUStatus *status) {
     if (status == NULL) {
@@ -1568,18 +1580,18 @@ void ggml_cuda_print_gpu_status(const GPUStatus *status) {
     const char *divider = "+------------------------------------+------------+-----------+-----------+-----------+-----------+";
     printf("\nCUDA Device Summary - %d devices found\n", status->num_devices);
     printf("%s\n", divider);
-    printf("| %-34s | %10s | %9s | %9s | %9s | %9s |\n", "Device", "VRAM Total", "VRAM Free", "VRAM Used","Split %", "Device ID");
+    printf("| %-34s | %10s | %9s | %9s | %9s | %9s |\n", "Device", "VRAM Total", "VRAM Free", "VRAM Used","Split at %", "Device ID");
     printf("%s\n", divider);
 
     for (int i = 0; i < status->num_devices; ++i) {
         const struct cudaDeviceProp *prop = &status->device_props[i];
         size_t vram_used = status->device_vram_total[i] - status->device_vram_free[i];
-        float split_percentage = g_tensor_split[i] * 100;
+        float split_at_percentage = g_tensor_split[i] * 100;
         printf("| %-34s | %7zu MB | %6zu MB | %6zu MB | %8.1f%% | %2d %6s |\n", 
-                prop->name, status->device_vram_total[i] / (1024 * 1024), status->device_vram_free[i] / (1024 * 1024), vram_used / (1024 * 1024),split_percentage, i, (i == status->main_device_id) ? "(Main)" : "");
+                prop->name, status->device_vram_total[i] / (1024 * 1024), status->device_vram_free[i] / (1024 * 1024), vram_used / (1024 * 1024),split_at_percentage, i, (i == status->main_device_id) ? "(Main)" : "");
         printf("%s\n", divider);
     }
-    printf("Total VRAM: %.2f GB, Free VRAM: %.2f GB\n", (float)status->total_vram / (1024 * 1024 * 1024), (float)status->total_free_vram / (1024 * 1024 * 1024));
+    printf("Total VRAM: %.2f GB, Total available VRAM: %.2f GB\n", (float)status->total_vram / (1024 * 1024 * 1024), (float)status->total_free_vram / (1024 * 1024 * 1024));
     printf("--------------------\n");
 }
 
@@ -1661,7 +1673,14 @@ void ggml_cuda_set_tensor_split(const float * tensor_split) {
         split_sum += tensor_split[i];
     }
     for (int i = 0; i < g_system_gpu_status.num_devices; ++i) {
-        g_tensor_split[i] /= split_sum;
+        float device_prop = tensor_split[i] / split_sum;
+        if (device_prop == 0.0f) {
+            g_tensor_split[i] = 1.0f;
+        }
+        else {
+            g_tensor_split[i] /= split_sum;
+        }
+
     }
 }
 
@@ -2645,17 +2664,12 @@ void ggml_cuda_assign_buffers_no_scratch(struct ggml_tensor * tensor) {
 }
 
 void ggml_cuda_set_main_device(int main_device) {
-    if (main_device >= g_system_gpu_status.num_devices) {
-        fprintf(stderr, "warning: cannot set main_device=%d because there are only %d devices. Using device %d instead.\n",
-                main_device, g_system_gpu_status.num_devices, g_system_gpu_status.main_device_id);
-        return;
-    }
-    g_system_gpu_status.main_device_id = main_device;
-    if (g_system_gpu_status.num_devices > 1) {
-        cudaDeviceProp prop;
-        CUDA_CHECK(cudaGetDeviceProperties(&prop, g_system_gpu_status.main_device_id));
-        fprintf(stderr, "%s: using device %d (%s) as main device\n", __func__, g_system_gpu_status.main_device_id, prop.name);
-    }
+    // if (main_device >= g_system_gpu_status.num_devices) {
+    //     fprintf(stderr, "warning: cannot set main_device=%d because there are only %d devices. Using device %d instead.\n",
+    //             main_device, g_system_gpu_status.num_devices, g_system_gpu_status.main_device_id);
+    //     return;
+    // }
+    // we accept setting it before initialization
     g_system_gpu_status.main_device_id = main_device;
 }
 

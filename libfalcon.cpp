@@ -1397,6 +1397,7 @@ static void falcon_model_load_internal(
         model.tensors_by_name.emplace_back(lt.name, lt.ggml_tensor);
     }
 
+/*  moved into common so that it is set from begin on and can be visualized before evaluation starts
     (void) tensor_split;
 #if defined(GGML_USE_CUBLAS)
     {
@@ -1404,6 +1405,7 @@ static void falcon_model_load_internal(
         ggml_cuda_set_tensor_split(tensor_split);
     }
 #endif
+*/
 
     ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &lctx.model.mlock_mmap : NULL);
 
