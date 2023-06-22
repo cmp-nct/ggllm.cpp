@@ -1581,7 +1581,7 @@ void ggml_cuda_print_gpu_status(const GPUStatus *status) {
     const char *divider = "+------------------------------------+------------+-----------+-----------+-----------+-----------+";
     printf("\nCUDA Device Summary - %d devices found\n", status->num_devices);
     printf("%s\n", divider);
-    printf("| %-34s | %10s | %9s | %9s | %9s | %9s |\n", "Device", "VRAM Total", "VRAM Free", "VRAM Used","Split at %", "Device ID");
+    printf("| %-34s | %10s | %9s | %9s | %9s | %9s |\n", "Device", "VRAM Total", "VRAM Free", "VRAM Used","Split at ", "Device ID");
     printf("%s\n", divider);
 
     for (int i = 0; i < status->num_devices; ++i) {
