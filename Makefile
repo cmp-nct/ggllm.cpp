@@ -50,12 +50,12 @@ CXXFLAGS = -I. -I./examples $(OPT) -std=c++11 -fPIC
 LDFLAGS  =
 
 ifdef LLAMA_DEBUG
-	CFLAGS   += -O0 -g
-	CXXFLAGS += -O0 -g
+	CFLAGS   += -O0 -g -DGGML_PERF=1
+	CXXFLAGS += -O0 -g -DGGML_PERF=1
 	LDFLAGS  += -g
 else
-	CFLAGS   += -DNDEBUG
-	CXXFLAGS += -DNDEBUG
+	CFLAGS   += -DNDEBUG -DGGML_PERF=1
+	CXXFLAGS += -DNDEBUG -DGGML_PERF=1
 endif
 
 # warnings
