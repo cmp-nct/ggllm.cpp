@@ -1408,7 +1408,10 @@ static void falcon_model_load_internal(
     }
 #endif
 */
-
+    if (progress_callback) {
+        progress_callback(0.01f, progress_callback_user_data,"Loading weights");
+    }
+    
     ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &lctx.model.mlock_mmap : NULL);
 
     if (progress_callback) {
