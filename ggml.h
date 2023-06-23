@@ -1138,6 +1138,9 @@ extern "C" {
 
     // dump the graph into a file using the dot format
     GGML_API void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename);
+    
+    // visualize the tensor - extended adds more information - when printing sample content extended will also print src0 and src1 content
+    void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line,  bool extended, bool print_sample);
 
     //
     // optimization
