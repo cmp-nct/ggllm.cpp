@@ -18334,10 +18334,27 @@ void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line
     const char *sep_border = "+======================+======================+======================+======================+";
     printf("%s\n",  sep_border);
     printf("| %s:%d\n", prefix,line);
-    printf("| %-32s\n",  tensor->name);
+    printf("| %-32s [%s type]\n",  tensor->name, GGML_TYPE_NAME[tensor->type]);
     printf("%s\n",  sep);
-    printf("| %-20s | %-20s | %-20s | %-20s |\n",  "Dimensions", "Quantization", "Layer id", "Backend");
-    printf("| %-20d | %-20s | %-20d | %-20s |\n",  tensor->n_dims, GGML_TYPE_NAME[tensor->type], tensor->meta.layer_id >= 0 ? tensor->meta.layer_id : -1, tensor->backend == GGML_BACKEND_CPU ? "CPU" : ((tensor->backend == GGML_BACKEND_GPU) ? "GPU" : "GPU_SPLIT"));
+    char strides[256] = {0};
+    /**
+        // nb[0] = sizeof(type)
+        // nb[1] = nb[0]   * ne[0] + padding
+        // nb[i] = nb[i-1] * ne[i-1]
+    */
+    {
+        int pos = 0;
+        for (int i = 0; i < tensor->n_dims; i++) {
+            pos += snprintf(strides + pos, sizeof(strides) - pos, "%" PRId64, tensor->nb[i]);
+            if (i != tensor->n_dims - 1) {
+                pos += snprintf(strides + pos, sizeof(strides) - pos, "x");
+            }
+        }
+    }
+
+
+    printf("| %-20s | %-20s | %-20s | %-20s |\n",  "Dimensions", "Strides", "Layer id", "Backend");
+    printf("| %-20d | %-20s | %-20d | %-20s |\n",  tensor->n_dims, strides, tensor->meta.layer_id >= 0 ? tensor->meta.layer_id : -1, tensor->backend == GGML_BACKEND_CPU ? "CPU" : ((tensor->backend == GGML_BACKEND_GPU) ? "GPU" : "GPU_SPLIT"));
     printf("%s\n",  sep);
     int pos = 0;
     for (int i = 0; i < tensor->n_dims; i++) {
@@ -18378,16 +18395,23 @@ void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line
     }
     printf(" %-20s |", tensor->op > 0?GGML_OP_NAME[tensor->op] : "N/A");
     printf("\n");
-
-    
     printf("%s\n",  sep);
 
+   if (extended)
+   {
+        bool is_transposed = ggml_is_transposed(tensor);
+        bool is_permuted = ggml_is_permuted(tensor);
+        bool is_cont = ggml_is_contiguous(tensor);
+        printf("| %-17s%s | %-17s%s | %-17s%s | %-6s%11.2f MB |\n", "Transposed:", is_transposed ? "Yes" : "No ", "Permuted:", is_permuted ? "Yes" : "No ", "Contiguous:", is_cont ? "Yes" : "No ","Size:", ggml_nbytes(tensor)/(1024.0*1024.0));
+   }
+
+
    if (extended) {
-        if (tensor->src0) {
+        if (tensor->src0 && strlen(tensor->src0->name)) {
             printf("| %-20s | ", "Src0 name:");
             printf("%-66s |\n", tensor->src0->name);
         }
-        if (tensor->src1) {
+        if (tensor->src1 && strlen(tensor->src1->name)) {
             printf("| %-20s | ", "Src1 name:");
             printf("%-66s |\n", tensor->src1->name);
         }
