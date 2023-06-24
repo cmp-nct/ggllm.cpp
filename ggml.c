@@ -9323,7 +9323,8 @@ static void ggml_compute_forward_repeat2_f32(
             }
         }
     }
-    // ggml_tensor_printf(dst, __func__, __LINE__, true,true);
+    if (ne01 == 100)
+    ggml_tensor_printf(dst, __func__, __LINE__, true,true);
 }
 
 static void ggml_compute_forward_repeat2(
@@ -18275,10 +18276,11 @@ void ggml_printTensorSample(char *prefix,const struct ggml_tensor * tensor) {
     printf("%s",  sep);
     printf("| Content of %s \"%s\" (%d dim)",prefix,tensor->name,tensor->n_dims);
     printf("\n");
+    const int max_elements = 4;
     
     if (tensor->n_dims == 1) {
         printf("| ");
-        for(int i = 0; i < tensor->nb[0] && i < 3; i++){
+        for(int i = 0; i < tensor->ne[0] && i < max_elements; i++){
             printf("%-20f ", *(float *)((char *) tensor->data + i*tensor->nb[0])); 
         }
         printf("|");
@@ -18286,38 +18288,38 @@ void ggml_printTensorSample(char *prefix,const struct ggml_tensor * tensor) {
         printf("%s",  sep);
     }
     else if (tensor->n_dims == 2) {
-        for(int i = 0; i < tensor->nb[0] && i < 3; i++){
+        for(int i = 0; i < tensor->ne[0] && i < max_elements; i++){
             printf("| ");
-            for(int j = 0; j < tensor->nb[1] && j < 3; j++){
-                printf("%-20f ", *(float *)((char *) tensor->data + j*tensor->nb[1] + i*tensor->nb[0]));
+            for(int j = 0; j < tensor->ne[1] && j < max_elements; j++){
+                printf("%-20f ", *(float *)((char *) tensor->data + i*tensor->nb[0] + j*tensor->nb[1]));
             }
             printf("|");
             printf("\n");
         }
         printf("%s",  sep);
     }
-   else if(tensor->n_dims == 3) {
-    for(int i = 0; i < tensor->nb[0] && i < 3; i++){
-        printf("Layer %d\n", i);
-        for(int j = 0; j < tensor->nb[1] && j < 3; j++){
-            printf("| ");
-            for(int k = 0; k < tensor->nb[2] && k < 3; k++){
-                printf("%-20f ", *(float *)((char *) tensor->data + k*tensor->nb[2] + j*tensor->nb[1] + i*tensor->nb[0]));
+    else if(tensor->n_dims == 3) {
+        for(int i = 0; i < tensor->ne[0] && i < 3; i++){
+            printf("Layer %d\n", i);
+            for(int j = 0; j < tensor->ne[1] && j < max_elements; j++){
+                printf("| ");
+                for(int k = 0; k < tensor->ne[2] && k < max_elements; k++){
+                    printf("%-20f ", *(float *)((char *) tensor->data + i*tensor->nb[0] + j*tensor->nb[1] + k*tensor->nb[2]));
+                }
+                printf("|\n");
             }
-            printf("|\n");
+            printf("%s\n",  sep);
         }
-        printf("%s\n",  sep);
-    }
     }
     else if(tensor->n_dims == 4){
-        for(int i = 0; i < tensor->nb[0] && i < 3; i++){
+        for(int i = 0; i < tensor->ne[0] && i < 3; i++){
             printf("Batch %d\n", i);
-            for(int j = 0; j < tensor->nb[1] && j < 3; j++){
+            for(int j = 0; j < tensor->ne[1] && j < 3; j++){
                 printf("Layer %d\n", j);
-                for(int k = 0; k < tensor->nb[2] && k < 3; k++){
+                for(int k = 0; k < tensor->ne[2] && k < max_elements; k++){
                     printf("| ");
-                    for(int l = 0; l < tensor->nb[3] && l < 3; l++){
-                        printf("%-20f ", *(float *)((char *) tensor->data + l*tensor->nb[3] + k*tensor->nb[2] + j*tensor->nb[1] + i*tensor->nb[0]));
+                    for(int l = 0; l < tensor->ne[3] && l < 3; l++){
+                        printf("%-20f ", *(float *)((char *) tensor->data + i*tensor->nb[0] + j*tensor->nb[1] + k*tensor->nb[2] + l*tensor->nb[3]));
                     }
                     printf("|\n");
                 }
