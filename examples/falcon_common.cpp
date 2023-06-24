@@ -352,7 +352,6 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 params.debug_timings = 1;
             } else
                 params.debug_timings = std::stoi(argv[i]);
-        } else if (arg == "-r" || arg == "--reverse-prompt") {
         } else if (arg == "--verbose-prompt") {
             params.verbose_prompt = true;
         } else if (arg == "-r" || arg == "--reverse-prompt") {
