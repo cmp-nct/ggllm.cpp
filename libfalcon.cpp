@@ -792,7 +792,7 @@ struct llama_model_loader {
         size_t done_size = 0;
         for (falcon_load_tensor & lt : tensors_map.tensors) {
             if (progress_callback) {
-                char *status="";
+                const char *status="";
                 if (lt.ggml_tensor->backend == GGML_BACKEND_CPU) 
                     status = "Loading tensor (CPU)";
                 else if (lt.ggml_tensor->backend == GGML_BACKEND_GPU)
