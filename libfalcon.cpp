@@ -1522,6 +1522,7 @@ static bool falcon_eval_internal(
     struct ggml_tensor * cur;
     struct ggml_tensor * inpL = ggml_get_rows(ctx0, model.tok_embeddings, embd);
     struct ggml_tensor* repeat_dummy = ggml_new_tensor_3d(ctx0, inpL->type, head_dim, N + n_past, n_head);
+    ggml_set_zero(repeat_dummy); // just for debug functions not catching uninitialized values
     
     struct ggml_tensor * layernorm_output;
 
@@ -1615,7 +1616,8 @@ static bool falcon_eval_internal(
             ggml_set_name(Qcur, "Qcur");
 
             struct ggml_tensor * Kcur = ggml_view_3d(
-                ctx0, cur, head_dim, n_head_kv, N,
+                ctx0, cur, 
+                head_dim, n_head_kv, N,
                 head_dim * sizeof_wtype,
                 head_dim * (n_head + 2 * n_head_kv) * sizeof_wtype,
                 head_dim * n_head * sizeof_wtype);
@@ -1663,9 +1665,16 @@ static bool falcon_eval_internal(
 
             // K * Q
 
-            K = ggml_cont(ctx0, ggml_repeat2(ctx0, K, repeat_dummy));
+            if(0)
+            {
+                K = ggml_cont(ctx0, ggml_repeat2(ctx0, K, repeat_dummy));
+            } else
+            {
+                // roughly 25% speed increase at context 300 on 40b 6k
+                K = ggml_repeat2(ctx0, ggml_cont(ctx0, K),repeat_dummy); 
+            }
+            
             ggml_set_name(K, "K");
-
             struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
             ggml_set_name(Q, "Q");
             struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
@@ -1700,7 +1709,17 @@ static bool falcon_eval_internal(
                     head_dim, n_head_kv, n_past + N),
                 0, 2, 1, 3);
 
-            V = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_repeat2(ctx0, V, repeat_dummy)));
+            if(0)
+            {
+                 V = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_repeat2(ctx0, V, repeat_dummy)));
+            } else
+            {
+                V = ggml_permute(ctx0, V, 1, 0, 2, 3);
+                V = ggml_cont(ctx0, V);
+                struct ggml_tensor* repeat_dummy_permuted =  ggml_new_tensor_3d(ctx0, inpL->type, N + n_past, head_dim, n_head);
+                V = ggml_repeat2(ctx0, V, repeat_dummy_permuted);
+            }
+
             ggml_set_name(V, "V");
 
             // KQV = transpose(V) * KQ_soft_max
