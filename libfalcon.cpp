@@ -1,5 +1,8 @@
-// Defines fileno on msys:
-// inference&model based on the ggml falcon example PR from https://github.com/KerfuffleV2/ggml-falcon
+/*
+    * libfalcon.cpp
+    * https://github.com/cmp-nct/ggllm.cpp
+    * MIT license
+*/
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #include <cstddef>
@@ -497,8 +500,8 @@ struct falcon_file_loader {
         if (file_version == LLAMA_FILE_VERSION_GGML)
         {
             int32_t ftype = file.read_u32();
-            const int32_t qntvr = hparams.ftype / GGML_QNT_VERSION_FACTOR;
-            hparams.ftype = (enum llama_ftype) (hparams.ftype % GGML_QNT_VERSION_FACTOR);
+            const int32_t qntvr = ftype / GGML_QNT_VERSION_FACTOR;
+            hparams.ftype = (enum llama_ftype) (qntvr);
         } else
         {
             hparams.ftype = (enum llama_ftype) file.read_u32();
@@ -1087,7 +1090,6 @@ static void falcon_model_load_internal(
         int n_batch,
         int n_gpu_layers,
         int main_gpu,
-        const float * tensor_split,
         ggml_type memory_type,
         bool use_mmap,
         bool use_mlock,
@@ -1443,7 +1445,6 @@ static bool falcon_model_load(
         int n_batch,
         int n_gpu_layers,
         int main_gpu,
-        float * tensor_split,
         ggml_type memory_type,
         bool use_mmap,
         bool use_mlock,
@@ -1451,7 +1452,7 @@ static bool falcon_model_load(
         falcon_progress_callback progress_callback,
         void *progress_callback_user_data) {
     try {
-        falcon_model_load_internal(fname, lctx, n_ctx, n_batch, n_gpu_layers, main_gpu, tensor_split, memory_type,
+        falcon_model_load_internal(fname, lctx, n_ctx, n_batch, n_gpu_layers, main_gpu, memory_type,
                                   use_mmap, use_mlock, vocab_only, progress_callback, progress_callback_user_data);
         return true;
     } catch (const std::exception & err) {
@@ -1563,7 +1564,7 @@ static bool falcon_eval_internal(
         }
 #endif // GGML_USE_CUBLAS
 
-        struct ggml_tensor * inpSA = inpL;
+        // struct ggml_tensor * inpSA = inpL;
 
         lctx.use_buf(ctx0, 0);
 
@@ -1789,7 +1790,7 @@ static bool falcon_eval_internal(
 
     // norm
     {
-        cur = ggml_norm(ctx0, cur);
+        cur = ggml_norm(ctx0, inpL);
         // offload_func(cur);
         ggml_set_name(cur, "norm_cur");
 
@@ -2613,8 +2614,8 @@ static void falcon_model_quantize_internal(const std::string & fname_inp, const 
         }
     }
 
-    int i_attention_wv = 0;
-    int i_feed_forward_w2 = 0;
+    // int i_attention_wv = 0;
+    // int i_feed_forward_w2 = 0;
 #endif
 
     size_t total_size_org = 0;
@@ -2794,7 +2795,7 @@ struct falcon_context * falcon_init_from_file(
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
         params.progress_callback_user_data = &cur_percentage; // not sure why this is so complicated ? I left it for now
-        params.progress_callback = [](float progress, void * ctx, char *status) {
+        params.progress_callback = [](float progress, void * ctx, const char *status) {
             unsigned percentage = (unsigned) (100 * progress);
             unsigned * cur_percentage_p = (unsigned *) ctx;
             static const int bar_width = 50;
@@ -2836,7 +2837,7 @@ struct falcon_context * falcon_init_from_file(
     ggml_type memory_type = params.f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     if (!falcon_model_load(path_model, *ctx, params.n_ctx, params.n_batch, params.n_gpu_layers,
-                params.main_gpu, params.tensor_split, memory_type, params.use_mmap, params.use_mlock,
+                params.main_gpu, memory_type, params.use_mmap, params.use_mlock,
                 params.vocab_only, params.progress_callback, params.progress_callback_user_data)) {
         fprintf(stderr, "%s: failed to load model\n", __func__);
         llama_free(ctx);

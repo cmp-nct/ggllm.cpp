@@ -21,7 +21,7 @@ typedef struct {
     size_t device_vram_free[GGML_CUDA_MAX_DEVICES];
     size_t device_vram_total[GGML_CUDA_MAX_DEVICES];
 } GPUStatus;
-const GPUStatus* ggml_cuda_get_system_gpu_status();
+const GPUStatus* ggml_cuda_get_system_gpu_status(void);
 
 void   ggml_init_cublas(void);
 void   ggml_cuda_update_gpu_status(int device_id);

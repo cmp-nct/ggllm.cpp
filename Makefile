@@ -1,5 +1,5 @@
 # Define the default target now so that it is always the first target
-BUILD_TARGETS = main quantize quantize-stats perplexity embedding vdot train-text-from-scratch simple
+BUILD_TARGETS = falcon_main falcon_quantize falcon_perplexity # main quantize quantize-stats perplexity embedding vdot train-text-from-scratch simple
 
 ifdef LLAMA_BUILD_SERVER
 	BUILD_TARGETS += server
@@ -92,10 +92,6 @@ endif
 ifdef LLAMA_GPROF
 	CFLAGS   += -pg
 	CXXFLAGS += -pg
-endif
-ifdef LLAMA_PERF
-	CFLAGS   += -DGGML_PERF
-	CXXFLAGS += -DGGML_PERF
 endif
 
 # Architecture specific
@@ -234,7 +230,7 @@ endif # LLAMA_NO_K_QUANTS
 # Print build information
 #
 
-$(info I llama.cpp build info: )
+$(info I ggllm.cpp build info: )
 $(info I UNAME_S:  $(UNAME_S))
 $(info I UNAME_P:  $(UNAME_P))
 $(info I UNAME_M:  $(UNAME_M))
@@ -271,7 +267,7 @@ clean:
 	rm -vf *.o *.so main quantize quantize-stats perplexity embedding benchmark-matmult save-load-state server vdot train-text-from-scratch build-info.h
 
 #
-# Examples
+# Binaries
 #
 
 main: examples/main/main.cpp                                  build-info.h ggml.o llama.o common.o $(OBJS)
@@ -286,8 +282,19 @@ simple: examples/simple/simple.cpp                            build-info.h ggml.
 quantize: examples/quantize/quantize.cpp                      build-info.h ggml.o llama.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
+falcon_main: examples/falcon/falcon_main.cpp                                  build-info.h ggml.o libfalcon.o falcon_common.o $(OBJS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+	@echo
+	@echo '====  Run ./falcon_main -h for help.  ===='
+	@echo 'Read the readme file for important parameters and usage'
+	@echo
+
 falcon_quantize: examples/falcon_quantize/quantize.cpp                      build-info.h ggml.o libfalcon.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+
+falcon_perplexity: examples/falcon_perplexity/falcon_perplexity.cpp                build-info.h ggml.o libfalcon.o falcon_common.o $(OBJS)
+	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+
 
 quantize-stats: examples/quantize-stats/quantize-stats.cpp    build-info.h ggml.o llama.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
@@ -295,8 +302,6 @@ quantize-stats: examples/quantize-stats/quantize-stats.cpp    build-info.h ggml.
 perplexity: examples/perplexity/perplexity.cpp                build-info.h ggml.o llama.o common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-falcon_perplexity: examples/falcon_perplexity/falcon_perplexity.cpp                build-info.h ggml.o libfalcon.o falcon_common.o $(OBJS)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
 embedding: examples/embedding/embedding.cpp                   build-info.h ggml.o llama.o common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
@@ -318,8 +323,7 @@ build-info.h: $(wildcard .git/index) scripts/build-info.sh
 		rm $@.tmp; \
 	fi
 
-falcon_main: examples/falcon/falcon_main.cpp                                  build-info.h ggml.o libfalcon.o falcon_common.o $(OBJS)
-	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
+
 #
 # Tests
 #

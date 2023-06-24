@@ -17010,9 +17010,9 @@ void graph_calculate_mean_sd(float array[], int n, float *mean, float *sd)
         sum += array[i];
     *mean = sum / n;
     for (i = 0; i < n; i++)
-        variance += pow(array[i] - *mean, 2);
+        variance += powf(array[i] - *mean, 2);
     variance /= n;
-    *sd = sqrt(variance);
+    *sd = sqrtf(variance);
 }
 void ggml_graph_print(const struct ggml_cgraph * cgraph) {
     ggml_graph_print_impl(cgraph, true, true, GGML_OP_NONE);
@@ -18280,7 +18280,7 @@ void ggml_printTensorSample(char *prefix,const struct ggml_tensor * tensor) {
     if (tensor->n_dims == 1) {
         printf("| ");
         for(int i = 0; i < tensor->ne[0] && i < max_elements; i++){
-            printf("%-20f ", *(float *)((char *) tensor->data + i*tensor->nb[0])); 
+            printf("%-20f ", (double) *(float *)((char *) tensor->data + i*tensor->nb[0])); 
         }
         printf("|");
         printf("\n");
@@ -18290,7 +18290,7 @@ void ggml_printTensorSample(char *prefix,const struct ggml_tensor * tensor) {
         for(int i = 0; i < tensor->ne[0] && i < max_elements; i++){
             printf("| ");
             for(int j = 0; j < tensor->ne[1] && j < max_elements; j++){
-                printf("%-20f ", *(float *)((char *) tensor->data + i*tensor->nb[0] + j*tensor->nb[1]));
+                printf("%-20f ", (double) *(float *)((char *) tensor->data + i*tensor->nb[0] + j*tensor->nb[1]));
             }
             printf("|");
             printf("\n");
@@ -18303,7 +18303,7 @@ void ggml_printTensorSample(char *prefix,const struct ggml_tensor * tensor) {
             for(int j = 0; j < tensor->ne[1] && j < max_elements; j++){
                 printf("| ");
                 for(int k = 0; k < tensor->ne[2] && k < max_elements; k++){
-                    printf("%-20f ", *(float *)((char *) tensor->data + i*tensor->nb[0] + j*tensor->nb[1] + k*tensor->nb[2]));
+                    printf("%-20f ", (double) *(float *)((char *) tensor->data + i*tensor->nb[0] + j*tensor->nb[1] + k*tensor->nb[2]));
                 }
                 printf("|\n");
             }
@@ -18318,7 +18318,7 @@ void ggml_printTensorSample(char *prefix,const struct ggml_tensor * tensor) {
                 for(int k = 0; k < tensor->ne[2] && k < max_elements; k++){
                     printf("| ");
                     for(int l = 0; l < tensor->ne[3] && l < 3; l++){
-                        printf("%-20f ", *(float *)((char *) tensor->data + i*tensor->nb[0] + j*tensor->nb[1] + k*tensor->nb[2] + l*tensor->nb[3]));
+                        printf("%-20f ", (double) *(float *)((char *) tensor->data + i*tensor->nb[0] + j*tensor->nb[1] + k*tensor->nb[2] + l*tensor->nb[3]));
                     }
                     printf("|\n");
                 }
@@ -18330,6 +18330,7 @@ void ggml_printTensorSample(char *prefix,const struct ggml_tensor * tensor) {
 
 void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line,  bool extended, bool print_sample) {
     char tmp_str[256] = {0};
+    int pos=0;
     const char *sep = "+----------------------+----------------------+----------------------+----------------------+";
     const char *sep_border = "+======================+======================+======================+======================+";
     printf("%s\n",  sep_border);
@@ -18343,7 +18344,7 @@ void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line
         // nb[i] = nb[i-1] * ne[i-1]
     */
     {
-        int pos = 0;
+        pos = 0;
         for (int i = 0; i < tensor->n_dims; i++) {
             pos += snprintf(strides + pos, sizeof(strides) - pos, "%" PRId64, tensor->nb[i]);
             if (i != tensor->n_dims - 1) {
@@ -18356,7 +18357,7 @@ void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line
     printf("| %-20s | %-20s | %-20s | %-20s |\n",  "Dimensions", "Strides", "Layer id", "Backend");
     printf("| %-20d | %-20s | %-20d | %-20s |\n",  tensor->n_dims, strides, tensor->meta.layer_id >= 0 ? tensor->meta.layer_id : -1, tensor->backend == GGML_BACKEND_CPU ? "CPU" : ((tensor->backend == GGML_BACKEND_GPU) ? "GPU" : "GPU_SPLIT"));
     printf("%s\n",  sep);
-    int pos = 0;
+    pos = 0;
     for (int i = 0; i < tensor->n_dims; i++) {
         pos += snprintf(tmp_str + pos, sizeof(tmp_str) - pos, "%" PRId64, tensor->ne[i]);
         if (i != tensor->n_dims - 1) {
@@ -18368,8 +18369,7 @@ void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line
         
 
     if (tensor->src0) {
-        char tmp_str[256] = {0};
-        int pos = 0;
+        pos = 0;
         for (int i = 0; i < tensor->src0->n_dims; i++) {
             pos += snprintf(tmp_str + pos, sizeof(tmp_str) - pos, "%" PRId64, tensor->src0->ne[i]);
             if (i != tensor->src0->n_dims - 1) {
@@ -18382,7 +18382,7 @@ void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line
             printf(" %-20s |", "N/A");
     }
     if (tensor->src1) {
-        int pos = 0;
+        pos = 0;
         for (int i = 0; i < tensor->src1->n_dims; i++) {
             pos += snprintf(tmp_str + pos, sizeof(tmp_str) - pos, "%" PRId64, tensor->src1->ne[i]);
             if (i != tensor->src1->n_dims - 1) {

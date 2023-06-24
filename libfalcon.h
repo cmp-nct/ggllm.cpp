@@ -69,7 +69,7 @@ extern "C" {
         bool sorted;
     } llama_token_data_array;
 
-    typedef void (*falcon_progress_callback)(float progress, void *ctx, char *status);
+    typedef void (*falcon_progress_callback)(float progress, void *ctx, const char *status);
 
     struct falcon_context_params {
         int n_ctx;                             // text context

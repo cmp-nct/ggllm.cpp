@@ -1609,7 +1609,7 @@ void ggml_cuda_print_gpu_status(const GPUStatus *status) {
     printf("--------------------\n");
 }
 
-const GPUStatus* ggml_cuda_get_system_gpu_status() {
+const GPUStatus* ggml_cuda_get_system_gpu_status(void) {
     return &g_system_gpu_status;
 }
 
@@ -1632,8 +1632,8 @@ void ggml_init_cublas() {
             int64_t total_vram = 0;
             for (int id = 0; id < g_system_gpu_status.num_devices; ++id) {
                 g_tensor_split[id] = total_vram;
-                size_t vram_free, vram_total;
-                vram_total = g_system_gpu_status.device_vram_total[id];
+                size_t vram_free;
+                // vram_total = g_system_gpu_status.device_vram_total[id];
                 vram_free = g_system_gpu_status.device_vram_free[id];
                 total_vram += vram_free;
             }
