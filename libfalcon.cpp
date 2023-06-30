@@ -220,9 +220,66 @@ struct falcon_model {
     }
 };
 
+
+#if 1
+struct TrieNode {
+    std::map<char, TrieNode*> map;
+    int32_t Id = -1; 
+};
+struct Trie {
+    TrieNode *root;
+
+    Trie() : root(new TrieNode()) {}
+    ~Trie() {
+        if(root)
+        deleteTrie(root);
+    }
+        // Move constructor
+    Trie(Trie&& other) noexcept : root(other.root) {
+        other.root = nullptr;
+    }
+
+    // Move assignment operator
+    Trie& operator=(Trie&& other) noexcept {
+        if (this != &other) {
+            if(root)
+                deleteTrie(root);
+            root = other.root;
+            other.root = nullptr;
+        }
+        return *this;
+    }
+
+
+    void insert(const std::string &token, int32_t Id) {
+        TrieNode* current = root;
+        for(auto ch : token) {
+            if(current->map.find(ch) == current->map.end())
+                current->map[ch] = new TrieNode();
+            current = current->map[ch];
+        }
+        current->Id = Id;
+    }
+    
+    void reset() 
+    {
+        deleteTrie(root);
+        root = new TrieNode();
+    }
+
+private:
+    void deleteTrie(TrieNode* node) {
+        for(auto &it: node->map) {
+            deleteTrie(it.second);
+        }
+        delete node;
+    }
+
+};
 struct falcon_vocab {
-    using id    = int32_t;
+    using id = int32_t;
     using token = std::string;
+    std::map<std::string, uint32_t> max_token_length; // max length, for each 2byte prefix
 
     struct token_score {
         token tok;
@@ -231,7 +288,54 @@ struct falcon_vocab {
 
     std::unordered_map<token, id> token_to_id;
     std::vector<token_score> id_to_token;
+    Trie trie;
+
+
+    // populate trie from map
+    void populate_trie_from_map() {
+        trie.reset();
+        for (const auto& pair : token_to_id) {
+            trie.insert(pair.first, pair.second);
+            if (pair.first.size() >= 2)
+            {
+                std::string prefix = pair.first.substr(0, 2);
+                max_token_length[prefix] = std::max(max_token_length[prefix], (uint32_t)pair.first.size());
+            }
+        }
+    }
+    // get max token length available for a prefix of 2 bytes (string at least 2 bytes long)
+    int get_max_token_length(const std::string& string) const {
+        if (string.size() < 2)
+            return -1;
+        std::string prefix = string.substr(0, 2);
+        if (max_token_length.find(prefix) == max_token_length.end())
+            return 0;
+        return max_token_length.at(prefix);
+    }
+
+    std::pair<falcon_vocab::id, std::string> find_longest_match(const std::string& snippet) const {
+        TrieNode* current = trie.root;
+        falcon_vocab::id last_matched_id = -1;
+        std::string last_matched_token = "";
+        std::string current_token = "";
+        for (auto ch : snippet) {
+            if (current->map.find(ch) == current->map.end()) {
+                break;
+            }
+            current = current->map[ch];
+            current_token += ch;
+            if (current->Id != -1) {
+                last_matched_id = current->Id;
+                last_matched_token = current_token;
+            }
+        }
+        return {last_matched_id, last_matched_token};
+    }
+
 };
+#endif
+
+
 
 struct falcon_context {
     std::mt19937 rng;
@@ -511,7 +615,7 @@ struct falcon_file_loader {
         for (uint32_t i = 0; i < (uint32_t)hparams.n_vocab; i++) {
             uint32_t len = file.read_u32();
             std::string word = file.read_string(len);
-
+            // the vocab is not identical to HF, the whitespace prefix is an actual #20 space
             float score = 0.0f; // flacon does not have scores in vocab, scores are a sentencepiece addition
             if (file_version >= LLAMA_FILE_VERSION_GGMF_V1) {
                 file.read_raw(&score, sizeof(score));
@@ -528,8 +632,12 @@ struct falcon_file_loader {
             vocab.id_to_token.resize(65024);
             vocab.token_to_id.erase("[PAD]");
             hparams.n_vocab = 65024;
+            // this needs a followup of the tensors itself, quality of the model affected needs to be tested
         }
-        //TODO: the tensor word_embeddings needs to be shaved to 65024
+        #if 1
+        vocab.populate_trie_from_map();
+        #endif
+        
     }
     void read_tensor_metadata(size_t file_idx, llama_load_tensors_map & tensors_map) {
         while (file.tell() < file.size) {
@@ -2082,9 +2190,95 @@ struct falcon_tokenizer {
         // seed the work queue with all possible 2-character tokens.
         for (size_t i = 1; i < symbols_.size(); ++i) {
             try_add_bigram(i - 1, i);
-            // printf("bigram = '%.*s%.*s'\n", (int) symbols_[i-1].n, symbols_[i-1].text, (int) symbols_[i].n, symbols_[i].text);
+            //printf("bigram = '%.*s%.*s'\n", (int) symbols_[i-1].n, symbols_[i-1].text, (int) symbols_[i].n, symbols_[i].text);
         }
+        // copy them
+        
+        #if 1
+        std::vector<llama_sp_symbol> symbols_first_pass;
+        symbols_first_pass.reserve(symbols_.size());
+        for (auto & s : symbols_) {
+            symbols_first_pass.emplace_back(s);
+        }
+        
+        // all symbols that can form a valid token and the length of the token
+        std::vector<std::pair<llama_sp_symbol::index, std::string>> token_symbols;
 
+        // tree search for longest matches
+        if (symbols_first_pass.size() > 4)
+        for (int i = 0; i != -1; i = symbols_first_pass[i].next) // iterate through the linked symbols
+        {
+            auto & symbol = symbols_first_pass[i];
+            if (symbol.next == -1 )  break;
+            
+            std::string prefix = std::string(symbol.text,2);
+            auto max_len = vocab_.get_max_token_length(prefix);
+
+            // Construct a string starting from the current symbol 
+            std::string test_chunk = "";
+            int real_max_len = 0;
+            // we now go through the linked list and find the actual max_len
+            for (int j = i; j != -1; j = symbols_first_pass[j].next) {
+                auto & next_symbol = symbols_first_pass[j];
+                if (symbols_first_pass[j].text[0] == ' ') break;
+                real_max_len += next_symbol.n;
+                if (next_symbol.next == -1) break;
+                if (real_max_len >= max_len) break;
+            }
+            test_chunk = std::string(symbol.text, real_max_len);
+            printf("test_chunk = '%s' (%d of %d)\n", test_chunk.c_str(), real_max_len, max_len);
+            
+            //test_chunk = std::string(symbol.text, max_len); 
+            
+            // look forward if token can be formed
+            auto longest_match = vocab_.find_longest_match(test_chunk);
+            falcon_vocab::id matched_id = longest_match.first;
+            std::string matched_token = longest_match.second;
+
+            if (matched_id != -1) {
+                // printf("Matched '%s' with '%s'\n", test_chunk.c_str(), matched_token.c_str());
+                // we now need to prepare to sort a vector of symbols that can form a token and their size
+                token_symbols.emplace_back(i, matched_token);
+            }
+        }
+        std::sort(token_symbols.begin(), token_symbols.end(), [](auto & l, auto & r) { return l.second.size() > r.second.size(); });
+        // printf("Found %zu tokens\n", token_symbols.size());
+        // for (auto & token_symbol : token_symbols) {
+        //     printf("Token:Size = '%s' : %zu\n", token_symbol.second.c_str(), token_symbol.second.size());
+        // }
+
+        
+        for (auto & token_symbol : token_symbols) 
+        {
+            // if (token_symbol.second.size() < 1) break; // anything smaller is handled fine by the queue
+            auto & symbol = symbols_[token_symbol.first];
+            if (symbol.n != 1) continue; // already merged
+            // go through symbol and .next step by step merging
+            printf("Token to form: %s\n", token_symbol.second.c_str());
+            // we need to look ahead if the token is still legal, if yes we'll merge
+            bool can_merge=false;
+            int collector=0;
+            for (int i=token_symbol.first; i != -1; i = symbols_[i].next) {
+                if (symbols_[i].n != 1) break;
+                if (++collector == token_symbol.second.size()) 
+                {
+                    can_merge=true;
+                    break;
+                }
+            }
+
+            if (!can_merge) printf("Cannot merge '%s'\n", token_symbol.second.c_str());
+            if (!can_merge) continue;
+
+            for (int i=token_symbol.first+1; i != -1; i = symbols_[i].next) {
+                symbol.n += symbols_[i].n;
+                symbol.next = symbols_[i].next;
+                symbols_[i].n = 0;
+                if (symbol.n == token_symbol.second.size()) break;
+            }
+            printf("Merged '%.*s' consisting of %zu symbols\n", (int) symbol.n, symbol.text, symbol.n);
+        }
+        #endif
         // keep substituting the highest frequency pairs for as long as we can.
         while (!work_queue_.empty()) {
             auto bigram = work_queue_.top();
@@ -2112,39 +2306,6 @@ struct falcon_tokenizer {
             // find more substitutions
             try_add_bigram(left_symbol.prev, bigram.left);  // left side of current bigram
             try_add_bigram(bigram.left, left_symbol.next);  // right side of current bigram           
-        }
-        // Bug: the tokenizer is currently unable to merge tokens if not all sub parts can form vocabulary duplets, also it will form duplets that can make forming a triplet impossible 
-        // Imagine AABBBA where ABBBBA is a token and AA is a token. The tokenizer would create AA B B B A instead of A ABBBA
-        // below is not a full solution to this, but it can merge triplets if no sub-merging happened as in the example before
-        // a real solution is probably not easy to integrate, maybe a hash sorted vocabulary in combination with a lookahead search would be better
-        // this allows to combine the triplet >> AN S WER << into first >> ANSWER << and second >>ANSWER<< - it's certainly not efficient but for a couple hundred tokens it's fast enough for now
-        bool found_triplet = true;
-        while (found_triplet)
-        {
-            found_triplet = false;
-            for (int i = 0; i != -1; i = symbols_[i].next) {
-                auto & symbol = symbols_[i];
-                // triplet
-                if (symbol.prev != -1 && symbol.next != -1) {
-                    auto & left_symbol = symbols_[symbol.prev];
-                    auto & right_symbol = symbols_[symbol.next];
-                    if (left_symbol.n > 0 && right_symbol.n > 0) {
-                        auto token = vocab_.token_to_id.find(std::string(left_symbol.text, left_symbol.n) + std::string(symbol.text, symbol.n) + std::string(right_symbol.text, right_symbol.n));
-                        if (token != vocab_.token_to_id.end()) {
-                            // printf("found triplet token = '%.*s%.*s%.*s'\n", (int) left_symbol.n, left_symbol.text, (int) symbol.n, symbol.text, (int) right_symbol.n, right_symbol.text);
-                            // merge all 3 into the left one and invalidate the others
-                            left_symbol.n += symbol.n + right_symbol.n;
-                            symbol.n = 0;
-                            right_symbol.n = 0;
-                            left_symbol.next = right_symbol.next;
-                            if (right_symbol.next >= 0) {
-                                symbols_[right_symbol.next].prev = symbol.prev;
-                            }
-                            found_triplet = true;
-                        }
-                    }
-                }
-            }
         }
 
         for (int i = 0; i != -1; i = symbols_[i].next) {
@@ -2183,7 +2344,7 @@ private:
         if (token == vocab_.token_to_id.end()) {
             return;
         }
-        //printf("ADDING BI GRAM: '%s' left = '%.*s' right = '%.*s'\n", text.c_str(), (int) symbols_[left].n, symbols_[left].text, (int) symbols_[right].n, symbols_[right].text);
+        // printf("ADDING BI GRAM: '%s' left = '%.*s' right = '%.*s'\n", text.c_str(), (int) symbols_[left].n, symbols_[left].text, (int) symbols_[right].n, symbols_[right].text);
 
         if (static_cast<size_t>((*token).second) >= vocab_.id_to_token.size()) {
             return;
