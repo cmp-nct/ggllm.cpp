@@ -136,7 +136,7 @@ extern "C" {
     // TODO: not great API - very likely to change
     // Initialize the llama + ggml backend
     // Call once at the start of the program
-    LLAMA_API void llama_init_backend();
+    LLAMA_API void falcon_init_backend();
 
     LLAMA_API int64_t llama_time_us();
 

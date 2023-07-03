@@ -322,7 +322,7 @@ struct falcon_vocab {
     }
     // populate token ranks map
     int populate_bpe_ranks(std::vector<std::pair<std::string, std::string>> bpe_merges_) {
-        for (int i = 0; i < bpe_merges_.size(); i++) {
+        for (int i = 0; i < (int)bpe_merges_.size(); i++) {
             bpe_ranks.emplace(bpe_merges_[i], i);
         }
         bpe_merges = bpe_merges_;
@@ -331,11 +331,23 @@ struct falcon_vocab {
         for (int i = 0; i < 12; i++) {
             special_tokens[id_to_token[i].tok] = i;
         }
-        for (int i = 65024; i < id_to_token.size(); i++) {
+        for (int i = 65024; i < (int)id_to_token.size(); i++) {
             special_tokens[id_to_token[i].tok] = i;
         }
 
         return bpe_merges_.size();
+    }
+    // Trim whitespace characters from the beginning and end of the string
+    void trim(std::string& str) {
+        // Remove whitespace characters from the beginning of the string
+        str.erase(str.begin(), std::find_if(str.begin(), str.end(), [](int ch) {
+            return !std::isspace(ch);
+        }));
+
+        // Remove whitespace characters from the end of the string
+        str.erase(std::find_if(str.rbegin(), str.rend(), [](int ch) {
+            return !std::isspace(ch);
+        }).base(), str.end());
     }
    // requires the standard HF type tokenizer.json (pretty printed)
     std::vector<std::pair<std::string, std::string>> parse_json_to_bpe_merges(const std::string& filename) {
@@ -354,6 +366,7 @@ struct falcon_vocab {
             // Trim the line
             line.erase(0, line.find_first_not_of(" \t"));
             line.erase(line.find_last_not_of(" \t") + 1);
+            trim(line);
 
             if (line == "\"merges\": [") {
                 isMergesSection = true;
@@ -740,12 +753,16 @@ struct falcon_file_loader {
                     case 1: file_version = LLAMA_FILE_VERSION_GGJT_V1; return;
                     case 2: file_version = LLAMA_FILE_VERSION_GGJT_V2; return;
                     case 3: file_version = LLAMA_FILE_VERSION_GGJT_V3; return;
+                    break;
                 }
+                break;
             case FALCON_FILE_MAGIC_GGCC:
                 switch (version) {
                     // we start at 10 to avoid confusion with the old GGJT format
                     case 10: file_version = FALCON_FILE_VERSION_GGCC_V1; return;
+                    break;
                 }
+                break;
         }
 
 
@@ -818,12 +835,18 @@ struct falcon_file_loader {
             std::string tokenizer_json_path = parent_path + "/tokenizer.json";
             auto merges = vocab.parse_json_to_bpe_merges(tokenizer_json_path);
             if (merges.empty()) {
-                fprintf(stderr, "falcon.cpp: error: old file format requires json data in directory: %s\n", tokenizer_json_path.c_str());
+                fprintf(stderr, "falcon.cpp: error: old file format. Place json data in directory: %s\n", tokenizer_json_path.c_str());
+                #if defined(GGML_USE_CUBLAS)
+                while (!ggml_init_cublas(true)) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                #endif
                 exit(1);
             }
             int num_bpe_merges = vocab.populate_bpe_ranks(merges);
             if (num_bpe_merges == 0) {
                 fprintf(stderr, "falcon.cpp: error: old file format, no valid BPE merges found in %s\n", tokenizer_json_path.c_str());
+                #if defined(GGML_USE_CUBLAS)
+                while (!ggml_init_cublas(true)) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                #endif
                 exit(1);
             }
             hparams.n_bpe_merges = num_bpe_merges;
@@ -1332,7 +1355,7 @@ bool llama_mlock_supported() {
     return llama_mlock::SUPPORTED;
 }
 
-void llama_init_backend() {
+void falcon_init_backend() {
     ggml_time_init();
 
     // needed to initialize f16 tables
@@ -2377,9 +2400,7 @@ struct falcon_tokenizer {
     falcon_tokenizer(const falcon_vocab & vocab, bool g2ws_): vocab_(vocab) { flag_g2ws = g2ws_; }
 
     void tokenize(const std::string & text, std::vector<falcon_vocab::id> & output) {
-        int index = 0;
         int final_prev_index = -1;
-        size_t offset = 0;
         
         auto word_collection = bpe_gpt2_preprocess(text); 
         
@@ -2547,7 +2568,7 @@ private:
         
 
         std::string token="";
-        char *raw_text_p = (char*)text.c_str();
+        const char *raw_text_p = text.c_str();
         // GPT2 system regex:  's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
         bool collecting_numeric = false;
         bool collecting_letter = false;
@@ -2565,24 +2586,24 @@ private:
                 smallest_len_special_tokens = special_token.size();
         }
 
-        for (int i = 0; i < text_utf.size(); i++) 
+        for (int i = 0; i < (int)text_utf.size(); i++) 
         {
             const CNCTString &utf_char = text_utf[i];
             bool split_condition = false;
-            char *text_pos = raw_text_p + utf_char.seq_offset_bytes;
+            const char *text_pos = raw_text_p + utf_char.seq_offset_bytes;
             int bytes_remain = strlen(text_pos);
             // forward backward lookups
-            CNCTString utf_char_next = (i+1 < text_utf.size()) ? text_utf[i+1] : CNCTString();
-            CNCTString utf_char_next_next = (i+2 < text_utf.size()) ? text_utf[i+2] : CNCTString();
+            CNCTString utf_char_next = (i+1 < (int)text_utf.size()) ? text_utf[i+1] : CNCTString();
+            CNCTString utf_char_next_next = (i+2 < (int)text_utf.size()) ? text_utf[i+2] : CNCTString();
             CNCTString utf_char_prev = (i > 0) ? text_utf[i-1] : CNCTString();
 
             // handling special tokens
             bool special_token_found = false;
-            if (bytes_remain >= smallest_len_special_tokens)
+            if (bytes_remain >= (int)smallest_len_special_tokens)
             for (auto it = special_tokens.begin(); it != special_tokens.end(); ++it)
             {
                 std::string special_token = it->first;
-                if ((bytes_remain) < special_token.size())
+                if ((bytes_remain) < (int)special_token.size())
                     continue;
                 if (strncmp(text_pos, special_token.c_str(), special_token.size()) == 0)
                 {
@@ -2593,7 +2614,7 @@ private:
                     }
                     bpe_words.push_back(special_token); // push special token as token
                     // we now advance i until the token is fulfilled by the utf_chars
-                    int st_bytes = special_token.size();
+                    int st_bytes = (int)special_token.size();
                     for (;st_bytes;st_bytes -= text_utf[i++].str.size());
                     i--;
                     special_token_found = true;
@@ -2657,7 +2678,7 @@ private:
                     collecting = true;
                 }
                 else if (
-                    (utf_char.char_type != CNCTCharType::LETTER && utf_char.char_type != CNCTCharType::DIGIT) && (utf_char.char_type != CNCTCharType::WHITESPACE) ||
+                    ((utf_char.char_type != CNCTCharType::LETTER && utf_char.char_type != CNCTCharType::DIGIT) && (utf_char.char_type != CNCTCharType::WHITESPACE)) ||
                     (!token.size() && utf_char==" " && utf_char_next.char_type != CNCTCharType::LETTER && utf_char_next.char_type != CNCTCharType::DIGIT && utf_char_next.char_type != CNCTCharType::WHITESPACE)
                     )
                 {

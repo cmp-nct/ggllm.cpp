@@ -20,32 +20,33 @@ struct CNCTUnicode;
 
 struct CNCTString {
     std::string str;
-    size_t utf8_chars; // number of utf8 characters in str
-    
+    size_t utf8_chars;
+
     CNCTCharType char_type=UNIDENTIFIED;
     bool is_sequential=false;
-    
-    size_t seq_offset_bytes=0; // used when in sequence
-    size_t seq_offset_utf8_chars=0; // used when in sequence
+
+    size_t seq_offset_bytes=0;
+    size_t seq_offset_utf8_chars=0;
 
     bool operator==(const std::string &other) const;
     bool operator==(const char other) const;
     bool operator==(const CNCTString &other) const;
     CNCTString &operator+=(const std::string &other);
-    CNCTString &CNCTString::operator+=(const char other);
+    CNCTString &operator+=(const char other);
     friend CNCTString operator+(CNCTString lhs, const std::string &rhs);
-    friend CNCTString CNCTString::operator+(CNCTString lhs, const char rhs);
-    CNCTString& CNCTString::operator+=(const CNCTString& other);
-    friend CNCTString CNCTString::operator+(CNCTString lhs, const CNCTString& rhs);
-    
+    friend CNCTString operator+(CNCTString lhs, const char rhs);
+    CNCTString& operator+=(const CNCTString& other);
+    friend CNCTString operator+(CNCTString lhs, const CNCTString& rhs);
 };
+
+
 
 struct CNCTUnicode {
     static bool check_code_range(int c, const std::vector<std::pair<int, int>>& ranges);
     static CNCTCharType get_code_type(int c);
     static CNCTCharType get_code_type(const std::string &utf8_char);
-    static const int utf8_len(const char c);
-    static const int strlen_utf8(std::string src);
+    static int utf8_len(const char c);
+    static int strlen_utf8(std::string src);
     static std::vector<std::string> split_utf8(const std::string &src);
     static std::vector<CNCTString> split_utf8_enhanced(const std::string &src);
     static CNCTCharType string_identify(const std::string& str);

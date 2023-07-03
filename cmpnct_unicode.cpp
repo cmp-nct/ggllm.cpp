@@ -132,7 +132,7 @@ CNCTCharType CNCTUnicode::get_code_type(const std::string &utf8_char)
     return get_code_type(utf8_to_unicode(utf8_char));
 }
 
-const int CNCTUnicode::utf8_len(const char c)
+int CNCTUnicode::utf8_len(const char c)
 {
     if ((c & 0x80) == 0)
         return 1; // ASCII character
@@ -147,7 +147,7 @@ const int CNCTUnicode::utf8_len(const char c)
     // return lookup[static_cast<uint8_t>(c) >> 4];
 }
 
-const int CNCTUnicode::strlen_utf8(const std::string src)
+int CNCTUnicode::strlen_utf8(const std::string src)
 {
     int len = 0;
     for (std::string::const_iterator it = src.begin(); it != src.end(); ++it)

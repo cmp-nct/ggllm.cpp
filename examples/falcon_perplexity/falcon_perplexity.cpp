@@ -147,7 +147,7 @@ int main(int argc, char ** argv) {
         params.prompt = gpt_random_prompt(rng);
     }
 
-    llama_init_backend();
+    falcon_init_backend();
 
     falcon_context * ctx;
 

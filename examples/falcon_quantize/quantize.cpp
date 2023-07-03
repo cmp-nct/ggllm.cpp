@@ -182,7 +182,7 @@ int main(int argc, char ** argv) {
         usage(argv[0]);
     }
 
-    llama_init_backend();
+    falcon_init_backend();
 
     // parse command line arguments
     const std::string fname_inp = argv[arg_idx];
