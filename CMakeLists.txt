@@ -496,9 +496,14 @@ add_library(libfalcon
     libfalcon.h
     llama-util.h
     )
+add_library(cmpnct_unicode
+    cmpnct_unicode.cpp
+    cmpnct_unicode.h
+    )
 target_include_directories(libfalcon PUBLIC .)
 target_compile_features(libfalcon PUBLIC cxx_std_11) # don't bump
 target_link_libraries(libfalcon PRIVATE
+    cmpnct_unicode
     ggml
     ${LLAMA_EXTRA_LIBS}
     )

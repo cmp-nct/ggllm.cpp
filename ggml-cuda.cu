@@ -2080,6 +2080,9 @@ void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
     }
+    if (g_system_gpu_status.num_devices == 0) {
+        return nullptr;
+    }
 
     void * ptr = nullptr;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);

@@ -12,6 +12,7 @@
 
 #include "llama-util.h"
 #include "libfalcon.h"
+#include "cmpnct_unicode.h"
 
 #include "ggml.h"
 #ifdef GGML_USE_CUBLAS
@@ -47,6 +48,7 @@
 #include <mutex>
 #include <sstream>
 #include <numeric>
+// #include <locale>
 
 #if defined(_MSC_VER)
 // disable "possible loss of data" 
@@ -113,6 +115,7 @@ struct falcon_hparams {
     int32_t n_head_kv = 1;
     int32_t n_layer = 32;
     int32_t n_falcon_type = 7; // 7 for Falcon-7B, 40 for Falcon-40B
+    int32_t n_bpe_merges = 64784; // in binary starting with FALCON_FILE_VERSION_GGCC_V1
     enum llama_ftype ftype = LLAMA_FTYPE_MOSTLY_F16;
 
     bool operator!=(const falcon_hparams & other) const {
@@ -222,6 +225,15 @@ struct falcon_model {
 
 
 #if 1
+
+std::string replaceAll(std::string str, const std::string& from, const std::string& to) {
+    size_t start_pos = 0;
+    while((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
+    }
+    return str;
+}
 struct TrieNode {
     std::map<char, TrieNode*> map;
     int32_t Id = -1; 
@@ -280,6 +292,11 @@ struct falcon_vocab {
     using id = int32_t;
     using token = std::string;
     std::map<std::string, uint32_t> max_token_length; // max length, for each 2byte prefix
+    // std::unordered_map<std::pair<std::string, std::string>, int> bpe_ranks;
+    std::map<std::pair<std::string,std::string>, int> bpe_ranks;
+    std::vector<std::pair<std::string, std::string>> bpe_merges;
+    std::unordered_map<std::string, int> special_tokens;
+
 
     struct token_score {
         token tok;
@@ -288,7 +305,7 @@ struct falcon_vocab {
 
     std::unordered_map<token, id> token_to_id;
     std::vector<token_score> id_to_token;
-    Trie trie;
+    Trie trie; // highspeed access to tokens by prefix tree
 
 
     // populate trie from map
@@ -303,6 +320,116 @@ struct falcon_vocab {
             }
         }
     }
+    // populate token ranks map
+    int populate_bpe_ranks(std::vector<std::pair<std::string, std::string>> bpe_merges_) {
+        for (int i = 0; i < bpe_merges_.size(); i++) {
+            bpe_ranks.emplace(bpe_merges_[i], i);
+        }
+        bpe_merges = bpe_merges_;
+
+        // populate special tokens too (0-11 and if available 65024++)
+        for (int i = 0; i < 12; i++) {
+            special_tokens[id_to_token[i].tok] = i;
+        }
+        for (int i = 65024; i < id_to_token.size(); i++) {
+            special_tokens[id_to_token[i].tok] = i;
+        }
+
+        return bpe_merges_.size();
+    }
+   // requires the standard HF type tokenizer.json (pretty printed)
+    std::vector<std::pair<std::string, std::string>> parse_json_to_bpe_merges(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file) {
+            fprintf(stderr, "Error: could not open file %s\n", filename.c_str());
+            return std::vector<std::pair<std::string, std::string>>(); // return empty vector
+        }
+
+        std::string line;
+        std::vector<std::pair<std::string, std::string>> bpe_merges;
+        bool isMergesSection = false;
+        int count=0;
+
+        while (std::getline(file, line)) {
+            // Trim the line
+            line.erase(0, line.find_first_not_of(" \t"));
+            line.erase(line.find_last_not_of(" \t") + 1);
+
+            if (line == "\"merges\": [") {
+                isMergesSection = true;
+                continue;
+            }
+
+            if (isMergesSection) 
+            {
+                static char allowedSymbols[] = {' ', '\t', '\n', '\r', ']', ',', ';'};
+
+                std::vector<char> bytes(line.begin(), line.end()); // Convert the string to vector of bytes
+                if(bytes.size() <= 8) {
+                    bool is_finished=true;
+                    for (const char& byte : bytes) {
+                        if (std::find(std::begin(allowedSymbols), std::end(allowedSymbols), byte) == std::end(allowedSymbols)) {
+                            
+                            is_finished=false;
+                            break;
+                        }
+                    }
+                    if(is_finished)
+                        break;
+                }
+                
+
+                // Remove the leading and trailing quotes
+                if (line.size() < 2) {
+                    fprintf(stderr, "Error: Invalid line format in file %s\n", filename.c_str());
+                    fprintf(stderr, "Line: %s\n", line.c_str());
+                    return std::vector<std::pair<std::string, std::string>>(); // return empty vector
+                }
+                size_t pos = line.find('"');
+                if (pos != std::string::npos) 
+                {
+                line.erase(0, pos + 1);
+                }
+                pos = line.rfind('"');
+                if (pos != std::string::npos) 
+                {
+                    line.erase(pos);
+                }
+
+
+                std::istringstream iss(line);
+                std::string first, second;
+                pos = line.find(' ', 1); // Start the search from the second character
+                if (pos != std::string::npos) 
+                {
+                    first = line.substr(0, pos);
+                    second = line.substr(pos + 1);
+                }
+                for (auto& str : {std::ref(first), std::ref(second)}) 
+                {
+                    size_t pos = 0;
+                    while ((pos = str.get().find("\\\\", pos)) != std::string::npos) {
+                        str.get().replace(pos, 2, "\\");
+                        pos += 1;
+                    }
+                    pos = 0;
+                    while ((pos = str.get().find("\\\"", pos)) != std::string::npos) {
+                        str.get().replace(pos, 2, "\"");
+                        pos += 1;
+                    }
+                }
+                bpe_merges.push_back(std::make_pair(first, second));
+                count++;
+            }
+        }
+
+        if (bpe_merges.empty()) {
+            fprintf(stderr, "Error: could not parse file %s\n", filename.c_str());
+        }
+
+        return bpe_merges;
+    }
+
     // get max token length available for a prefix of 2 bytes (string at least 2 bytes long)
     int get_max_token_length(const std::string& string) const {
         if (string.size() < 2)
@@ -312,6 +439,23 @@ struct falcon_vocab {
             return 0;
         return max_token_length.at(prefix);
     }
+
+    // function to find if two tokens match in bpe_rank, return rank or -1
+    int find_bpe_rank(const std::string& token1, const std::string& token2) const 
+    {
+        std::string left_token = token1;
+        std::string right_token = token2;
+        left_token = replaceAll(left_token, " ", "Ġ");
+        left_token = replaceAll(left_token, "\n", "Ċ");
+        right_token = replaceAll(right_token, " ", "Ġ");
+        right_token = replaceAll(right_token, "\n", "Ċ");
+
+        auto it = bpe_ranks.find(std::make_pair(left_token, right_token));
+        if (it == bpe_ranks.end())
+            return -1;
+        return it->second;
+    }
+
 
     std::pair<falcon_vocab::id, std::string> find_longest_match(const std::string& snippet) const {
         TrieNode* current = trie.root;
@@ -546,20 +690,30 @@ enum llama_file_version {
     LLAMA_FILE_VERSION_GGJT_V1, // added padding
     LLAMA_FILE_VERSION_GGJT_V2, // changed quantization format
     LLAMA_FILE_VERSION_GGJT_V3, // changed Q4 and Q8 quantization format
+    RESERVED_1,
+    RESERVED_2,
+    RESERVED_3,
+    RESERVED_4,
+    RESERVED_5,
+    FALCON_FILE_VERSION_GGCC_V1 // for new falcon tokenizer
+
 };
+
 
 struct falcon_file_loader {
     llama_file file;
     llama_file_version file_version;
     falcon_hparams hparams;
     falcon_vocab vocab;
+    const char * fname;
 
     falcon_file_loader(const char * fname, size_t file_idx, llama_load_tensors_map & tensors_map)
         : file(fname, "rb") {
         fprintf(stderr, "falcon.cpp: loading model from %s\n", fname);
+        this->fname = fname;
         read_magic();
         if (file_version <= 1)
-            fprintf(stderr, "falcon.cpp: file version %d - Use falcon_quantize to update version and improve performance\n", file_version);
+            fprintf(stderr, "falcon.cpp: file version %d - loading foundation model for quantization only\n", file_version);
         else
             fprintf(stderr, "falcon.cpp: file version %d\n", file_version);
         read_hparams();
@@ -575,7 +729,6 @@ struct falcon_file_loader {
         }
 
         uint32_t version = file.read_u32();
-
         switch (magic) {
             case LLAMA_FILE_MAGIC_GGMF:
                 switch (version) {
@@ -588,7 +741,13 @@ struct falcon_file_loader {
                     case 2: file_version = LLAMA_FILE_VERSION_GGJT_V2; return;
                     case 3: file_version = LLAMA_FILE_VERSION_GGJT_V3; return;
                 }
+            case FALCON_FILE_MAGIC_GGCC:
+                switch (version) {
+                    // we start at 10 to avoid confusion with the old GGJT format
+                    case 10: file_version = FALCON_FILE_VERSION_GGCC_V1; return;
+                }
         }
+
 
         throw std::runtime_error(format("unknown (magic, version) combination: %08x, %08x; is this really a GGML file?",
                      magic, version));
@@ -609,6 +768,9 @@ struct falcon_file_loader {
         {
             hparams.ftype = (enum llama_ftype) file.read_u32();
         }
+        if (file_version >= FALCON_FILE_VERSION_GGCC_V1) {
+            hparams.n_bpe_merges = file.read_u32();
+        }
     }
     void read_vocab() {
         vocab.id_to_token.resize(hparams.n_vocab);
@@ -621,23 +783,55 @@ struct falcon_file_loader {
                 file.read_raw(&score, sizeof(score));
             }
             vocab.token_to_id[word] = i;
-            // printf("falcon.cpp: vocab %d %s %f\n", i, word.c_str(), score);
 
             auto & tok_score = vocab.id_to_token[i];
             tok_score.tok = std::move(word);
             tok_score.score = score;
         }
-        if (file_version >= 4 && hparams.n_vocab == 65025 && vocab.id_to_token[65024].tok == "[PAD]") {
+        if (file_version >= LLAMA_FILE_VERSION_GGJT_V3 && hparams.n_vocab == 65025 && vocab.id_to_token[65024].tok == "[PAD]") {
             // wizard hack - shaving off one token
             vocab.id_to_token.resize(65024);
             vocab.token_to_id.erase("[PAD]");
             hparams.n_vocab = 65024;
             // this needs a followup of the tensors itself, quality of the model affected needs to be tested
         }
+        if (file_version >= FALCON_FILE_VERSION_GGCC_V1)
+        {
+            // similar to vocab the merges are read
+            std::vector<std::pair<std::string, std::string>> bpe_merges;
+            int32_t num_bpe_merges = file.read_u32();
+            for (int i = 0; i < num_bpe_merges; i++) {
+                uint32_t len1 = file.read_u32();
+                std::string word1 = file.read_string(len1);
+                uint32_t len2 = file.read_u32();
+                std::string word2 = file.read_string(len2);
+                bpe_merges.push_back(std::make_pair(word1, word2));
+            }
+            vocab.populate_bpe_ranks(bpe_merges);
+        } else
+        {
+            // same path as model file, we need to cut the filename off from fname:
+            fprintf(stderr, "falcon.cpp: fallback for old file format. Loading BPE merges from tokenizer.json\n");
+            std::string fname_str(fname);
+            size_t last_slash_idx = fname_str.find_last_of("\\/");
+            std::string parent_path = fname_str.substr(0, last_slash_idx);
+            std::string tokenizer_json_path = parent_path + "/tokenizer.json";
+            auto merges = vocab.parse_json_to_bpe_merges(tokenizer_json_path);
+            if (merges.empty()) {
+                fprintf(stderr, "falcon.cpp: error: old file format requires json data in directory: %s\n", tokenizer_json_path.c_str());
+                exit(1);
+            }
+            int num_bpe_merges = vocab.populate_bpe_ranks(merges);
+            if (num_bpe_merges == 0) {
+                fprintf(stderr, "falcon.cpp: error: old file format, no valid BPE merges found in %s\n", tokenizer_json_path.c_str());
+                exit(1);
+            }
+            hparams.n_bpe_merges = num_bpe_merges;
+        }
+        
         #if 1
         vocab.populate_trie_from_map();
         #endif
-        
     }
     void read_tensor_metadata(size_t file_idx, llama_load_tensors_map & tensors_map) {
         while (file.tell() < file.size) {
@@ -699,6 +893,7 @@ struct llama_file_saver {
     falcon_file_loader * any_file_loader;
     llama_file_saver(const char * fname, falcon_file_loader * any_file_loader, enum llama_ftype new_ftype)
         : file(fname, "wb"), any_file_loader(any_file_loader) {
+        any_file_loader->file_version = LLAMA_FILE_VERSION;
         fprintf(stderr, "falcon.cpp: saving model to %s\n", fname);
         write_magic();
         write_hparams(new_ftype);
@@ -717,17 +912,31 @@ struct llama_file_saver {
         file.write_u32(hparams.n_layer);
         file.write_u32(hparams.n_falcon_type);
         file.write_u32(new_ftype);
+        if (any_file_loader->file_version >= FALCON_FILE_VERSION_GGCC_V1) {
+            file.write_u32(hparams.n_bpe_merges);
+        }
     }
     void write_vocab() {
         if (any_file_loader->file_version == LLAMA_FILE_VERSION_GGML) {
-            fprintf(stderr, "falcon.cpp: WARNING: input is an old file that doesn't have scores; will add dummy scores\n");
+            // fprintf(stderr, "falcon.cpp: WARNING: input is an old file that doesn't have scores; will add dummy scores\n");
         }
         uint32_t n_vocab = any_file_loader->hparams.n_vocab;
         for (uint32_t i = 0; i < n_vocab; i++) {
-            const auto & token_score = any_file_loader->vocab.id_to_token.at(i);
-            file.write_u32((uint32_t) token_score.tok.size());
-            file.write_raw(token_score.tok.data(), token_score.tok.size());
-            file.write_raw(&token_score.score, sizeof(token_score.score));
+            const auto & token = any_file_loader->vocab.id_to_token.at(i);
+            file.write_u32((uint32_t) token.tok.size());
+            file.write_raw(token.tok.data(), token.tok.size());
+            file.write_raw(&token.score, sizeof(token.score));
+        }
+        if (any_file_loader->file_version >= FALCON_FILE_VERSION_GGCC_V1) 
+        {
+            file.write_u32(any_file_loader->hparams.n_bpe_merges);
+            for (int32_t i = 0; i < any_file_loader->hparams.n_bpe_merges; i++) {
+                const auto & bpe_merge = any_file_loader->vocab.bpe_merges.at(i);
+                file.write_u32((uint32_t) bpe_merge.first.size());
+                file.write_raw(bpe_merge.first.data(), bpe_merge.first.size());
+                file.write_u32((uint32_t) bpe_merge.second.size());
+                file.write_raw(bpe_merge.second.data(), bpe_merge.second.size());
+            }
         }
     }
     void write_tensor(falcon_load_tensor & tensor, enum ggml_type new_type, const void * new_data, size_t new_size) {
@@ -1147,6 +1356,9 @@ static const char *llama_file_version_name(llama_file_version version) {
         case LLAMA_FILE_VERSION_GGML: return "'ggml v0'";
         case LLAMA_FILE_VERSION_GGMF_V1: return "ggml v1";
         case LLAMA_FILE_VERSION_GGJT_V3: return "ggml v3";
+
+
+        case FALCON_FILE_VERSION_GGCC_V1: return "ggcc v1";
         default: 
         break;
     }
@@ -1263,13 +1475,13 @@ static void falcon_model_load_internal(
     const uint32_t n_ff = 4 * model.hparams.n_embd;
 
     {
-        fprintf(stderr, "+---------------+------------+---------+-------+--------+---------------+---------+--------+-------+--------+\n");
-        fprintf(stderr, "| %13s | %10s | %7s | %5s | %6s | %13s | %7s | %6s | %5s | %6s |\n",
-                "Info", "format", "n_vocab", "n_ctx", "n_embd", "n_head ; kv", "n_layer", "falcon", "ftype", "n_ff");
-        fprintf(stderr, "+---------------+------------+---------+-------+--------+---------------+---------+--------+-------+--------+\n");
-        fprintf(stderr, "|               | %10s | %7u | %5u | %6u | %7u ; %3u | %7u | %2u;%3s | %5u | %6u |\n",
-                llama_file_version_name(file_version), hparams.n_vocab, hparams.n_ctx, hparams.n_embd, hparams.n_head, hparams.n_head_kv, hparams.n_layer, hparams.n_falcon_type,falcon_model_type_name(model.type), hparams.ftype, n_ff);
-        fprintf(stderr, "+---------------+------------+---------+-------+--------+---------------+---------+--------+-------+--------+\n");
+        fprintf(stderr, "+---------------+------------+---------+---------+-------+--------+---------------+---------+--------+-------+--------+\n");
+        fprintf(stderr, "| %13s | %10s | %7s | %7s | %5s | %6s | %13s | %7s | %6s | %5s | %6s |\n",
+                "Info", "format", "n_vocab", "n_bpe", "n_ctx", "n_embd", "n_head ; kv", "n_layer", "falcon", "ftype", "n_ff");
+        fprintf(stderr, "+---------------+------------+---------+---------+-------+--------+---------------+---------+--------+-------+--------+\n");
+        fprintf(stderr, "|               | %10s | %7u | %7u | %5d | %6u | %7u ; %3u | %7u | %2u;%3s | %5u | %6u |\n",
+                llama_file_version_name(file_version), hparams.n_vocab, hparams.n_bpe_merges, hparams.n_ctx, hparams.n_embd, hparams.n_head, hparams.n_head_kv, hparams.n_layer, hparams.n_falcon_type,falcon_model_type_name(model.type), hparams.ftype, n_ff);
+        fprintf(stderr, "+---------------+------------+---------+---------+-------+--------+---------------+---------+--------+-------+--------+\n");
     }
 
     if (file_version < LLAMA_FILE_VERSION_GGJT_V3) {
@@ -1458,7 +1670,7 @@ static void falcon_model_load_internal(
             
             model.output_norm = ml->get_tensor("transformer.ln_f.weight", {n_embd}, backend_norm);
             model.output_norm_b = ml->get_tensor("transformer.ln_f.bias", {n_embd}, backend_norm);
-            // lm_head does not run in quantized kernels - cuda currently converts it to 32 bit which will cause 2GB vram overhead on 40B
+            // lm_head does not always run in quantized kernels - cuda currently converts it to 16 bit which will cause 1GB vram overhead on 40B
             model.lm_head = ml->get_tensor("lm_head.weight", {n_embd, n_vocab}, backend_output);
         }
 
@@ -2130,16 +2342,10 @@ static bool falcon_eval_internal(
 }
 
 //
-// tokenizer
+// tokenizer - bpe type, gpt2 tokenization compatible
 //
 
-static size_t utf8_len(char src) {
-    const size_t lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4 };
-    uint8_t highbits = static_cast<uint8_t>(src) >> 4;
-    return lookup[highbits];
-}
-
-struct llama_sp_symbol {
+struct ggllm_bpe_symbol {
     using index = int;
     index prev;
     index next;
@@ -2147,179 +2353,146 @@ struct llama_sp_symbol {
     size_t n;
 };
 
-static_assert(std::is_trivially_copyable<llama_sp_symbol>::value, "llama_sp_symbol is not trivially copyable");
+static_assert(std::is_trivially_copyable<ggllm_bpe_symbol>::value, "ggllm_bpe_symbol is not trivially copyable");
 
-struct llama_sp_bigram {
-    struct comparator {
-        bool operator()(llama_sp_bigram & l, llama_sp_bigram & r) {
-            //return (l.score < r.score) || (l.score == r.score && l.left > r.left);
-            //printf("Comparing '%s' with '%s' :  Size %zu : %zu, Left %d : %d, Right %d : %d == %s\n", l.text.c_str(), r.text.c_str(), l.size, r.size, l.left, r.left, l.right, r.right, (l.left > r.left || (l.size < r.size))? "true" : "false");
-            return l.left > r.left || (l.size < r.size);
+struct ggllm_bpe_bigram {
+    struct comparator 
+    {
+        bool operator()(ggllm_bpe_bigram & l, ggllm_bpe_bigram & r) 
+        {
+            return l.rank > r.rank || (l.rank == r.rank && l.left > r.left);
         }
     };
-    using queue_storage = std::vector<llama_sp_bigram>;
-    using queue = std::priority_queue<llama_sp_bigram, queue_storage, comparator>;
-    llama_sp_symbol::index left;
-    llama_sp_symbol::index right;
+
+    using queue_storage = std::vector<ggllm_bpe_bigram>;
+    using queue = std::priority_queue<ggllm_bpe_bigram, queue_storage, comparator>;
+    ggllm_bpe_symbol::index left;
+    ggllm_bpe_symbol::index right;
     std::string text;
-    float score;
+    int rank;
     size_t size;
 };
 
-// original implementation:
-// https://github.com/ggerganov/llama.cpp/commit/074bea2eb1f1349a0118239c4152914aecaa1be4
 struct falcon_tokenizer {
-    falcon_tokenizer(const falcon_vocab & vocab): vocab_(vocab) {}
+    falcon_tokenizer(const falcon_vocab & vocab, bool g2ws_): vocab_(vocab) { flag_g2ws = g2ws_; }
 
     void tokenize(const std::string & text, std::vector<falcon_vocab::id> & output) {
-        // split string into utf8 chars
         int index = 0;
-        size_t offs = 0;
-        while (offs < text.size()) {
-            llama_sp_symbol sym;
-            size_t char_len = std::min(text.size() - offs, utf8_len(text[offs]));
-            sym.text = text.c_str() + offs;
-            sym.n = char_len;
-            offs += char_len;
-            sym.prev = index - 1;
-            sym.next = offs == text.size() ? -1 : index + 1;
-            index++;
-            symbols_.emplace_back(sym);
-        }
-
-        // seed the work queue with all possible 2-character tokens.
-        for (size_t i = 1; i < symbols_.size(); ++i) {
-            try_add_bigram(i - 1, i);
-            //printf("bigram = '%.*s%.*s'\n", (int) symbols_[i-1].n, symbols_[i-1].text, (int) symbols_[i].n, symbols_[i].text);
-        }
-        // copy them
+        int final_prev_index = -1;
+        size_t offset = 0;
         
-        #if 1
-        std::vector<llama_sp_symbol> symbols_first_pass;
-        symbols_first_pass.reserve(symbols_.size());
-        for (auto & s : symbols_) {
-            symbols_first_pass.emplace_back(s);
-        }
+        auto word_collection = bpe_gpt2_preprocess(text); 
         
-        // all symbols that can form a valid token and the length of the token
-        std::vector<std::pair<llama_sp_symbol::index, std::string>> token_symbols;
+        
+        symbols_final.clear(); 
 
-        // tree search for longest matches
-        if (symbols_first_pass.size() > 4)
-        for (int i = 0; i != -1; i = symbols_first_pass[i].next) // iterate through the linked symbols
+        for (auto & word : word_collection) 
         {
-            auto & symbol = symbols_first_pass[i];
-            if (symbol.next == -1 )  break;
-            
-            std::string prefix = std::string(symbol.text,2);
-            auto max_len = vocab_.get_max_token_length(prefix);
-
-            // Construct a string starting from the current symbol 
-            std::string test_chunk = "";
-            int real_max_len = 0;
-            // we now go through the linked list and find the actual max_len
-            for (int j = i; j != -1; j = symbols_first_pass[j].next) {
-                auto & next_symbol = symbols_first_pass[j];
-                if (symbols_first_pass[j].text[0] == ' ') break;
-                real_max_len += next_symbol.n;
-                if (next_symbol.next == -1) break;
-                if (real_max_len >= max_len) break;
-            }
-            test_chunk = std::string(symbol.text, real_max_len);
-            printf("test_chunk = '%s' (%d of %d)\n", test_chunk.c_str(), real_max_len, max_len);
-            
-            //test_chunk = std::string(symbol.text, max_len); 
-            
-            // look forward if token can be formed
-            auto longest_match = vocab_.find_longest_match(test_chunk);
-            falcon_vocab::id matched_id = longest_match.first;
-            std::string matched_token = longest_match.second;
-
-            if (matched_id != -1) {
-                // printf("Matched '%s' with '%s'\n", test_chunk.c_str(), matched_token.c_str());
-                // we now need to prepare to sort a vector of symbols that can form a token and their size
-                token_symbols.emplace_back(i, matched_token);
-            }
-        }
-        std::sort(token_symbols.begin(), token_symbols.end(), [](auto & l, auto & r) { return l.second.size() > r.second.size(); });
-        // printf("Found %zu tokens\n", token_symbols.size());
-        // for (auto & token_symbol : token_symbols) {
-        //     printf("Token:Size = '%s' : %zu\n", token_symbol.second.c_str(), token_symbol.second.size());
-        // }
-
-        
-        for (auto & token_symbol : token_symbols) 
-        {
-            // if (token_symbol.second.size() < 1) break; // anything smaller is handled fine by the queue
-            auto & symbol = symbols_[token_symbol.first];
-            if (symbol.n != 1) continue; // already merged
-            // go through symbol and .next step by step merging
-            printf("Token to form: %s\n", token_symbol.second.c_str());
-            // we need to look ahead if the token is still legal, if yes we'll merge
-            bool can_merge=false;
-            int collector=0;
-            for (int i=token_symbol.first; i != -1; i = symbols_[i].next) {
-                if (symbols_[i].n != 1) break;
-                if (++collector == token_symbol.second.size()) 
+            work_queue_ = ggllm_bpe_bigram::queue();
+            symbols_.clear();
+            bool is_special = false;
+            for (auto it = vocab_.special_tokens.begin(); it != vocab_.special_tokens.end(); ++it)
+            {
+                std::string special_token = it->first;
+                if (word.compare(special_token) == 0)
                 {
-                    can_merge=true;
+                    ggllm_bpe_symbol sym;
+                    sym.text = word.c_str();
+                    sym.n = word.size();
+                    sym.prev = -1;
+                    sym.next = -1;
+                    symbols_.emplace_back(sym);
+                    is_special = true;
                     break;
                 }
             }
 
-            if (!can_merge) printf("Cannot merge '%s'\n", token_symbol.second.c_str());
-            if (!can_merge) continue;
-
-            for (int i=token_symbol.first+1; i != -1; i = symbols_[i].next) {
-                symbol.n += symbols_[i].n;
-                symbol.next = symbols_[i].next;
-                symbols_[i].n = 0;
-                if (symbol.n == token_symbol.second.size()) break;
+            int index = 0;
+            size_t offset = 0;
+            if (!is_special) 
+            {
+       
+                while (offset < word.size()) 
+                {
+                    ggllm_bpe_symbol sym;
+                    size_t char_len = std::min(word.size() - offset, (size_t) CNCTUnicode::utf8_len(word[offset]));
+                    sym.text = word.c_str() + offset;
+                    sym.n = 1;
+                    sym.n = char_len;
+                    offset += sym.n;
+                    sym.prev = index - 1;
+                    sym.next = offset == word.size() ? -1 : index + 1;
+                    index++;
+                    symbols_.emplace_back(sym);
+                }
+                for (size_t i = 1; i < symbols_.size(); ++i) {
+                    add_new_bigram(i - 1, i);
+                }
             }
-            printf("Merged '%.*s' consisting of %zu symbols\n", (int) symbol.n, symbol.text, symbol.n);
+            // build token(s)
+            while (!work_queue_.empty()) 
+            {
+                auto bigram = work_queue_.top();
+                work_queue_.pop();
+
+                auto & left_symbol = symbols_[bigram.left];
+                auto & right_symbol = symbols_[bigram.right];
+
+                if (left_symbol.n == 0 || right_symbol.n == 0) {
+                    continue;
+                }
+                std::string left_token = std::string(left_symbol.text, left_symbol.n);
+                std::string right_token = std::string(right_symbol.text, right_symbol.n);
+                if (left_token + right_token != bigram.text) {
+                    continue;  // Skip this bigram if it's outdated
+                }
+
+                // merge the right sym into the left one
+                left_symbol.n += right_symbol.n;
+                right_symbol.n = 0;
+                
+                // remove the right sym from the chain
+                left_symbol.next = right_symbol.next;
+                if (right_symbol.next >= 0) {
+                    symbols_[right_symbol.next].prev = bigram.left;
+                }
+                
+                add_new_bigram(left_symbol.prev, bigram.left);  // left side of current symbol
+                add_new_bigram(bigram.left, left_symbol.next);  // right side of current symbol
+            }
+            // add the fnished tokens to the final list keeping correct order for next and prev
+            
+            for (auto & sym : symbols_) 
+            {
+                if (sym.n > 0) 
+                {
+                    sym.prev = final_prev_index;
+                    sym.next = -1;
+                    if (final_prev_index != -1) 
+                    {
+                        symbols_final[final_prev_index].next = symbols_final.size();
+                    }
+                    symbols_final.emplace_back(sym);
+                    final_prev_index = symbols_final.size() - 1;
+                }
+            }
         }
-        #endif
-        // keep substituting the highest frequency pairs for as long as we can.
-        while (!work_queue_.empty()) {
-            auto bigram = work_queue_.top();
-            work_queue_.pop();
 
-            auto & left_symbol = symbols_[bigram.left];
-            auto & right_symbol = symbols_[bigram.right];
 
-            // if one of the symbols already got merged, skip it.
-            if (left_symbol.n == 0 || right_symbol.n == 0 ||
-                left_symbol.n + right_symbol.n != bigram.size) {
-                continue;
-            }
-            // we now merge tokens in the queue with each other to form longer tokens
-            // merge the right sym into the left one
-            left_symbol.n += right_symbol.n; // update the length of the left symbol to incorporate the right one
-            //printf("Merging '%.*s' and '%.*s' into '%.*s'\n", (int) left_symbol.n, left_symbol.text, (int) right_symbol.n, right_symbol.text, (int) left_symbol.n, left_symbol.text);
-
-            right_symbol.n = 0;
-            // remove the right sym from the chain
-            left_symbol.next = right_symbol.next;
-            if (right_symbol.next >= 0) {
-                symbols_[right_symbol.next].prev = bigram.left;
-            }
-            // find more substitutions
-            try_add_bigram(left_symbol.prev, bigram.left);  // left side of current bigram
-            try_add_bigram(bigram.left, left_symbol.next);  // right side of current bigram           
-        }
-
+        symbols_ = symbols_final;
+        if (symbols_.size())
         for (int i = 0; i != -1; i = symbols_[i].next) {
             auto & symbol = symbols_[i];
             if (symbol.n == 0) {
                 continue;
             }
-            auto token = vocab_.token_to_id.find(std::string(symbol.text, symbol.n));
+            std::string str = std::string(symbol.text, symbol.n);
+            std::string str_decoded = decode_token(str);
+            auto token = vocab_.token_to_id.find(str_decoded);
 
             if (token == vocab_.token_to_id.end()) {
-                // output any symbols that did not form tokens as (token) bytes.
-                for (int j = 0; j < (int) symbol.n; ++j) {
-                    // falcon_vocab::id token_id = static_cast<uint8_t>(symbol.text[j]) + 3; // not BPE compatible
-                    std::string byte_str(1, symbol.text[j]);
+                for (auto j = str_decoded.begin(); j != str_decoded.end(); ++j) {
+                    std::string byte_str(1, *j);
                     auto token_multibyte = vocab_.token_to_id.find(byte_str);
                     if (token_multibyte == vocab_.token_to_id.end()) {
                         fprintf(stderr,"ERROR: byte not found in vocab: '%s'\n", byte_str.c_str());
@@ -2333,41 +2506,249 @@ struct falcon_tokenizer {
     }
 
 private:
-    void try_add_bigram(int left, int right) {
-        if (left == -1 || right == -1) {
+    void add_new_bigram(int left, int right) 
+    {
+        if (left == -1 || right == -1)  return;
+        
+        std::string left_token = std::string(symbols_[left].text, symbols_[left].n);
+        std::string right_token = std::string(symbols_[right].text, symbols_[right].n);
+
+        int rank_found = -1;
+        rank_found = vocab_.find_bpe_rank(left_token, right_token);
+
+        if (rank_found < 0) {
             return;
         }
 
-        const std::string text = std::string(symbols_[left].text, symbols_[left].n + symbols_[right].n);
-        auto token = vocab_.token_to_id.find(text);
-
-        if (token == vocab_.token_to_id.end()) {
-            return;
-        }
-        // printf("ADDING BI GRAM: '%s' left = '%.*s' right = '%.*s'\n", text.c_str(), (int) symbols_[left].n, symbols_[left].text, (int) symbols_[right].n, symbols_[right].text);
-
-        if (static_cast<size_t>((*token).second) >= vocab_.id_to_token.size()) {
-            return;
-        }
-
-        const auto &tok_score = vocab_.id_to_token[(*token).second];
-
-        llama_sp_bigram bigram;
+        ggllm_bpe_bigram bigram;
         bigram.left = left;
         bigram.right = right;
-        bigram.score = tok_score.score; // With falcon that's always 0.0
-        bigram.size = text.size();
-        bigram.text = text;
+        bigram.rank = rank_found;
+        bigram.size = left_token.size() + right_token.size();
+        bigram.text = left_token + right_token;
         work_queue_.push(bigram);
     }
 
+    std::unordered_map<unsigned char, std::string> bytes_to_unicode() {
+        static std::unordered_map<unsigned char, std::string> hex_map = { { 0x21, "\x21" }, { 0x22, "\x22" }, { 0x23, "\x23" }, { 0x24, "\x24" }, { 0x25, "\x25" }, { 0x26, "\x26" }, { 0x27, "\x27" }, { 0x28, "\x28" }, { 0x29, "\x29" }, { 0x2A, "\x2A" }, { 0x2B, "\x2B" }, { 0x2C, "\x2C" }, { 0x2D, "\x2D" }, { 0x2E, "\x2E" }, { 0x2F, "\x2F" }, { 0x30, "\x30" }, { 0x31, "\x31" }, { 0x32, "\x32" }, { 0x33, "\x33" }, { 0x34, "\x34" }, { 0x35, "\x35" }, { 0x36, "\x36" }, { 0x37, "\x37" }, { 0x38, "\x38" }, { 0x39, "\x39" }, { 0x3A, "\x3A" }, { 0x3B, "\x3B" }, { 0x3C, "\x3C" }, { 0x3D, "\x3D" }, { 0x3E, "\x3E" }, { 0x3F, "\x3F" }, { 0x40, "\x40" }, { 0x41, "\x41" }, { 0x42, "\x42" }, { 0x43, "\x43" }, { 0x44, "\x44" }, { 0x45, "\x45" }, { 0x46, "\x46" }, { 0x47, "\x47" }, { 0x48, "\x48" }, { 0x49, "\x49" }, { 0x4A, "\x4A" }, { 0x4B, "\x4B" }, { 0x4C, "\x4C" }, { 0x4D, "\x4D" }, { 0x4E, "\x4E" }, { 0x4F, "\x4F" }, { 0x50, "\x50" }, { 0x51, "\x51" }, { 0x52, "\x52" }, { 0x53, "\x53" }, { 0x54, "\x54" }, { 0x55, "\x55" }, { 0x56, "\x56" }, { 0x57, "\x57" }, { 0x58, "\x58" }, { 0x59, "\x59" }, { 0x5A, "\x5A" }, { 0x5B, "\x5B" }, { 0x5C, "\x5C" }, { 0x5D, "\x5D" }, { 0x5E, "\x5E" }, { 0x5F, "\x5F" }, { 0x60, "\x60" }, { 0x61, "\x61" }, { 0x62, "\x62" }, { 0x63, "\x63" }, { 0x64, "\x64" }, { 0x65, "\x65" }, { 0x66, "\x66" }, { 0x67, "\x67" }, { 0x68, "\x68" }, { 0x69, "\x69" }, { 0x6A, "\x6A" }, { 0x6B, "\x6B" }, { 0x6C, "\x6C" }, { 0x6D, "\x6D" }, { 0x6E, "\x6E" }, { 0x6F, "\x6F" }, { 0x70, "\x70" }, { 0x71, "\x71" }, { 0x72, "\x72" }, { 0x73, "\x73" }, { 0x74, "\x74" }, { 0x75, "\x75" }, { 0x76, "\x76" }, { 0x77, "\x77" }, { 0x78, "\x78" }, { 0x79, "\x79" }, { 0x7A, "\x7A" }, { 0x7B, "\x7B" }, { 0x7C, "\x7C" }, { 0x7D, "\x7D" }, { 0x7E, "\x7E" }, { 0xA1, "\xC2\xA1" }, { 0xA2, "\xC2\xA2" }, { 0xA3, "\xC2\xA3" }, { 0xA4, "\xC2\xA4" }, { 0xA5, "\xC2\xA5" }, { 0xA6, "\xC2\xA6" }, { 0xA7, "\xC2\xA7" }, { 0xA8, "\xC2\xA8" }, { 0xA9, "\xC2\xA9" }, { 0xAA, "\xC2\xAA" }, { 0xAB, "\xC2\xAB" }, { 0xAC, "\xC2\xAC" }, { 0xAE, "\xC2\xAE" }, { 0xAF, "\xC2\xAF" }, { 0xB0, "\xC2\xB0" }, { 0xB1, "\xC2\xB1" }, { 0xB2, "\xC2\xB2" }, { 0xB3, "\xC2\xB3" }, { 0xB4, "\xC2\xB4" }, { 0xB5, "\xC2\xB5" }, { 0xB6, "\xC2\xB6" }, { 0xB7, "\xC2\xB7" }, { 0xB8, "\xC2\xB8" }, { 0xB9, "\xC2\xB9" }, { 0xBA, "\xC2\xBA" }, { 0xBB, "\xC2\xBB" }, { 0xBC, "\xC2\xBC" }, { 0xBD, "\xC2\xBD" }, { 0xBE, "\xC2\xBE" }, { 0xBF, "\xC2\xBF" }, { 0xC0, "\xC3\x80" }, { 0xC1, "\xC3\x81" }, { 0xC2, "\xC3\x82" }, { 0xC3, "\xC3\x83" }, { 0xC4, "\xC3\x84" }, { 0xC5, "\xC3\x85" }, { 0xC6, "\xC3\x86" }, { 0xC7, "\xC3\x87" }, { 0xC8, "\xC3\x88" }, { 0xC9, "\xC3\x89" }, { 0xCA, "\xC3\x8A" }, { 0xCB, "\xC3\x8B" }, { 0xCC, "\xC3\x8C" }, { 0xCD, "\xC3\x8D" }, { 0xCE, "\xC3\x8E" }, { 0xCF, "\xC3\x8F" }, { 0xD0, "\xC3\x90" }, { 0xD1, "\xC3\x91" }, { 0xD2, "\xC3\x92" }, { 0xD3, "\xC3\x93" }, { 0xD4, "\xC3\x94" }, { 0xD5, "\xC3\x95" }, { 0xD6, "\xC3\x96" }, { 0xD7, "\xC3\x97" }, { 0xD8, "\xC3\x98" }, { 0xD9, "\xC3\x99" }, { 0xDA, "\xC3\x9A" }, { 0xDB, "\xC3\x9B" }, { 0xDC, "\xC3\x9C" }, { 0xDD, "\xC3\x9D" }, { 0xDE, "\xC3\x9E" }, { 0xDF, "\xC3\x9F" }, { 0xE0, "\xC3\xA0" }, { 0xE1, "\xC3\xA1" }, { 0xE2, "\xC3\xA2" }, { 0xE3, "\xC3\xA3" }, { 0xE4, "\xC3\xA4" }, { 0xE5, "\xC3\xA5" }, { 0xE6, "\xC3\xA6" }, { 0xE7, "\xC3\xA7" }, { 0xE8, "\xC3\xA8" }, { 0xE9, "\xC3\xA9" }, { 0xEA, "\xC3\xAA" }, { 0xEB, "\xC3\xAB" }, { 0xEC, "\xC3\xAC" }, { 0xED, "\xC3\xAD" }, { 0xEE, "\xC3\xAE" }, { 0xEF, "\xC3\xAF" }, { 0xF0, "\xC3\xB0" }, { 0xF1, "\xC3\xB1" }, { 0xF2, "\xC3\xB2" }, { 0xF3, "\xC3\xB3" }, { 0xF4, "\xC3\xB4" }, { 0xF5, "\xC3\xB5" }, { 0xF6, "\xC3\xB6" }, { 0xF7, "\xC3\xB7" }, { 0xF8, "\xC3\xB8" }, { 0xF9, "\xC3\xB9" }, { 0xFA, "\xC3\xBA" }, { 0xFB, "\xC3\xBB" }, { 0xFC, "\xC3\xBC" }, { 0xFD, "\xC3\xBD" }, { 0xFE, "\xC3\xBE" }, { 0xFF, "\xC3\xBF" }, { 0x00, "\xC4\x80" }, { 0x01, "\xC4\x81" }, { 0x02, "\xC4\x82" }, { 0x03, "\xC4\x83" }, { 0x04, "\xC4\x84" }, { 0x05, "\xC4\x85" }, { 0x06, "\xC4\x86" }, { 0x07, "\xC4\x87" }, { 0x08, "\xC4\x88" }, { 0x09, "\xC4\x89" }, { 0x0A, "\xC4\x8A" }, { 0x0B, "\xC4\x8B" }, { 0x0C, "\xC4\x8C" }, { 0x0D, "\xC4\x8D" }, { 0x0E, "\xC4\x8E" }, { 0x0F, "\xC4\x8F" }, { 0x10, "\xC4\x90" }, { 0x11, "\xC4\x91" }, { 0x12, "\xC4\x92" }, { 0x13, "\xC4\x93" }, { 0x14, "\xC4\x94" }, { 0x15, "\xC4\x95" }, { 0x16, "\xC4\x96" }, { 0x17, "\xC4\x97" }, { 0x18, "\xC4\x98" }, { 0x19, "\xC4\x99" }, { 0x1A, "\xC4\x9A" }, { 0x1B, "\xC4\x9B" }, { 0x1C, "\xC4\x9C" }, { 0x1D, "\xC4\x9D" }, { 0x1E, "\xC4\x9E" }, { 0x1F, "\xC4\x9F" }, { 0x20, "\xC4\xA0" }, { 0x7F, "\xC4\xA1" }, { 0x80, "\xC4\xA2" }, { 0x81, "\xC4\xA3" }, { 0x82, "\xC4\xA4" }, { 0x83, "\xC4\xA5" }, { 0x84, "\xC4\xA6" }, { 0x85, "\xC4\xA7" }, { 0x86, "\xC4\xA8" }, { 0x87, "\xC4\xA9" }, { 0x88, "\xC4\xAA" }, { 0x89, "\xC4\xAB" }, { 0x8A, "\xC4\xAC" }, { 0x8B, "\xC4\xAD" }, { 0x8C, "\xC4\xAE" }, { 0x8D, "\xC4\xAF" }, { 0x8E, "\xC4\xB0" }, { 0x8F, "\xC4\xB1" }, { 0x90, "\xC4\xB2" }, { 0x91, "\xC4\xB3" }, { 0x92, "\xC4\xB4" }, { 0x93, "\xC4\xB5" }, { 0x94, "\xC4\xB6" }, { 0x95, "\xC4\xB7" }, { 0x96, "\xC4\xB8" }, { 0x97, "\xC4\xB9" }, { 0x98, "\xC4\xBA" }, { 0x99, "\xC4\xBB" }, { 0x9A, "\xC4\xBC" }, { 0x9B, "\xC4\xBD" }, { 0x9C, "\xC4\xBE" }, { 0x9D, "\xC4\xBF" }, { 0x9E, "\xC5\x80" }, { 0x9F, "\xC5\x81" }, { 0xA0, "\xC5\x82" }, { 0xAD, "\xC5\x83" }};
+        return hex_map;
+    }
+    
+    std::unordered_map<std::string, unsigned char> unicode_to_bytes() {
+        static std::unordered_map<std::string, unsigned char> hex_map = { { "\x21", 0x21 }, { "\x22", 0x22 }, { "\x23", 0x23 }, { "\x24", 0x24 }, { "\x25", 0x25 }, { "\x26", 0x26 }, { "\x27", 0x27 }, { "\x28", 0x28 }, { "\x29", 0x29 }, { "\x2A", 0x2A }, { "\x2B", 0x2B }, { "\x2C", 0x2C }, { "\x2D", 0x2D }, { "\x2E", 0x2E }, { "\x2F", 0x2F }, { "\x30", 0x30 }, { "\x31", 0x31 }, { "\x32", 0x32 }, { "\x33", 0x33 }, { "\x34", 0x34 }, { "\x35", 0x35 }, { "\x36", 0x36 }, { "\x37", 0x37 }, { "\x38", 0x38 }, { "\x39", 0x39 }, { "\x3A", 0x3A }, { "\x3B", 0x3B }, { "\x3C", 0x3C }, { "\x3D", 0x3D }, { "\x3E", 0x3E }, { "\x3F", 0x3F }, { "\x40", 0x40 }, { "\x41", 0x41 }, { "\x42", 0x42 }, { "\x43", 0x43 }, { "\x44", 0x44 }, { "\x45", 0x45 }, { "\x46", 0x46 }, { "\x47", 0x47 }, { "\x48", 0x48 }, { "\x49", 0x49 }, { "\x4A", 0x4A }, { "\x4B", 0x4B }, { "\x4C", 0x4C }, { "\x4D", 0x4D }, { "\x4E", 0x4E }, { "\x4F", 0x4F }, { "\x50", 0x50 }, { "\x51", 0x51 }, { "\x52", 0x52 }, { "\x53", 0x53 }, { "\x54", 0x54 }, { "\x55", 0x55 }, { "\x56", 0x56 }, { "\x57", 0x57 }, { "\x58", 0x58 }, { "\x59", 0x59 }, { "\x5A", 0x5A }, { "\x5B", 0x5B }, { "\x5C", 0x5C }, { "\x5D", 0x5D }, { "\x5E", 0x5E }, { "\x5F", 0x5F }, { "\x60", 0x60 }, { "\x61", 0x61 }, { "\x62", 0x62 }, { "\x63", 0x63 }, { "\x64", 0x64 }, { "\x65", 0x65 }, { "\x66", 0x66 }, { "\x67", 0x67 }, { "\x68", 0x68 }, { "\x69", 0x69 }, { "\x6A", 0x6A }, { "\x6B", 0x6B }, { "\x6C", 0x6C }, { "\x6D", 0x6D }, { "\x6E", 0x6E }, { "\x6F", 0x6F }, { "\x70", 0x70 }, { "\x71", 0x71 }, { "\x72", 0x72 }, { "\x73", 0x73 }, { "\x74", 0x74 }, { "\x75", 0x75 }, { "\x76", 0x76 }, { "\x77", 0x77 }, { "\x78", 0x78 }, { "\x79", 0x79 }, { "\x7A", 0x7A }, { "\x7B", 0x7B }, { "\x7C", 0x7C }, { "\x7D", 0x7D }, { "\x7E", 0x7E }, { "\xC2\xA1", 0xA1 }, { "\xC2\xA2", 0xA2 }, { "\xC2\xA3", 0xA3 }, { "\xC2\xA4", 0xA4 }, { "\xC2\xA5", 0xA5 }, { "\xC2\xA6", 0xA6 }, { "\xC2\xA7", 0xA7 }, { "\xC2\xA8", 0xA8 }, { "\xC2\xA9", 0xA9 }, { "\xC2\xAA", 0xAA }, { "\xC2\xAB", 0xAB }, { "\xC2\xAC", 0xAC }, { "\xC2\xAE", 0xAE }, { "\xC2\xAF", 0xAF }, { "\xC2\xB0", 0xB0 }, { "\xC2\xB1", 0xB1 }, { "\xC2\xB2", 0xB2 }, { "\xC2\xB3", 0xB3 }, { "\xC2\xB4", 0xB4 }, { "\xC2\xB5", 0xB5 }, { "\xC2\xB6", 0xB6 }, { "\xC2\xB7", 0xB7 }, { "\xC2\xB8", 0xB8 }, { "\xC2\xB9", 0xB9 }, { "\xC2\xBA", 0xBA }, { "\xC2\xBB", 0xBB }, { "\xC2\xBC", 0xBC }, { "\xC2\xBD", 0xBD }, { "\xC2\xBE", 0xBE }, { "\xC2\xBF", 0xBF }, { "\xC3\x80", 0xC0 }, { "\xC3\x81", 0xC1 }, { "\xC3\x82", 0xC2 }, { "\xC3\x83", 0xC3 }, { "\xC3\x84", 0xC4 }, { "\xC3\x85", 0xC5 }, { "\xC3\x86", 0xC6 }, { "\xC3\x87", 0xC7 }, { "\xC3\x88", 0xC8 }, { "\xC3\x89", 0xC9 }, { "\xC3\x8A", 0xCA }, { "\xC3\x8B", 0xCB }, { "\xC3\x8C", 0xCC }, { "\xC3\x8D", 0xCD }, { "\xC3\x8E", 0xCE }, { "\xC3\x8F", 0xCF }, { "\xC3\x90", 0xD0 }, { "\xC3\x91", 0xD1 }, { "\xC3\x92", 0xD2 }, { "\xC3\x93", 0xD3 }, { "\xC3\x94", 0xD4 }, { "\xC3\x95", 0xD5 }, { "\xC3\x96", 0xD6 }, { "\xC3\x97", 0xD7 }, { "\xC3\x98", 0xD8 }, { "\xC3\x99", 0xD9 }, { "\xC3\x9A", 0xDA }, { "\xC3\x9B", 0xDB }, { "\xC3\x9C", 0xDC }, { "\xC3\x9D", 0xDD }, { "\xC3\x9E", 0xDE }, { "\xC3\x9F", 0xDF }, { "\xC3\xA0", 0xE0 }, { "\xC3\xA1", 0xE1 }, { "\xC3\xA2", 0xE2 }, { "\xC3\xA3", 0xE3 }, { "\xC3\xA4", 0xE4 }, { "\xC3\xA5", 0xE5 }, { "\xC3\xA6", 0xE6 }, { "\xC3\xA7", 0xE7 }, { "\xC3\xA8", 0xE8 }, { "\xC3\xA9", 0xE9 }, { "\xC3\xAA", 0xEA }, { "\xC3\xAB", 0xEB }, { "\xC3\xAC", 0xEC }, { "\xC3\xAD", 0xED }, { "\xC3\xAE", 0xEE }, { "\xC3\xAF", 0xEF }, { "\xC3\xB0", 0xF0 }, { "\xC3\xB1", 0xF1 }, { "\xC3\xB2", 0xF2 }, { "\xC3\xB3", 0xF3 }, { "\xC3\xB4", 0xF4 }, { "\xC3\xB5", 0xF5 }, { "\xC3\xB6", 0xF6 }, { "\xC3\xB7", 0xF7 }, { "\xC3\xB8", 0xF8 }, { "\xC3\xB9", 0xF9 }, { "\xC3\xBA", 0xFA }, { "\xC3\xBB", 0xFB }, { "\xC3\xBC", 0xFC }, { "\xC3\xBD", 0xFD }, { "\xC3\xBE", 0xFE }, { "\xC3\xBF", 0xFF }, { "\xC4\x80", 0x00 }, { "\xC4\x81", 0x01 }, { "\xC4\x82", 0x02 }, { "\xC4\x83", 0x03 }, { "\xC4\x84", 0x04 }, { "\xC4\x85", 0x05 }, { "\xC4\x86", 0x06 }, { "\xC4\x87", 0x07 }, { "\xC4\x88", 0x08 }, { "\xC4\x89", 0x09 }, { "\xC4\x8A", 0x0A }, { "\xC4\x8B", 0x0B }, { "\xC4\x8C", 0x0C }, { "\xC4\x8D", 0x0D }, { "\xC4\x8E", 0x0E }, { "\xC4\x8F", 0x0F }, { "\xC4\x90", 0x10 }, { "\xC4\x91", 0x11 }, { "\xC4\x92", 0x12 }, { "\xC4\x93", 0x13 }, { "\xC4\x94", 0x14 }, { "\xC4\x95", 0x15 }, { "\xC4\x96", 0x16 }, { "\xC4\x97", 0x17 }, { "\xC4\x98", 0x18 }, { "\xC4\x99", 0x19 }, { "\xC4\x9A", 0x1A }, { "\xC4\x9B", 0x1B }, { "\xC4\x9C", 0x1C }, { "\xC4\x9D", 0x1D }, { "\xC4\x9E", 0x1E }, { "\xC4\x9F", 0x1F }, { "\xC4\xA0", 0x20 }, { "\xC4\xA1", 0x7F }, { "\xC4\xA2", 0x80 }, { "\xC4\xA3", 0x81 }, { "\xC4\xA4", 0x82 }, { "\xC4\xA5", 0x83 }, { "\xC4\xA6", 0x84 }, { "\xC4\xA7", 0x85 }, { "\xC4\xA8", 0x86 }, { "\xC4\xA9", 0x87 }, { "\xC4\xAA", 0x88 }, { "\xC4\xAB", 0x89 }, { "\xC4\xAC", 0x8A }, { "\xC4\xAD", 0x8B }, { "\xC4\xAE", 0x8C }, { "\xC4\xAF", 0x8D }, { "\xC4\xB0", 0x8E }, { "\xC4\xB1", 0x8F }, { "\xC4\xB2", 0x90 }, { "\xC4\xB3", 0x91 }, { "\xC4\xB4", 0x92 }, { "\xC4\xB5", 0x93 }, { "\xC4\xB6", 0x94 }, { "\xC4\xB7", 0x95 }, { "\xC4\xB8", 0x96 }, { "\xC4\xB9", 0x97 }, { "\xC4\xBA", 0x98 }, { "\xC4\xBB", 0x99 }, { "\xC4\xBC", 0x9A }, { "\xC4\xBD", 0x9B }, { "\xC4\xBE", 0x9C }, { "\xC4\xBF", 0x9D }, { "\xC5\x80", 0x9E }, { "\xC5\x81", 0x9F }, { "\xC5\x82", 0xA0 }, { "\xC5\x83", 0xAD }};
+        return hex_map;
+    }
+
+    std::vector<std::string> bpe_gpt2_preprocess(const std::string& text) 
+    {
+        static std::unordered_map< unsigned char, std::string> byte_encoder = bytes_to_unicode();
+        std::vector<std::string> bpe_words;
+        std::vector<std::string> bpe_encoded_words;
+        
+
+        std::string token="";
+        char *raw_text_p = (char*)text.c_str();
+        // GPT2 system regex:  's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+        bool collecting_numeric = false;
+        bool collecting_letter = false;
+        bool collecting_special = false;
+        bool collecting_whitespace_lookahead = false;
+        bool collecting=false;
+
+        std::vector<CNCTString> text_utf = CNCTUnicode::split_utf8_enhanced(text);
+        std::unordered_map<std::string, int> special_tokens = vocab_.special_tokens;
+        size_t smallest_len_special_tokens = 1024;
+        for (auto it = special_tokens.begin(); it != special_tokens.end(); ++it)
+        {
+            std::string special_token = it->first;
+            if (special_token.size() < smallest_len_special_tokens)
+                smallest_len_special_tokens = special_token.size();
+        }
+
+        for (int i = 0; i < text_utf.size(); i++) 
+        {
+            const CNCTString &utf_char = text_utf[i];
+            bool split_condition = false;
+            char *text_pos = raw_text_p + utf_char.seq_offset_bytes;
+            int bytes_remain = strlen(text_pos);
+            // forward backward lookups
+            CNCTString utf_char_next = (i+1 < text_utf.size()) ? text_utf[i+1] : CNCTString();
+            CNCTString utf_char_next_next = (i+2 < text_utf.size()) ? text_utf[i+2] : CNCTString();
+            CNCTString utf_char_prev = (i > 0) ? text_utf[i-1] : CNCTString();
+
+            // handling special tokens
+            bool special_token_found = false;
+            if (bytes_remain >= smallest_len_special_tokens)
+            for (auto it = special_tokens.begin(); it != special_tokens.end(); ++it)
+            {
+                std::string special_token = it->first;
+                if ((bytes_remain) < special_token.size())
+                    continue;
+                if (strncmp(text_pos, special_token.c_str(), special_token.size()) == 0)
+                {
+                    if (token.size())
+                    {
+                        bpe_words.push_back(token); // push previous content as token
+                        token = "";
+                    }
+                    bpe_words.push_back(special_token); // push special token as token
+                    // we now advance i until the token is fulfilled by the utf_chars
+                    int st_bytes = special_token.size();
+                    for (;st_bytes;st_bytes -= text_utf[i++].str.size());
+                    i--;
+                    special_token_found = true;
+                    break;
+                }
+            }
+            if (special_token_found)   continue;
+
+
+        
+
+            // handling contractions
+            if (!split_condition && bytes_remain >= 2)
+            {
+                // 's|'t|'m|'d
+                if (utf_char == '\'' && (utf_char_next == 's' || utf_char_next == 't' || utf_char_next == 'm' || utf_char_next == 'd'))
+                    split_condition = true;
+                if (split_condition)
+                {
+                    if (token.size())
+                        bpe_words.push_back(token); // push previous content as token
+                    token = utf_char.str + utf_char_next.str; 
+                    bpe_words.push_back(token); 
+                    token="";
+                    i++;
+                    continue;
+                }
+            }
+            if (!split_condition && bytes_remain >= 3)
+            {
+                // 're|'ve|'ll
+                if (utf_char == '\'' && (
+                    (utf_char_next == 'r' || utf_char_next_next == 'e') ||
+                    (utf_char_next == 'v' || utf_char_next_next == 'e') ||
+                    (utf_char_next == 'l' || utf_char_next_next == 'l')) 
+                )
+                    split_condition = true;
+                if (split_condition)
+                {
+                    // current token + next token can be defined
+                    if (token.size())
+                        bpe_words.push_back(token); // push previous content as token
+                    token = utf_char.str + utf_char_next.str + utf_char_next_next.str; 
+                    bpe_words.push_back(token); // the contraction
+                    token="";
+                    i+=2;
+                    continue;
+                }
+            }
+
+            if (!split_condition && !collecting)
+            {
+                if (utf_char.char_type == CNCTCharType::LETTER || (!token.size() && utf_char==" " && utf_char_next.char_type == CNCTCharType::LETTER)) 
+                {
+                    collecting_letter = true;
+                    collecting = true;
+                }
+                else if (utf_char.char_type == CNCTCharType::DIGIT || (!token.size() && utf_char==" " && utf_char_next.char_type == CNCTCharType::DIGIT))
+                {
+                    collecting_numeric = true;
+                    collecting = true;
+                }
+                else if (
+                    (utf_char.char_type != CNCTCharType::LETTER && utf_char.char_type != CNCTCharType::DIGIT) && (utf_char.char_type != CNCTCharType::WHITESPACE) ||
+                    (!token.size() && utf_char==" " && utf_char_next.char_type != CNCTCharType::LETTER && utf_char_next.char_type != CNCTCharType::DIGIT && utf_char_next.char_type != CNCTCharType::WHITESPACE)
+                    )
+                {
+                    collecting_special = true;
+                    collecting = true; 
+                }
+                else if (utf_char.char_type == CNCTCharType::WHITESPACE && utf_char_next.char_type == CNCTCharType::WHITESPACE)
+                {
+                    collecting_whitespace_lookahead = true;
+                    collecting = true;
+                } else if (utf_char.char_type == CNCTCharType::WHITESPACE)
+                {
+                    split_condition = true;
+                }
+            } else
+            if (!split_condition && collecting)
+            {
+                if (collecting_letter && utf_char.char_type != CNCTCharType::LETTER)
+                {
+                    split_condition = true;
+                }
+                else if (collecting_numeric && utf_char.char_type != CNCTCharType::DIGIT)
+                {
+                    split_condition = true;
+                }
+                else if (collecting_special && (utf_char.char_type == CNCTCharType::LETTER || utf_char.char_type == CNCTCharType::DIGIT || utf_char.char_type == CNCTCharType::WHITESPACE))
+                {
+                    split_condition = true;
+                }
+                else if (collecting_whitespace_lookahead && utf_char_next.char_type != CNCTCharType::WHITESPACE)
+                {
+                    split_condition = true;
+                }
+            }
+            if(utf_char_next.str.size() == 0)
+            {
+                split_condition = true; // final
+                token += utf_char.str;
+            }
+
+            if (split_condition)
+            {
+                if (token.size())
+                    bpe_words.push_back(token);
+                token = utf_char.str;
+                collecting = false;
+                collecting_letter = false;
+                collecting_numeric = false;
+                collecting_special = false;
+                collecting_whitespace_lookahead = false;
+            } else token += utf_char.str;
+        }
+
+        for (std::string& word : bpe_words)
+        {
+            std::string encoded_token="";
+            for (char& c : word) 
+            {
+                encoded_token += byte_encoder[c];
+            }
+            bpe_encoded_words.push_back(encoded_token);
+        }
+
+        return bpe_encoded_words;
+    }
+
+    // decoder (for one token)
+    std::string decode_token(const std::string& token)
+    {
+        static std::unordered_map< std::string, unsigned char> byte_decoder = unicode_to_bytes();
+        std::string decoded_token="";
+        auto unicode_seqeunces = CNCTUnicode::split_utf8(token);
+        for (auto& unicode_sequence : unicode_seqeunces)
+        {
+            decoded_token += byte_decoder[unicode_sequence];
+          
+        }
+        
+        return decoded_token;
+    }
+        
+
     const falcon_vocab & vocab_;
-    std::vector<llama_sp_symbol> symbols_;
-    llama_sp_bigram::queue work_queue_;
+    std::vector<ggllm_bpe_symbol> symbols_;
+    std::vector<ggllm_bpe_symbol> symbols_final;
+    ggllm_bpe_bigram::queue work_queue_;
+    bool flag_g2ws=false;
 };
 
-static std::vector<falcon_vocab::id> falcon_tokenize(const falcon_vocab & vocab, const std::string & text, bool bos) {
-    falcon_tokenizer tokenizer(vocab);
+static std::vector<falcon_vocab::id> falcon_tokenize(const falcon_vocab & vocab, const std::string & text, bool bos, bool g2ws) {
+    falcon_tokenizer tokenizer(vocab, g2ws);
     std::vector<falcon_vocab::id> output;
 
     if (text.empty()) {
@@ -2927,7 +3308,7 @@ static void falcon_model_quantize_internal(const std::string & fname_inp, const 
 
         // quantize only 2D tensors
         quantize &= (tensor.ne.size() == 2);
-        quantize &= params->quantize_output_tensor || tensor.name != "output.weight";
+        quantize &= params->quantize_output_tensor || tensor.name != "lm_head.weight";
         quantize &= quantized_type != tensor.type;
     
         enum ggml_type new_type;
@@ -2949,7 +3330,7 @@ static void falcon_model_quantize_internal(const std::string & fname_inp, const 
                 int ny = tensor.ne.at(0);
                 if (nx % QK_K != 0 || ny % QK_K != 0) {
                     fprintf(stderr, "\n\n========================= Tensor sizes %d x %d are not divisible by %d\n",nx,ny,QK_K);
-                    fprintf(stderr, "This is required to be able to use k-quants for now!\n");
+                    fprintf(stderr, "This is required to be able to use k-quants for now - use legacy quantizer instead (non K)!\n");
                     fprintf(stderr, "========================================================================================\n\n");
                     throw std::runtime_error("Unsupported tensor size encountered\n");
                 }
@@ -3860,10 +4241,10 @@ int falcon_tokenize(
                  llama_token * tokens,
                          int   n_max_tokens,
                         bool   add_bos) {
-    auto res = falcon_tokenize(ctx->vocab, text, add_bos);
+    auto res = falcon_tokenize(ctx->vocab, text, add_bos, true);
 
     if (n_max_tokens < (int) res.size()) {
-        fprintf(stderr, "%s: too many tokens\n", __func__);
+        fprintf(stderr, "%s: too many tokens: %d < %zu\n", __func__, n_max_tokens, res.size());
         return -((int) res.size());
     }
 

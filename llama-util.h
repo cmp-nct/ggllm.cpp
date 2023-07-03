@@ -102,17 +102,19 @@ struct llama_file {
     }
 
     void read_raw(void * ptr, size_t len) const {
+        static size_t total_read = 0;
         if (len == 0) {
             return;
         }
         errno = 0;
         std::size_t ret = std::fread(ptr, len, 1, fp);
         if (ferror(fp)) {
-            throw std::runtime_error(format("read error: %s", strerror(errno)));
+            throw std::runtime_error(format("read error at position %d (total read: %d): %s", ftell(fp), total_read, strerror(errno)));
         }
         if (ret != 1) {
-            throw std::runtime_error(std::string("unexpectedly reached end of file"));
+            throw std::runtime_error(format("unexpectedly reached end of file at position %d (total read: %d)", ftell(fp), total_read));
         }
+        total_read += len;
     }
 
     std::uint32_t read_u32() {

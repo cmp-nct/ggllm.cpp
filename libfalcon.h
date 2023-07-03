@@ -32,8 +32,10 @@
 #define LLAMA_FILE_MAGIC_GGML        0x67676d6cu // 'ggml'
 #define LLAMA_FILE_MAGIC_GGSN        0x6767736eu // 'ggsn'
 
-#define LLAMA_FILE_VERSION           3
-#define LLAMA_FILE_MAGIC             LLAMA_FILE_MAGIC_GGJT
+#define FALCON_FILE_MAGIC_GGCC        0x67676363u // 'ggcc' (cmp-cnt enhancements for ggllm.cpp)
+
+#define LLAMA_FILE_VERSION           FALCON_FILE_VERSION_GGCC_V1
+#define LLAMA_FILE_MAGIC             FALCON_FILE_MAGIC_GGCC
 #define LLAMA_FILE_MAGIC_UNVERSIONED LLAMA_FILE_MAGIC_GGML
 #define LLAMA_SESSION_MAGIC          LLAMA_FILE_MAGIC_GGSN
 #define LLAMA_SESSION_VERSION        1
@@ -317,4 +319,6 @@ std::vector<std::pair<std::string, struct ggml_tensor *>>& llama_internal_get_te
 
 #endif
 
+
+ 
 #endif 

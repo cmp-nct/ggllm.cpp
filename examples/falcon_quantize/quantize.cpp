@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 
+#define FILE_VERSION_S "GGCC Falcon V1"
 struct quant_option {
     std::string name;
     llama_ftype ftype;
@@ -17,99 +18,99 @@ static const std::vector<struct quant_option> QUANT_OPTIONS = {
     {
         "Q4_0",
         LLAMA_FTYPE_MOSTLY_Q4_0,
-        " 3.50G, +0.2499 ppl @ 7B - small, very high quality loss - legacy, prefer using Q3_K_M",
+        " - small, very high quality loss",
     },
     {
         "Q4_1",
         LLAMA_FTYPE_MOSTLY_Q4_1,
-        " 3.90G, +0.1846 ppl @ 7B - small, substantial quality loss - legacy, prefer using Q3_K_L",
+        " - small, substantial quality loss",
     },
     {
         "Q5_0",
         LLAMA_FTYPE_MOSTLY_Q5_0,
-        " 4.30G, +0.0796 ppl @ 7B - medium, balanced quality - legacy, prefer using Q4_K_M",
+        " - medium, balanced quality",
     },
     {
         "Q5_1",
         LLAMA_FTYPE_MOSTLY_Q5_1,
-        " 4.70G, +0.0415 ppl @ 7B - medium, low quality loss - legacy, prefer using Q5_K_M",
+        " - medium, low quality loss",
     },
 #ifdef GGML_USE_K_QUANTS
     {
         "Q2_K",
         LLAMA_FTYPE_MOSTLY_Q2_K,
-        " 2.67G, +0.8698 ppl @ 7B - smallest, extreme quality loss - not recommended",
+        " - smallest, very high quality loss - try for yourself",
     },
     {
         "Q3_K",
         LLAMA_FTYPE_MOSTLY_Q3_K_M,
-        "alias for Q3_K_M"
+        " - very small, very high quality loss"
     },
-    {
-        "Q3_K_S",
-        LLAMA_FTYPE_MOSTLY_Q3_K_S,
-        " 2.75G, +0.5505 ppl @ 7B - very small, very high quality loss",
-    },
-    {
-        "Q3_K_M",
-        LLAMA_FTYPE_MOSTLY_Q3_K_M,
-        " 3.06G, +0.2437 ppl @ 7B - very small, very high quality loss",
-    },
-    {
-        "Q3_K_L",
-        LLAMA_FTYPE_MOSTLY_Q3_K_L,
-        " 3.35G, +0.1803 ppl @ 7B - small, substantial quality loss",
-    },
+    // {
+    //     "Q3_K_S",
+    //     LLAMA_FTYPE_MOSTLY_Q3_K_S,
+    //     " 2.75G, +0.5505 ppl @ 7B - very small, very high quality loss",
+    // },
+    // {
+    //     "Q3_K_M",
+    //     LLAMA_FTYPE_MOSTLY_Q3_K_M,
+    //     " 3.06G, +0.2437 ppl @ 7B - very small, very high quality loss",
+    // },
+    // {
+    //     "Q3_K_L",
+    //     LLAMA_FTYPE_MOSTLY_Q3_K_L,
+    //     " 3.35G, +0.1803 ppl @ 7B - small, substantial quality loss",
+    // },
     {
         "Q4_K",
         LLAMA_FTYPE_MOSTLY_Q4_K_M,
-        "alias for Q4_K_M",
+        " - medium, balanced quality - *recommended*",
     },
-    {
-        "Q4_K_S",
-        LLAMA_FTYPE_MOSTLY_Q4_K_S,
-        " 3.56G, +0.1149 ppl @ 7B - small, significant quality loss",
-    },
-    {
-        "Q4_K_M",
-        LLAMA_FTYPE_MOSTLY_Q4_K_M,
-        " 3.80G, +0.0535 ppl @ 7B - medium, balanced quality - *recommended*",
-    },
+    // {
+    //     "Q4_K_S",
+    //     LLAMA_FTYPE_MOSTLY_Q4_K_S,
+    //     " 3.56G, +0.1149 ppl @ 7B - small, significant quality loss",
+    // },
+    // {
+    //     "Q4_K_M",
+    //     LLAMA_FTYPE_MOSTLY_Q4_K_M,
+    //     " 3.80G, +0.0535 ppl @ 7B - medium, balanced quality - *recommended*",
+    // },
     {
         "Q5_K",
         LLAMA_FTYPE_MOSTLY_Q5_K_M,
-        "alias for Q5_K_M",
+        " - large, very low quality loss - *recommended*",
     },
-    {
-        "Q5_K_S",
-        LLAMA_FTYPE_MOSTLY_Q5_K_S,
-        " 4.33G, +0.0353 ppl @ 7B - large, low quality loss - *recommended*",
-    },
-    {
-        "Q5_K_M",
-        LLAMA_FTYPE_MOSTLY_Q5_K_M,
-        " 4.45G, +0.0142 ppl @ 7B - large, very low quality loss - *recommended*",
-    },
+    // {
+    //     "Q5_K_S",
+    //     LLAMA_FTYPE_MOSTLY_Q5_K_S,
+    //     " 4.33G, +0.0353 ppl @ 7B - large, low quality loss - *recommended*",
+    // },
+    // {
+    //     "Q5_K_M",
+    //     LLAMA_FTYPE_MOSTLY_Q5_K_M,
+    //     " 4.45G, +0.0142 ppl @ 7B - large, very low quality loss - *recommended*",
+    // },
     {
         "Q6_K",
         LLAMA_FTYPE_MOSTLY_Q6_K,
-        " 5.15G, +0.0044 ppl @ 7B - very large, extremely low quality loss",
+        " - very large, extremely low quality loss",
     },
 #endif
     {
         "Q8_0",
         LLAMA_FTYPE_MOSTLY_Q8_0,
-        " 6.70G, +0.0004 ppl @ 7B - very large, extremely low quality loss - not recommended",
+        " - very large, extremely low quality loss - not recommended",
     },
     {
         "F16",
         LLAMA_FTYPE_MOSTLY_F16,
-        "13.00G              @ 7B - extremely large, virtually no quality loss - not recommended",
+        " - extremely large, virtually no quality loss - for quality benchmark",
     },
     {
         "F32",
         LLAMA_FTYPE_ALL_F32,
-        "26.00G              @ 7B - absolutely huge, lossless - not recommended",
+        " - absolutely huge, lossless - not recommended",
     },
 };
 
@@ -147,6 +148,7 @@ bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftype, std:
 //  ./quantize [--allow-requantize] [--leave-output-tensor] models/llama/ggml-model.bin [models/llama/ggml-model-quant.bin] type [nthreads]
 //
 void usage(const char * executable) {
+    fprintf(stderr, "Falcon - ggllm.cpp quantizer. Version %s \n", FILE_VERSION_S);
     fprintf(stderr, "usage: %s [--help] [--allow-requantize] [--leave-output-tensor] model-f32.bin [model-quant.bin] type [nthreads]\n\n", executable);
     fprintf(stderr, "  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     fprintf(stderr, "  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
