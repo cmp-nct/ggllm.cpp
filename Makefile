@@ -251,7 +251,7 @@ ggml.o: ggml.c ggml.h ggml-cuda.h
 llama.o: llama.cpp ggml.h ggml-cuda.h llama.h llama-util.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-cmpnct_unicode.o cmpnct_unicode.cpp cmpnct_unicode.h
+cmpnct_unicode.o: cmpnct_unicode.cpp cmpnct_unicode.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 libfalcon.o: libfalcon.cpp ggml.h ggml-cuda.h libfalcon.h llama-util.h cmpnct_unicode.h
