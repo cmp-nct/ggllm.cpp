@@ -10,9 +10,6 @@ extern "C" {
 #define GGML_CUDA_MAX_DEVICES       16
 #define D_MB                           (1024*1024)
 
-struct ggml_tensor_extra_gpu {
-    void * data_device[GGML_CUDA_MAX_DEVICES]; // 1 pointer for each device for split tensors
-};
 typedef struct {
     int max_gpus; // the max number of devices that can be used
     int num_devices;
