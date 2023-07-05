@@ -2326,14 +2326,14 @@ static bool falcon_eval_internal(
     // ggml_set_name(cur, "result_output");
 
     lctx.use_buf(ctx0, -1);
-#if 1
+#if 0
 {
     double used_mem = ggml_used_mem(ctx0) / 1024.0 / 1024.0;
     double scratch_mem_0 = lctx.get_buf_max_mem(0) / 1024.0 / 1024.0;
     double scratch_mem_1 = lctx.get_buf_max_mem(1) / 1024.0 / 1024.0;
 
     printf("\n%s: Memory Usage\n", __func__);
-    printf("n_past: %d - n_batch: %d - n_context: %d\n", n_past+n_tokens, N, n_ctx);
+    printf("tokens: %d - n_batch: %d - n_context: %d\n", n_past+n_tokens, N, n_ctx);
     printf("  Used Memory:    %.3f MB\n", used_mem);
     printf("  Scratch Memory 0: %.3f MB\n", scratch_mem_0);
     printf("  Scratch Memory 1: %.3f MB\n", scratch_mem_1);
