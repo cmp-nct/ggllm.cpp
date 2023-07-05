@@ -265,7 +265,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.n_batch = std::stoi(argv[i]);
-            params.n_batch = std::min(1024+128, params.n_batch); // appears to work fine with scratch buffer, keep in eye
+            // params.n_batch = std::min(1024+128, params.n_batch); // appears to work fine with scratch buffer, keep in eye
         } else if (arg == "--keep") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -428,7 +428,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             std::stringstream ss(argv[i]);
-            llama_token key;
+            falcon_token key;
             char sign;
             std::string value_str;
             try {
@@ -602,9 +602,9 @@ std::string gpt_random_prompt(std::mt19937 & rng) {
 }
 
 // TODO: not great allocating this every time
-std::vector<llama_token> falcon_tokenize(struct falcon_context * ctx, const std::string & text, bool add_bos) {
+std::vector<falcon_token> falcon_tokenize(struct falcon_context * ctx, const std::string & text, bool add_bos) {
     // initialize to prompt numer of chars, since n_tokens <= n_prompt_chars
-    std::vector<llama_token> res(text.size() + (int) add_bos);
+    std::vector<falcon_token> res(text.size() + (int) add_bos);
     const int n = falcon_tokenize(ctx, text.c_str(), res.data(), static_cast<int>(res.size()), add_bos);
     assert(n >= 0);
     res.resize(n);

@@ -1944,30 +1944,30 @@ void ggml_cuda_update_gpu_status(int device_id) {
 }
 void ggml_cuda_print_gpu_status(const GPUStatus *status, bool print_summary) {
     if (status == NULL) {
-        printf("Error: Invalid GPU status pointer.\n");
+        fprintf(stderr,"Error: Invalid GPU status pointer.\n");
         return;
     }
 
     const char *divider = "+----+------------------------------------+------------+-----------+-----------+-----------+-----------+";
-    printf("%s\n", divider);
-    printf("| ID | %-25s %2d found | %10s | %9s | %9s | %9s | %9s |\n", "Device", status->num_devices, "VRAM Total", "VRAM Free", "VRAM Used","Split at ", "Device");
-    printf("%s\n", divider);
+    fprintf(stderr,"%s\n", divider);
+    fprintf(stderr,"| ID | %-25s %2d found | %10s | %9s | %9s | %9s | %9s |\n", "Device", status->num_devices, "VRAM Total", "VRAM Free", "VRAM Used","Split at ", "Device");
+    fprintf(stderr,"%s\n", divider);
 
     for (int i = 0; i < status->num_devices; ++i) {
         const struct cudaDeviceProp *prop = &status->device_props[i];
         size_t vram_used = status->device_vram_total[i] - status->device_vram_free[i];
         float split_at_percentage = g_tensor_split[i] * 100;
-        printf("| %2d | %-34s | %7zu MB | %6zu MB | %6zu MB | %8.1f%% | %9s |\n", 
+        fprintf(stderr,"| %2d | %-34s | %7zu MB | %6zu MB | %6zu MB | %8.1f%% | %9s |\n", 
                 i,prop->name, status->device_vram_total[i] / (1024 * 1024), status->device_vram_free[i] / (1024 * 1024), vram_used / (1024 * 1024),split_at_percentage, (i == status->main_device_id) ? "Primary" : "Secondary");
         // printf("%s\n", divider);
     }
     if (print_summary && status->num_devices > 1)
     {
-        printf("%s\n", divider);
-        printf("|    | %-34s | %7zu MB | %6zu MB | %6zu MB | %9s | %9s |\n", 
+        fprintf(stderr,"%s\n", divider);
+        fprintf(stderr,"|    | %-34s | %7zu MB | %6zu MB | %6zu MB | %9s | %9s |\n", 
             "Device summary", status->total_vram / (1024 * 1024), status->total_free_vram / (1024 * 1024), (status->total_vram - status->total_free_vram) / (1024 * 1024), "N/A", "All");
     }
-    printf("%s\n", divider);
+    fprintf(stderr,"%s\n", divider);
     
 }
 
@@ -2090,7 +2090,7 @@ void * ggml_cuda_host_malloc(size_t size) {
         // The allocation error can be bypassed. A null ptr will assigned out of this function.
         // This can fixed the OOM error in WSL.
         cudaGetLastError();
-        fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory: %s\n",
+        fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned (CUDA optimized) memory: %s\n",
             size/1024.0/1024.0, cudaGetErrorString(err));
         return nullptr;
     }

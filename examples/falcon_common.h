@@ -36,7 +36,7 @@ struct gpt_params {
     // int     mb_reserve_gpu_other           = false; // override reserved megabytes of VRAM for secondary GPUs
 
     // sampling parameters
-    std::unordered_map<llama_token, float> logit_bias; // logit bias for specific tokens
+    std::unordered_map<falcon_token, float> logit_bias; // logit bias for specific tokens
     int32_t top_k             = 40;    // <= 0 to use vocab size
     float   top_p             = 0.95f; // 1.0 = disabled
     float   tfs_z             = 1.00f; // 1.0 = disabled
@@ -93,7 +93,7 @@ std::string gpt_random_prompt(std::mt19937 & rng);
 // Vocab utils
 //
 
-std::vector<llama_token> falcon_tokenize(struct falcon_context * ctx, const std::string & text, bool add_bos);
+std::vector<falcon_token> falcon_tokenize(struct falcon_context * ctx, const std::string & text, bool add_bos);
 
 //
 // Model utils

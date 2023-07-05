@@ -151,6 +151,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+
     #if defined(GGML_USE_CUBLAS)
     // wait for cublas and show device information
     {
@@ -168,14 +169,15 @@ int main(int argc, char ** argv) {
     // determine the maximum memory usage needed to do inference for the given n_batch and n_predict parameters
     // uncomment the "used_mem" line in llama.cpp to see the results
     if (params.mem_test) {
+        falcon_prepare_buffers(ctx, params.n_batch, params.n_ctx);
         {
-            const std::vector<llama_token> tmp(params.n_batch, falcon_token_bos());
-            falcon_eval(ctx, tmp.data(), tmp.size(), 0, params.n_threads,params.debug_timings);
+            const std::vector<falcon_token> tmp((int)params.n_batch, falcon_token_bos());
+            falcon_eval(ctx, tmp.data(), (int)tmp.size(), 0, params.n_threads,params.debug_timings);
         }
 
         {
-            const std::vector<llama_token> tmp = { 0, };
-            falcon_eval(ctx, tmp.data(), tmp.size(), params.n_predict - 1, params.n_threads,params.debug_timings);
+            const std::vector<falcon_token> tmp = { 0, };
+            falcon_eval(ctx, tmp.data(), (int)tmp.size(), params.n_predict - 1, params.n_threads,params.debug_timings);
         }
 
         falcon_print_timings(ctx);
@@ -193,7 +195,7 @@ int main(int argc, char ** argv) {
     }
 
     std::string path_session = params.path_prompt_cache;
-    std::vector<llama_token> session_tokens;
+    std::vector<falcon_token> session_tokens;
 
     if (!path_session.empty()) {
         fprintf(stderr, "%s: attempting to load saved session from '%s'\n", __func__, path_session.c_str());
@@ -219,7 +221,7 @@ int main(int argc, char ** argv) {
     }
 
     // tokenize the prompt
-    std::vector<llama_token> embd_inp;
+    std::vector<falcon_token> embd_inp;
 
     if (params.interactive_first || params.instruct || !params.prompt.empty() || session_tokens.empty()) {
         // Falcon does not have a dedicated bos token (bos==eos), so don't inject it here
@@ -239,11 +241,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s: error: prompt is too long (%d tokens, max %d)\n", __func__, (int) embd_inp.size(), n_ctx - 4);
         return 1;
     }
-
+    falcon_prepare_buffers(ctx, params.n_batch, embd_inp.size()+1);
     // debug message about similarity of saved session, if applicable
     size_t n_matching_session_tokens = 0;
     if (session_tokens.size()) {
-        for (llama_token id : session_tokens) {
+        for (falcon_token id : session_tokens) {
             if (n_matching_session_tokens >= embd_inp.size() || id != embd_inp[n_matching_session_tokens]) {
                 break;
             }
@@ -275,8 +277,8 @@ int main(int argc, char ** argv) {
     }
 
     // prefix & suffix for instruct mode
-    std::vector<llama_token> inp_pfx;
-    std::vector<llama_token> inp_sfx;
+    std::vector<falcon_token> inp_pfx;
+    std::vector<falcon_token> inp_sfx;
 
     // in instruct mode, we inject a prefix and a suffix to each input by the user
     if (params.instruct) {
@@ -294,7 +296,7 @@ int main(int argc, char ** argv) {
 
     // determine newline token
     //auto llama_token_newline = ::falcon_tokenize(ctx, "\n", false);
-    auto llama_token_newline = std::vector<llama_token>(193);
+    auto llama_token_newline = std::vector<falcon_token>(193);
 
     if (params.verbose_prompt) {
         fprintf(stderr, "\n");
@@ -359,7 +361,7 @@ fprintf(stderr, "|            | %5d | %.3f | %.3f | %.3f | %5d | %.3f | %.3f | %
 fprintf(stderr, "+============+=======+=======+=======+=======+=======+=======+-------+-------+------+------+--------+---------+\n");
 
 fprintf(stderr, "| %10s | %5s | %5s | %5s | %5s | %13s |\n", 
-                "Generation", "Ctx", "Batch", "Keep","Prmpt","Seed");
+                "Generation", "Ctx", "Batch", "Keep","Prom.","Seed");
 fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+\n");  
 fprintf(stderr, "|            | %5d | %5d | %5d | %5zu | %13d |\n",
                 n_ctx, params.n_batch, params.n_keep, embd_inp.size(),params.seed);
@@ -372,7 +374,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+\
     fprintf(stderr, "\n\n");
 
     // TODO: replace with ring-buffer
-    std::vector<llama_token> last_n_tokens(n_ctx);
+    std::vector<falcon_token> last_n_tokens(n_ctx);
     std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
 
     if (params.interactive) {
@@ -406,11 +408,11 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+\
     // the first thing we will do is to output the prompt, so set color accordingly
     console_set_color(con_st, CONSOLE_COLOR_PROMPT);
 
-    std::vector<llama_token> embd;
+    std::vector<falcon_token> embd;
 
     // do one empty run to warm up the model
     {
-        const std::vector<llama_token> tmp = { falcon_token_bos(), };
+        const std::vector<falcon_token> tmp = { falcon_token_bos(), };
         falcon_eval(ctx, tmp.data(), tmp.size(), 0, params.n_threads,0);
         llama_reset_timings(ctx);
     }
@@ -521,7 +523,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+\
                 llama_save_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
             }
 
-            llama_token id = 0;
+            falcon_token id = 0;
 
             {
                 auto logits  = falcon_get_logits(ctx);
@@ -532,13 +534,13 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+\
                     logits[it->first] += it->second;
                 }
 
-                std::vector<llama_token_data> candidates;
+                std::vector<falcon_token_data> candidates;
                 candidates.reserve(n_vocab);
-                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                    candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
+                for (falcon_token token_id = 0; token_id < n_vocab; token_id++) {
+                    candidates.emplace_back(falcon_token_data{token_id, logits[token_id], 0.0f});
                 }
 
-                llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+                falcon_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
 
                 // Apply penalties
                 float nl_logit = logits[falcon_token_nl()];

@@ -1345,6 +1345,8 @@ extern "C" {
     
     // visualize the tensor - extended adds more information - when printing sample content extended will also print src0 and src1 content
     void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line,  bool extended, bool print_sample);
+    // helper to accessa specific single index value (tested for fp32 only, though nb[] is considered)
+    float ggml_get_tensor_index(const struct ggml_tensor* tensor, int ind1, int ind2, int ind3, int ind4);
 
     //
     // optimization

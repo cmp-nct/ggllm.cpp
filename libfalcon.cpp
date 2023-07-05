@@ -80,8 +80,8 @@ void llama_nop(struct ggml_tensor * tensor) { // don't offload by default
 static const std::map<e_model, size_t> & MEM_REQ_SCRATCH0()
 {
     static std::map<e_model, size_t> k_sizes = {
-        { FALCON_7B,   512ull * MB },
-        { FALCON_40B,  1024ull * MB },
+        { FALCON_7B,   32ull * MB }, 
+        { FALCON_40B,  32ull * MB }, 
     };
     return k_sizes;
 }
@@ -89,22 +89,57 @@ static const std::map<e_model, size_t> & MEM_REQ_SCRATCH0()
 static const std::map<e_model, size_t> & MEM_REQ_SCRATCH1()
 {
     static std::map<e_model, size_t> k_sizes = {
-        { FALCON_7B,    512ull * MB },
-        { FALCON_40B,  1024ull * MB },
+        { FALCON_7B,   32ull * MB },
+        { FALCON_40B,  32ull * MB },
+    };
+    return k_sizes;
+}
+// batch mode requires growingly large tensors
+static std::pair<size_t, size_t> MEM_REQ_EVAL_BATCH(
+    e_model model, int32_t n_batch, int32_t n_ctx_prompt)
+{
+    size_t batch_scratch0 = 0;
+    size_t batch_scratch1 = 0;
+    // currently does not calculate if batch reduced at last passt (so assumes ctx is a clean multiple of batch)
+    // that would cause higher memory allocation than needed
+    // todo: calculate the multipliers based on actual tensor sizes
+    double a = 0;
+    double d = 0;
+    double lin_a = n_ctx_prompt * n_batch;
+    switch (model)
+    {
+        case FALCON_7B:
+            a=0.00029706;
+            d=92;
+            batch_scratch0 = (size_t) (lin_a * a + d)*MB;
+            batch_scratch1 = (size_t) 145752 * (size_t)n_batch + 8*MB;
+            break;
+
+        case FALCON_40B:
+            a=0.00065;
+            d=118;
+            batch_scratch0 = (size_t) (lin_a * a + d)*MB;
+            batch_scratch1 = (size_t) 262144ull * (size_t)n_batch + 8*MB; // 25mb clean/100 batch
+            break;
+        default:
+        break;
+    }
+
+    return std::make_pair(batch_scratch0, batch_scratch1);
+    
+}
+
+// this is mostly needed for temporary mul_mat buffers to dequantize the data
+// todo: check if this is actually needed - most happens in scratch 0
+static const std::map<e_model, size_t> & MEM_REQ_EVAL()
+{
+    static std::map<e_model, size_t> k_sizes = {
+        { FALCON_7B,   160ull * MB }, 
+        { FALCON_40B, 256ull * MB }, // for full offload matmul GPU this is oversized
     };
     return k_sizes;
 }
 
-// this is mostly needed for temporary mul_mat buffers to dequantize the data
-// not actually needed if BLAS is disabled
-static const std::map<e_model, size_t> & MEM_REQ_EVAL()
-{
-    static std::map<e_model, size_t> k_sizes = {
-        { FALCON_7B,   768ull * MB },
-        { FALCON_40B, 1536ull * MB },
-    };
-    return k_sizes;
-}
 
 // default hparams (Falcon 7B)
 struct falcon_hparams {
@@ -1304,6 +1339,7 @@ static bool kv_cache_init(
 
     (void) n_gpu_layers;
 #ifdef GGML_USE_CUBLAS
+// TODO : gpu kv offloading not implemented
     if (n_gpu_layers > n_layer + 1) {
         ggml_cuda_assign_buffers_no_scratch(cache.k);
         ggml_cuda_assign_buffers_no_scratch(cache.v);
@@ -1520,7 +1556,6 @@ static void falcon_model_load_internal(
     }
 
     auto & ctx = model.ctx;
-
     size_t ctx_size;
     size_t mmapped_size;
     ml->calc_sizes(&ctx_size, &mmapped_size);
@@ -1795,15 +1830,15 @@ static void falcon_model_load_internal(
 
     // print memory requirements
     {
-        // this is the total memory required to run the inference
-        // TODO: this calculation is still wrong
         int64_t mem_required =
-            ctx_size +
+            ctx_size + 
             mmapped_size - vram_weights + // weights in VRAM not in memory
             MEM_REQ_SCRATCH0().at(model.type) +
             MEM_REQ_SCRATCH1().at(model.type) +
+            MEM_REQ_EVAL_BATCH(model.type,n_batch,n_ctx).first + // only prompt context relevant but 
+            MEM_REQ_EVAL_BATCH(model.type,n_batch,n_ctx).second +// only prompt context actually scales
             MEM_REQ_EVAL().at    (model.type);
-
+        
         if (mem_required < 0) mem_required = 0;
 
         // this is the memory required by one llama_state
@@ -1882,6 +1917,7 @@ static bool falcon_model_load(
     }
 }
 
+
 // evaluate the transformer
 //
 //   - lctx:         llama context
@@ -1892,7 +1928,7 @@ static bool falcon_model_load(
 //
 static bool falcon_eval_internal(
         falcon_context &  lctx,
-    const llama_token *  tokens,
+    const falcon_token *  tokens,
             const int    n_tokens,
             const int    n_past,
             const int    n_threads,
@@ -1944,6 +1980,54 @@ static bool falcon_eval_internal(
     ggml_cgraph gf = {};
     gf.n_threads = N >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas() ? 1 : n_threads;
 
+            
+#if 0
+            lctx.use_buf(ctx0, 0);
+            
+            // test mode:
+            //1. create a 16k tensor filled with 0.5 values as Qcur
+            //2. run rope_inplace and then dump the resulting tensor for a plot
+            // test dimensions: n_embeddings (col), n_heads (rows=1), n_past (previous tokens calculated)
+            // can't we just calculate only the current one and copy the previous from cache ??            
+            // create a vector of 10k tensors, then run the same rope for npast 0-9999
+            // we want to see how clean the rotation is
+            struct ggml_tensor *test_tensor[100];
+
+
+            for (int multi=0;multi < 10;multi++)
+            {
+                struct ggml_context * ctx0 = ggml_init(params);
+                #define GGML_MAX_NODES 1000000
+                ggml_cgraph ggf = {};
+                ggf.n_threads = 1;
+                lctx.use_buf(ctx0, 0);
+                for (int i = 0; i < 100; i++) {
+                    int n_past = (multi*100 + i)*20;
+                    test_tensor[i] = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 2, 1, 1);
+                    ggml_set_current_layer_id(i);
+                    
+                    ggml_set_f32(test_tensor[i], 0.5);
+                    test_tensor[i] = ggml_rope_inplace(ctx0, test_tensor[i], n_past, 2, 2,10000);
+                    ggml_build_forward_expand(&ggf, test_tensor[i]);
+                }
+                ggml_graph_compute(ctx0, &ggf);
+                for (int i = 0; i < 100; i++) {
+                    int n_past = (multi*100 + i)*20;
+                    float rot_x,rot_y;
+                    rot_x = ggml_get_tensor_index(test_tensor[i],0,0,0,0);
+                    rot_y = ggml_get_tensor_index(test_tensor[i],1,0,0,0);
+                    printf("%d,%f,%f\n", n_past, rot_x, rot_y);
+                    // printf("rotation at %d is %f,%f\n", n_past, rot_x,rot_y);
+                    
+                }    
+                // destruct the gf
+                ggml_free(ctx0);
+            }
+            
+            //ggml_tensor_printf(test_tensor[90],"test",0,true,true);
+            exit(0 );
+#endif
+
     struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
     ggml_set_name(embd, "embd");
     memcpy(embd->data, tokens, N*ggml_element_size(embd));
@@ -1993,8 +2077,6 @@ static bool falcon_eval_internal(
         // struct ggml_tensor * inpSA = inpL;
 
         lctx.use_buf(ctx0, 0);
-
-
         // self-attention
         {
             layernorm_output = ggml_norm(ctx0, inpL);
@@ -2036,7 +2118,8 @@ static bool falcon_eval_internal(
             // debugging.
 
             struct ggml_tensor * Qcur = ggml_view_3d(
-                ctx0, cur, head_dim, n_head, N,
+                ctx0, cur, 
+                head_dim, n_head, N,
                 head_dim * sizeof_wtype,
                 head_dim * (n_head + 2 * n_head_kv) * sizeof_wtype,
                 0);
@@ -2051,7 +2134,8 @@ static bool falcon_eval_internal(
             ggml_set_name(Kcur, "Kcur");
 
             struct ggml_tensor * Vcur = ggml_view_3d(
-                ctx0, cur, head_dim, n_head_kv, N,
+                ctx0, cur, 
+                head_dim, n_head_kv, N,
                 head_dim * sizeof_wtype,
                 head_dim * (n_head + 2 * n_head_kv) * sizeof_wtype,
                 head_dim * (n_head + n_head_kv) * sizeof_wtype);
@@ -2242,7 +2326,19 @@ static bool falcon_eval_internal(
     // ggml_set_name(cur, "result_output");
 
     lctx.use_buf(ctx0, -1);
+#if 1
+{
+    double used_mem = ggml_used_mem(ctx0) / 1024.0 / 1024.0;
+    double scratch_mem_0 = lctx.get_buf_max_mem(0) / 1024.0 / 1024.0;
+    double scratch_mem_1 = lctx.get_buf_max_mem(1) / 1024.0 / 1024.0;
 
+    printf("\n%s: Memory Usage\n", __func__);
+    printf("n_past: %d - n_batch: %d - n_context: %d\n", n_past+n_tokens, N, n_ctx);
+    printf("  Used Memory:    %.3f MB\n", used_mem);
+    printf("  Scratch Memory 0: %.3f MB\n", scratch_mem_0);
+    printf("  Scratch Memory 1: %.3f MB\n", scratch_mem_1);
+}
+#endif
     // logits -> probs
     //cur = ggml_soft_max_inplace(ctx0, cur);
 
@@ -2343,10 +2439,15 @@ static bool falcon_eval_internal(
     }
 
 #if 0
-    printf("\n%s: used_mem = %.3f MB, scratch -- %.3f MB %.3f MB\n", __func__,
-            ggml_used_mem(ctx0)/1024.0/1024.0,
-            lctx.get_buf_max_mem(0)/1024.0/1024.0,
-            lctx.get_buf_max_mem(1)/1024.0/1024.0);
+    double used_mem = ggml_used_mem(ctx0) / 1024.0 / 1024.0;
+    double scratch_mem_0 = lctx.get_buf_max_mem(0) / 1024.0 / 1024.0;
+    double scratch_mem_1 = lctx.get_buf_max_mem(1) / 1024.0 / 1024.0;
+
+    printf("\n%s: Memory Usage\n", __func__);
+    printf("n_past: %d - n_batch: %d - n_context: %d\n", n_past+n_tokens, N, n_ctx);
+    printf("  Used Memory:    %.3f MB\n", used_mem);
+    printf("  Scratch Memory 0: %.3f MB\n", scratch_mem_0);
+    printf("  Scratch Memory 1: %.3f MB\n", scratch_mem_1);
 #endif
 
     ggml_free(ctx0);
@@ -2812,14 +2913,14 @@ static std::vector<falcon_vocab::id> falcon_tokenize(const falcon_vocab & vocab,
 // sampling
 //
 
-void llama_sample_softmax(struct falcon_context * ctx, llama_token_data_array * candidates) {
+void llama_sample_softmax(struct falcon_context * ctx, falcon_token_data_array * candidates) {
     assert(candidates->size > 0);
 
     const int64_t t_start_sample_us = ggml_time_us();
 
     // Sort the logits in descending order
     if (!candidates->sorted) {
-        std::sort(candidates->data, candidates->data + candidates->size, [](const llama_token_data & a, const llama_token_data & b) {
+        std::sort(candidates->data, candidates->data + candidates->size, [](const falcon_token_data & a, const falcon_token_data & b) {
             return a.logit > b.logit;
         });
         candidates->sorted = true;
@@ -2841,7 +2942,7 @@ void llama_sample_softmax(struct falcon_context * ctx, llama_token_data_array * 
     }
 }
 
-void llama_sample_top_k(struct falcon_context * ctx, llama_token_data_array * candidates, int k, size_t min_keep) {
+void llama_sample_top_k(struct falcon_context * ctx, falcon_token_data_array * candidates, int k, size_t min_keep) {
     const int64_t t_start_sample_us = ggml_time_us();
 
     k = std::max(k, (int) min_keep);
@@ -2849,7 +2950,7 @@ void llama_sample_top_k(struct falcon_context * ctx, llama_token_data_array * ca
 
     // Sort scores in descending order
     if (!candidates->sorted) {
-        auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+        auto comp = [](const falcon_token_data & a, const falcon_token_data & b) {
             return a.logit > b.logit;
         };
         if (k == (int) candidates->size) {
@@ -2866,7 +2967,7 @@ void llama_sample_top_k(struct falcon_context * ctx, llama_token_data_array * ca
     }
 }
 
-void llama_sample_top_p(struct falcon_context * ctx, llama_token_data_array * candidates, float p, size_t min_keep) {
+void llama_sample_top_p(struct falcon_context * ctx, falcon_token_data_array * candidates, float p, size_t min_keep) {
     if (p >= 1.0f) {
         return;
     }
@@ -2897,7 +2998,7 @@ void llama_sample_top_p(struct falcon_context * ctx, llama_token_data_array * ca
     }
 }
 
-void llama_sample_tail_free(struct falcon_context * ctx, llama_token_data_array * candidates, float z, size_t min_keep) {
+void llama_sample_tail_free(struct falcon_context * ctx, falcon_token_data_array * candidates, float z, size_t min_keep) {
     if (z >= 1.0f || candidates->size <= 2) {
         return;
     }
@@ -2949,7 +3050,7 @@ void llama_sample_tail_free(struct falcon_context * ctx, llama_token_data_array 
 }
 
 
-void llama_sample_typical(struct falcon_context * ctx, llama_token_data_array * candidates, float p, size_t min_keep) {
+void llama_sample_typical(struct falcon_context * ctx, falcon_token_data_array * candidates, float p, size_t min_keep) {
     // Reference implementation:
     // https://github.com/huggingface/transformers/compare/main...cimeister:typical-sampling:typical-pr
     if (p >= 1.0f) {
@@ -2997,7 +3098,7 @@ void llama_sample_typical(struct falcon_context * ctx, llama_token_data_array * 
     }
 
     // Resize the output vector to keep only the locally typical tokens
-    std::vector<llama_token_data> new_candidates;
+    std::vector<falcon_token_data> new_candidates;
     for (size_t i = 0; i < last_idx; ++i) {
         size_t idx = indices[i];
         new_candidates.push_back(candidates->data[idx]);
@@ -3012,7 +3113,7 @@ void llama_sample_typical(struct falcon_context * ctx, llama_token_data_array * 
     }
 }
 
-void llama_sample_temperature(struct falcon_context * ctx, llama_token_data_array * candidates_p, float temp) {
+void llama_sample_temperature(struct falcon_context * ctx, falcon_token_data_array * candidates_p, float temp) {
     const int64_t t_start_sample_us = ggml_time_us();
 
     for (size_t i = 0; i < candidates_p->size; ++i) {
@@ -3024,7 +3125,7 @@ void llama_sample_temperature(struct falcon_context * ctx, llama_token_data_arra
     }
 }
 
-void llama_sample_repetition_penalty(struct falcon_context * ctx, llama_token_data_array * candidates, const llama_token * last_tokens, size_t last_tokens_size, float penalty) {
+void llama_sample_repetition_penalty(struct falcon_context * ctx, falcon_token_data_array * candidates, const falcon_token * last_tokens, size_t last_tokens_size, float penalty) {
     if (last_tokens_size == 0 || penalty == 1.0f) {
         return;
     }
@@ -3053,7 +3154,7 @@ void llama_sample_repetition_penalty(struct falcon_context * ctx, llama_token_da
     }
 }
 
-void llama_sample_frequency_and_presence_penalties(struct falcon_context * ctx, llama_token_data_array * candidates, const llama_token * last_tokens_p, size_t last_tokens_size, float alpha_frequency, float alpha_presence) {
+void llama_sample_frequency_and_presence_penalties(struct falcon_context * ctx, falcon_token_data_array * candidates, const falcon_token * last_tokens_p, size_t last_tokens_size, float alpha_frequency, float alpha_presence) {
     if (last_tokens_size == 0 || (alpha_frequency == 0.0f && alpha_presence == 0.0f)) {
         return;
     }
@@ -3061,7 +3162,7 @@ void llama_sample_frequency_and_presence_penalties(struct falcon_context * ctx, 
     const int64_t t_start_sample_us = ggml_time_us();
 
     // Create a frequency map to count occurrences of each token in last_tokens
-    std::unordered_map<llama_token, int> token_count;
+    std::unordered_map<falcon_token, int> token_count;
     for (size_t i = 0; i < last_tokens_size; ++i) {
         token_count[last_tokens_p[i]]++;
     }
@@ -3085,7 +3186,7 @@ void llama_sample_frequency_and_presence_penalties(struct falcon_context * ctx, 
 }
 
 
-llama_token llama_sample_token_mirostat(struct falcon_context * ctx, llama_token_data_array * candidates, float tau, float eta, int m, float * mu) {
+falcon_token llama_sample_token_mirostat(struct falcon_context * ctx, falcon_token_data_array * candidates, float tau, float eta, int m, float * mu) {
     assert(ctx);
     auto N = float(falcon_n_vocab(ctx));
     int64_t t_start_sample_us;
@@ -3114,11 +3215,11 @@ llama_token llama_sample_token_mirostat(struct falcon_context * ctx, llama_token
     if (ctx) {
         ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
     }
-    llama_token X = llama_sample_token(ctx, candidates);
+    falcon_token X = llama_sample_token(ctx, candidates);
     t_start_sample_us = ggml_time_us();
 
     // Compute error as the difference between observed surprise and target surprise value
-    size_t X_idx = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const llama_token_data & candidate) {
+    size_t X_idx = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const falcon_token_data & candidate) {
         return candidate.id == X;
     }));
     float observed_surprise = -log2f(candidates->data[X_idx].p);
@@ -3134,7 +3235,7 @@ llama_token llama_sample_token_mirostat(struct falcon_context * ctx, llama_token
     return X;
 }
 
-llama_token llama_sample_token_mirostat_v2(struct falcon_context * ctx, llama_token_data_array * candidates, float tau, float eta, float * mu) {
+falcon_token llama_sample_token_mirostat_v2(struct falcon_context * ctx, falcon_token_data_array * candidates, float tau, float eta, float * mu) {
     assert(ctx);
     int64_t t_start_sample_us;
     t_start_sample_us = ggml_time_us();
@@ -3142,7 +3243,7 @@ llama_token llama_sample_token_mirostat_v2(struct falcon_context * ctx, llama_to
     llama_sample_softmax(ctx, candidates);
 
     // Truncate the words with surprise values greater than mu
-    candidates->size = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const llama_token_data & candidate) {
+    candidates->size = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const falcon_token_data & candidate) {
         return -log2f(candidate.p) > *mu;
     }));
 
@@ -3157,11 +3258,11 @@ llama_token llama_sample_token_mirostat_v2(struct falcon_context * ctx, llama_to
     if (ctx) {
         ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
     }
-    llama_token X = llama_sample_token(ctx, candidates);
+    falcon_token X = llama_sample_token(ctx, candidates);
     t_start_sample_us = ggml_time_us();
 
     // Compute error as the difference between observed surprise and target surprise value
-    size_t X_idx = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const llama_token_data & candidate) {
+    size_t X_idx = std::distance(candidates->data, std::find_if(candidates->data, candidates->data + candidates->size, [&](const falcon_token_data & candidate) {
         return candidate.id == X;
     }));
     float observed_surprise = -log2f(candidates->data[X_idx].p);
@@ -3176,15 +3277,15 @@ llama_token llama_sample_token_mirostat_v2(struct falcon_context * ctx, llama_to
     return X;
 }
 
-llama_token llama_sample_token_greedy(struct falcon_context * ctx, llama_token_data_array * candidates) {
+falcon_token llama_sample_token_greedy(struct falcon_context * ctx, falcon_token_data_array * candidates) {
     const int64_t t_start_sample_us = ggml_time_us();
 
     // Find max element
-    auto * max_iter = std::max_element(candidates->data, candidates->data + candidates->size, [](const llama_token_data & a, const llama_token_data & b) {
+    auto * max_iter = std::max_element(candidates->data, candidates->data + candidates->size, [](const falcon_token_data & a, const falcon_token_data & b) {
         return a.logit < b.logit;
     });
 
-    llama_token result = max_iter->id;
+    falcon_token result = max_iter->id;
     if (ctx) {
         ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
         ctx->n_sample++;
@@ -3192,7 +3293,7 @@ llama_token llama_sample_token_greedy(struct falcon_context * ctx, llama_token_d
     return result;
 }
 
-llama_token llama_sample_token(struct falcon_context * ctx, llama_token_data_array * candidates) {
+falcon_token llama_sample_token(struct falcon_context * ctx, falcon_token_data_array * candidates) {
     assert(ctx);
     const int64_t t_start_sample_us = ggml_time_us();
     llama_sample_softmax(nullptr, candidates);
@@ -3207,7 +3308,7 @@ llama_token llama_sample_token(struct falcon_context * ctx, llama_token_data_arr
     auto & rng = ctx->rng;
     int idx = dist(rng);
 
-    llama_token result = candidates->data[idx].id;
+    falcon_token result = candidates->data[idx].id;
 
     ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
     ctx->n_sample++;
@@ -3488,9 +3589,6 @@ static void falcon_model_quantize_internal(const std::string & fname_inp, const 
     }
 }
 
-//
-// interface implementation
-//
 
 struct falcon_context * falcon_init_from_file(
                              const char * path_model,
@@ -3586,10 +3684,6 @@ struct falcon_context * falcon_init_from_file(
             ctx->embedding.resize(hparams.n_embd);
         }
 
-        ctx->buf_compute.resize(MEM_REQ_EVAL().at(ctx->model.type));
-
-        ctx->buf_scratch[0].resize(MEM_REQ_SCRATCH0().at(ctx->model.type));
-        ctx->buf_scratch[1].resize(MEM_REQ_SCRATCH1().at(ctx->model.type));
     }
 
 #ifdef GGML_USE_METAL
@@ -4153,7 +4247,7 @@ size_t llama_set_state_data(struct falcon_context * ctx, uint8_t * src) {
     return nread;
 }
 
-bool llama_load_session_file(struct falcon_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+bool llama_load_session_file(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(path_session, "rb");
 
     // sanity checks
@@ -4184,7 +4278,7 @@ bool llama_load_session_file(struct falcon_context * ctx, const char * path_sess
             return false;
         }
 
-        file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
+        file.read_raw(tokens_out, sizeof(falcon_token) * n_token_count);
         *n_token_count_out = n_token_count;
     }
 
@@ -4207,7 +4301,7 @@ bool llama_load_session_file(struct falcon_context * ctx, const char * path_sess
     return true;
 }
 
-bool llama_save_session_file(struct falcon_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
+bool llama_save_session_file(struct falcon_context * ctx, const char * path_session, const falcon_token * tokens, size_t n_token_count) {
     llama_file file(path_session, "wb");
 
     file.write_u32(LLAMA_SESSION_MAGIC);
@@ -4217,7 +4311,7 @@ bool llama_save_session_file(struct falcon_context * ctx, const char * path_sess
 
     // save the prompt
     file.write_u32((uint32_t) n_token_count);
-    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
+    file.write_raw(tokens, sizeof(falcon_token) * n_token_count);
 
     // save the context state
     {
@@ -4234,7 +4328,7 @@ bool llama_save_session_file(struct falcon_context * ctx, const char * path_sess
 
 int falcon_eval(
         struct falcon_context * ctx,
-           const llama_token * tokens,
+           const falcon_token * tokens,
                          int   n_tokens,
                          int   n_past,
                          int   n_threads, int debug_timings) {
@@ -4266,11 +4360,20 @@ int falcon_eval(
     return 0;
 }
 
+void falcon_prepare_buffers(falcon_context *ctx, int n_batch, int n_ctx)
+{
+    ctx->buf_compute.resize(MEM_REQ_EVAL().at(ctx->model.type));
+    ctx->buf_scratch[0].resize(MEM_REQ_SCRATCH0().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).first);
+    ctx->buf_scratch[1].resize(MEM_REQ_SCRATCH1().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).second);
+
+    // fprintf(stderr, "Buffers: compute %.2f MB, scratch0 %.2f MB, scratch1 %.2f MB\n", MEM_REQ_EVAL().at(ctx->model.type)/1024.0/1024.0, (MEM_REQ_SCRATCH0().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).first)/1024.0/1024.0, (MEM_REQ_SCRATCH1().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).second)/1024.0/1024.0);
+}
+
 int falcon_eval_export(struct falcon_context * ctx, const char * fname) {
     const int n_batch = 1;
     const int n_ctx   = 512 - n_batch;
 
-    const std::vector<llama_token> tmp(n_batch, falcon_token_bos());
+    const std::vector<falcon_token> tmp(n_batch, falcon_token_bos());
 
     if (!falcon_eval_internal(*ctx, tmp.data(), tmp.size(), n_ctx, 1, fname,0)) {
         fprintf(stderr, "%s: failed to eval\n", __func__);
@@ -4283,7 +4386,7 @@ int falcon_eval_export(struct falcon_context * ctx, const char * fname) {
 int falcon_tokenize(
         struct falcon_context * ctx,
                   const char * text,
-                 llama_token * tokens,
+                 falcon_token * tokens,
                          int   n_max_tokens,
                         bool   add_bos) {
     auto res = falcon_tokenize(ctx->vocab, text, add_bos, true);
@@ -4333,7 +4436,7 @@ float * falcon_get_embeddings(struct falcon_context * ctx) {
     return ctx->embedding.data();
 }
 
-const char * falcon_token_to_str(const struct falcon_context * ctx, llama_token token) {
+const char * falcon_token_to_str(const struct falcon_context * ctx, falcon_token token) {
     if (token >= falcon_n_vocab(ctx)) {
         return nullptr;
     }
@@ -4341,19 +4444,19 @@ const char * falcon_token_to_str(const struct falcon_context * ctx, llama_token 
     return ctx->vocab.id_to_token[token].tok.c_str();
 }
 
-llama_token falcon_token_bos() {
+falcon_token falcon_token_bos() {
     return 11;
 }
 
-llama_token falcon_token_eos() {
+falcon_token falcon_token_eos() {
     return 11;
 }
 
-llama_token falcon_token_nl() {
+falcon_token falcon_token_nl() {
     return 193;
 }
 
-llama_token falcon_token_cr() {
+falcon_token falcon_token_cr() {
     return 195;
 }
 

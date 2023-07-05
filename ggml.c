@@ -4539,7 +4539,7 @@ struct ggml_tensor * ggml_new_tensor_impl(
         size_needed += GGML_TENSOR_SIZE;
 
         if (cur_end + size_needed + GGML_OBJECT_SIZE > ctx->mem_size) {
-            GGML_PRINT("%s: not enough space in the context's memory pool (needed %zu, available %zu)\n",
+            GGML_PRINT("\n%s: not enough space in the context's memory pool (needed %zu, available %zu)\n",
                     __func__, cur_end + size_needed + GGML_OBJECT_SIZE, ctx->mem_size);
             assert(false);
             return NULL;
@@ -4552,14 +4552,14 @@ struct ggml_tensor * ggml_new_tensor_impl(
         };
     } else {
         if (ctx->scratch.offs + size_needed > ctx->scratch.size) {
-            GGML_PRINT("%s: not enough space in the scratch memory pool (needed %zu, available %zu)\n",
+            GGML_PRINT("\n%s: not enough space in the scratch memory pool (needed %zu, available %zu)\n",
                     __func__, ctx->scratch.offs + size_needed, ctx->scratch.size);
             assert(false);
             return NULL;
         }
 
         if (cur_end + GGML_TENSOR_SIZE + GGML_OBJECT_SIZE > ctx->mem_size) {
-            GGML_PRINT("%s: not enough space in the context's memory pool (needed %zu, available %zu)\n",
+            GGML_PRINT("\n%s: not enough space in the context's memory pool (needed %zu, available %zu)\n",
                     __func__, cur_end + GGML_TENSOR_SIZE + GGML_OBJECT_SIZE, ctx->mem_size);
             assert(false);
             return NULL;
@@ -10931,20 +10931,20 @@ static void ggml_compute_forward_mul_mat_f32(
     const int64_t ne2  = dst->ne[2];
     const int64_t ne3  = dst->ne[3];
 
-    const int nb00 = src0->nb[0];
-    const int nb01 = src0->nb[1];
-    const int nb02 = src0->nb[2];
-    const int nb03 = src0->nb[3];
+    const size_t nb00 = src0->nb[0];
+    const size_t nb01 = src0->nb[1];
+    const size_t nb02 = src0->nb[2];
+    const size_t nb03 = src0->nb[3];
 
-    const int nb10 = src1->nb[0];
-    const int nb11 = src1->nb[1]; UNUSED(nb11);
-    const int nb12 = src1->nb[2]; UNUSED(nb12);
-    const int nb13 = src1->nb[3]; UNUSED(nb13);
+    const size_t nb10 = src1->nb[0];
+    const size_t nb11 = src1->nb[1]; UNUSED(nb11);
+    const size_t nb12 = src1->nb[2]; UNUSED(nb12);
+    const size_t nb13 = src1->nb[3]; UNUSED(nb13);
 
-    const int nb0  = dst->nb[0];
-    const int nb1  = dst->nb[1];
-    const int nb2  = dst->nb[2];
-    const int nb3  = dst->nb[3];
+    const size_t nb0  = dst->nb[0];
+    const size_t nb1  = dst->nb[1];
+    const size_t nb2  = dst->nb[2];
+    const size_t nb3  = dst->nb[3];
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -10962,7 +10962,17 @@ static void ggml_compute_forward_mul_mat_f32(
     GGML_ASSERT(nb0 == sizeof(float));
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
-    GGML_ASSERT(nb2 <= nb3);
+    if (!(nb2 <= nb3) )
+        {
+            fprintf(stderr,"nb2=%zu nb3=%zu Assert condition is %s\n",nb2,nb3,nb2 <= nb3 ? "true" : "false");
+            ggml_tensor_printf(dst,"",0,true,false); 
+            
+        }
+    GGML_ASSERT(nb2 <= nb3); 
+    
+
+
+
 
     //GGML_ASSERT(ne0 == ne01);
     //GGML_ASSERT(ne1 == ne11);
@@ -12840,7 +12850,7 @@ static void ggml_compute_forward_rope_f32(
     const size_t nb2 = dst->nb[2];
     const size_t nb3 = dst->nb[3];
 
-    //printf("ne0: %d, ne1: %d, ne2: %d, ne3: %d\n", ne0, ne1, ne2, ne3);
+    // printf("%s[%d] ne0: %d, ne1: %d, ne2: %d, ne3: %d\n", dst->name,dst->meta.layer_id,ne0, ne1, ne2, ne3);
     //printf("n_past = %d, ne2 = %d\n", n_past, ne2);
 
     GGML_ASSERT(nb00 == sizeof(float));
@@ -19525,7 +19535,7 @@ void ggml_printTensorSample(char *prefix,const struct ggml_tensor * tensor) {
     printf("%s",  sep);
     printf("| Content of %s \"%s\" (%d dim)",prefix,tensor->name,tensor->n_dims);
     printf("\n");
-    const int max_elements = 4;
+    const int max_elements = 40000;
     
     if (tensor->n_dims == 1) {
         printf("| ");
@@ -19595,7 +19605,7 @@ void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line
     */
     {
         pos = 0;
-        for (int i = 0; i < tensor->n_dims; i++) {
+        for (int i = 0; i <= tensor->n_dims; i++) {
             pos += snprintf(strides + pos, sizeof(strides) - pos, "%" PRId64, tensor->nb[i]);
             if (i != tensor->n_dims - 1) {
                 pos += snprintf(strides + pos, sizeof(strides) - pos, "x");
@@ -19683,7 +19693,28 @@ void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line
     }
     printf("%s\n",  sep_border);
 }
+float ggml_get_tensor_index(const struct ggml_tensor* tensor, int ind1, int ind2, int ind3, int ind4) {
+    if (tensor->n_dims < 1 || tensor->n_dims > 4) {
+        printf("Error: Incorrect dimension number %d\n", tensor->n_dims);
+        return -1; // handle error
+    }
 
+    int indices[4] = {ind1, ind2, ind3, ind4};
+    int total_offset = 0;
+
+    for (int i = 0; i < tensor->n_dims; i++) {
+        if (indices[i] > tensor->ne[i] || indices[i] < 0) {
+            printf("Error: Incorrect index for dimension %d\n", i);
+            printf("Index: %d, Dimension size: %d\n", indices[i], tensor->ne[i]);
+            return -1; // handle error
+        }
+
+        total_offset += indices[i] * tensor->nb[i];
+    }
+
+    // Return the value at the calculated offset
+    return *(float *)((char *) tensor->data + total_offset);
+}
 ////////////////////////////////////////////////////////////////////////////////
 
 int ggml_cpu_has_avx(void) {
