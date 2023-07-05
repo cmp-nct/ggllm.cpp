@@ -10921,7 +10921,7 @@ static void ggml_compute_forward_mul_mat_f32(
     const int64_t ne02 = src0->ne[2];
     const int64_t ne03 = src0->ne[3];
 
-    const int64_t ne10 = src1->ne[0];
+    // const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
     const int64_t ne13 = src1->ne[3];
@@ -19705,7 +19705,7 @@ float ggml_get_tensor_index(const struct ggml_tensor* tensor, int ind1, int ind2
     for (int i = 0; i < tensor->n_dims; i++) {
         if (indices[i] > tensor->ne[i] || indices[i] < 0) {
             printf("Error: Incorrect index for dimension %d\n", i);
-            printf("Index: %d, Dimension size: %d\n", indices[i], tensor->ne[i]);
+            printf("Index: %d, Dimension size: %ld\n", indices[i], tensor->ne[i]);
             return -1; // handle error
         }
 
