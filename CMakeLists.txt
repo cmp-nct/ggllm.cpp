@@ -491,18 +491,18 @@ target_link_libraries(llama PRIVATE
     )
 
 # falcon
-add_library(libfalcon
-    libfalcon.cpp
-    libfalcon.h
+add_library(falcon
+        falcon.cpp
+        falcon.h
     llama-util.h
     )
 add_library(cmpnct_unicode
     cmpnct_unicode.cpp
     cmpnct_unicode.h
     )
-target_include_directories(libfalcon PUBLIC .)
-target_compile_features(libfalcon PUBLIC cxx_std_11) # don't bump
-target_link_libraries(libfalcon PRIVATE
+target_include_directories(falcon PUBLIC .)
+target_compile_features(falcon PUBLIC cxx_std_11) # don't bump
+target_link_libraries(falcon PRIVATE
     cmpnct_unicode
     ggml
     ${LLAMA_EXTRA_LIBS}
@@ -517,10 +517,10 @@ if (BUILD_SHARED_LIBS)
     endif()
 
     # falcon
-    set_target_properties(libfalcon PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_compile_definitions(libfalcon PRIVATE LLAMA_SHARED LLAMA_BUILD)
+    set_target_properties(falcon PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(falcon PRIVATE LLAMA_SHARED LLAMA_BUILD)
     if (LLAMA_METAL)
-        set_target_properties(libfalcon PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ggml-metal.metal")
+        set_target_properties(falcon PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ggml-metal.metal")
     endif()
     #
 endif()
@@ -531,7 +531,7 @@ if (GGML_SOURCES_CUDA)
     set_property(TARGET ggml  PROPERTY CUDA_SELECT_NVCC_ARCH_FLAGS "Auto")
     set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES OFF)
     # falcon
-    set_property(TARGET libfalcon  PROPERTY CUDA_ARCHITECTURES OFF)
+    set_property(TARGET falcon  PROPERTY CUDA_ARCHITECTURES OFF)
 
 endif()
 

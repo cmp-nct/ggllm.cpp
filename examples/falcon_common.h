@@ -3,7 +3,7 @@
 #define __FALCON_COMMON_H__
 #pragma once
 
-#include "libfalcon.h"
+#include "falcon.h"
 
 #include <string>
 #include <vector>

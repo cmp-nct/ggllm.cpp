@@ -254,7 +254,7 @@ llama.o: llama.cpp ggml.h ggml-cuda.h llama.h llama-util.h
 cmpnct_unicode.o: cmpnct_unicode.cpp cmpnct_unicode.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-libfalcon.o: libfalcon.cpp ggml.h ggml-cuda.h libfalcon.h llama-util.h cmpnct_unicode.h
+falcon.o: falcon.cpp ggml.h ggml-cuda.h falcon.h llama-util.h cmpnct_unicode.h
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 common.o: examples/common.cpp examples/common.h
@@ -285,17 +285,17 @@ simple: examples/simple/simple.cpp                            build-info.h ggml.
 quantize: examples/quantize/quantize.cpp                      build-info.h ggml.o llama.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-falcon_main: examples/falcon/falcon_main.cpp                                  build-info.h ggml.o libfalcon.o libfalcon.o cmpnct_unicode.o falcon_common.o $(OBJS)
+falcon_main: examples/falcon/falcon_main.cpp                                  build-info.h ggml.o falcon.o falcon.o cmpnct_unicode.o falcon_common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 	@echo
 	@echo '====  Run ./falcon_main -h for help.  ===='
 	@echo 'Read the readme file for important parameters and usage'
 	@echo
 
-falcon_quantize: examples/falcon_quantize/quantize.cpp                      build-info.h ggml.o libfalcon.o libfalcon.o cmpnct_unicode.o  $(OBJS)
+falcon_quantize: examples/falcon_quantize/quantize.cpp                      build-info.h ggml.o falcon.o falcon.o cmpnct_unicode.o  $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-falcon_perplexity: examples/falcon_perplexity/falcon_perplexity.cpp                build-info.h ggml.o libfalcon.o libfalcon.o falcon_common.o cmpnct_unicode.o $(OBJS)
+falcon_perplexity: examples/falcon_perplexity/falcon_perplexity.cpp                build-info.h ggml.o falcon.o falcon.o falcon_common.o cmpnct_unicode.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
 

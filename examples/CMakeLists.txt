@@ -39,7 +39,7 @@ endif()
 
 target_include_directories(${FALCON_TARGET} PUBLIC .)
 target_compile_features(${FALCON_TARGET} PUBLIC cxx_std_11)
-target_link_libraries(${FALCON_TARGET} PRIVATE libfalcon)
+target_link_libraries(${FALCON_TARGET} PRIVATE falcon)
 
 # examples
 
