@@ -492,8 +492,8 @@ target_link_libraries(llama PRIVATE
 
 # falcon
 add_library(falcon
-        falcon.cpp
-        falcon.h
+    libfalcon.cpp
+    libfalcon.h
     llama-util.h
     )
 add_library(cmpnct_unicode

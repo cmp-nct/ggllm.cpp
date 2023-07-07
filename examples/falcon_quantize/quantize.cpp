@@ -1,6 +1,6 @@
 #include "build-info.h"
 
-#include "falcon.h"
+#include "libfalcon.h"
 
 #include <cstdio>
 #include <cstring>

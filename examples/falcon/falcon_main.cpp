@@ -9,7 +9,7 @@
 #endif
 
 #include "falcon_common.h"
-#include "falcon.h"
+#include "libfalcon.h"
 #include "build-info.h"
 
 #include <cassert>
