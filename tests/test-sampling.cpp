@@ -1,5 +1,5 @@
 #include "ggml.h"
-#include "llama.h"
+#include "libfalcon.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -12,7 +12,7 @@
 #include <vector>
 #include <algorithm>
 
-void dump(const llama_token_data_array * candidates) {
+void dump(const falcon_token_data_array * candidates) {
     for (size_t i = 0; i < candidates->size; i++) {
         printf("%d: %f (%f)\n", candidates->data[i].id, candidates->data[i].p, candidates->data[i].logit);
     }
@@ -25,14 +25,14 @@ void test_top_k(const std::vector<float> & probs,
                 const std::vector<float> & expected_probs,
                 int k) {
     size_t n_vocab = probs.size();
-    std::vector<llama_token_data> candidates;
+    std::vector<falcon_token_data> candidates;
     candidates.reserve(n_vocab);
-    for (llama_token token_id = 0; token_id < (llama_token)n_vocab; token_id++) {
+    for (falcon_token token_id = 0; token_id < (falcon_token)n_vocab; token_id++) {
         float logit = log(probs[token_id]);
-        candidates.emplace_back(llama_token_data{token_id, logit, 0.0f});
+        candidates.emplace_back(falcon_token_data{token_id, logit, 0.0f});
     }
 
-    llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+    falcon_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
     llama_sample_softmax(nullptr, &candidates_p);
     DUMP(&candidates_p);
     llama_sample_top_k(nullptr, &candidates_p, k, 1);
@@ -50,14 +50,14 @@ void test_top_p(const std::vector<float> & probs,
                 float p) {
 
     size_t n_vocab = probs.size();
-    std::vector<llama_token_data> candidates;
+    std::vector<falcon_token_data> candidates;
     candidates.reserve(n_vocab);
-    for (llama_token token_id = 0; token_id < (llama_token)n_vocab; token_id++) {
+    for (falcon_token token_id = 0; token_id < (falcon_token)n_vocab; token_id++) {
         float logit = log(probs[token_id]);
-        candidates.emplace_back(llama_token_data{token_id, logit, 0.0f});
+        candidates.emplace_back(falcon_token_data{token_id, logit, 0.0f});
     }
 
-    llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+    falcon_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
     llama_sample_softmax(nullptr, &candidates_p);
     DUMP(&candidates_p);
     llama_sample_top_p(nullptr, &candidates_p, p, 1);
@@ -74,14 +74,14 @@ void test_tfs(const std::vector<float> & probs,
                 const std::vector<float> & expected_probs,
                 float z) {
     size_t n_vocab = probs.size();
-    std::vector<llama_token_data> candidates;
+    std::vector<falcon_token_data> candidates;
     candidates.reserve(n_vocab);
-    for (llama_token token_id = 0; token_id < (llama_token)n_vocab; token_id++) {
+    for (falcon_token token_id = 0; token_id < (falcon_token)n_vocab; token_id++) {
         float logit = log(probs[token_id]);
-        candidates.emplace_back(llama_token_data{token_id, logit, 0.0f});
+        candidates.emplace_back(falcon_token_data{token_id, logit, 0.0f});
     }
 
-    llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+    falcon_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
     DUMP(&candidates_p);
     llama_sample_tail_free(nullptr, &candidates_p, z, 1);
     DUMP(&candidates_p);
@@ -97,14 +97,14 @@ void test_typical(const std::vector<float> & probs,
                 const std::vector<float> & expected_probs,
                 float p) {
     size_t n_vocab = probs.size();
-    std::vector<llama_token_data> candidates;
+    std::vector<falcon_token_data> candidates;
     candidates.reserve(n_vocab);
-    for (llama_token token_id = 0; token_id < (llama_token)n_vocab; token_id++) {
+    for (falcon_token token_id = 0; token_id < (falcon_token)n_vocab; token_id++) {
         float logit = log(probs[token_id]);
-        candidates.emplace_back(llama_token_data{token_id, logit, 0.0f});
+        candidates.emplace_back(falcon_token_data{token_id, logit, 0.0f});
     }
 
-    llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+    falcon_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
     DUMP(&candidates_p);
     llama_sample_typical(nullptr, &candidates_p, p, 1);
     DUMP(&candidates_p);
@@ -118,23 +118,23 @@ void test_typical(const std::vector<float> & probs,
 
 void test_repetition_penalty(
                 const std::vector<float> & probs,
-                const std::vector<llama_token> & last_tokens,
+                const std::vector<falcon_token> & last_tokens,
                 const std::vector<float> & expected_probs,
                 float penalty) {
     assert(probs.size() == expected_probs.size());
 
     size_t n_vocab = probs.size();
-    std::vector<llama_token_data> candidates;
+    std::vector<falcon_token_data> candidates;
     candidates.reserve(n_vocab);
-    for (llama_token token_id = 0; token_id < (llama_token)n_vocab; token_id++) {
+    for (falcon_token token_id = 0; token_id < (falcon_token)n_vocab; token_id++) {
         float logit = log(probs[token_id]);
-        candidates.emplace_back(llama_token_data{token_id, logit, 0.0f});
+        candidates.emplace_back(falcon_token_data{token_id, logit, 0.0f});
     }
 
-    llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+    falcon_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
     llama_sample_softmax(nullptr, &candidates_p);
     DUMP(&candidates_p);
-    llama_sample_repetition_penalty(nullptr, &candidates_p, (const llama_token *) last_tokens.data(), last_tokens.size(), penalty);
+    llama_sample_repetition_penalty(nullptr, &candidates_p, (const falcon_token *) last_tokens.data(), last_tokens.size(), penalty);
     llama_sample_softmax(nullptr, &candidates_p);
     DUMP(&candidates_p);
 
@@ -147,23 +147,23 @@ void test_repetition_penalty(
 
 void test_frequency_presence_penalty(
                 const std::vector<float> & probs,
-                const std::vector<llama_token> & last_tokens,
+                const std::vector<falcon_token> & last_tokens,
                 const std::vector<float> & expected_probs,
                 float alpha_frequency, float alpha_presence) {
     assert(probs.size() == expected_probs.size());
 
     size_t n_vocab = probs.size();
-    std::vector<llama_token_data> candidates;
+    std::vector<falcon_token_data> candidates;
     candidates.reserve(n_vocab);
-    for (llama_token token_id = 0; token_id < (llama_token)n_vocab; token_id++) {
+    for (falcon_token token_id = 0; token_id < (falcon_token)n_vocab; token_id++) {
         float logit = log(probs[token_id]);
-        candidates.emplace_back(llama_token_data{token_id, logit, 0.0f});
+        candidates.emplace_back(falcon_token_data{token_id, logit, 0.0f});
     }
 
-    llama_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
+    falcon_token_data_array candidates_p = { candidates.data(), candidates.size(), false };
     llama_sample_softmax(nullptr, &candidates_p);
     // DUMP(&candidates_p);
-    llama_sample_frequency_and_presence_penalties(nullptr, &candidates_p, (const llama_token *) last_tokens.data(), last_tokens.size(), alpha_frequency, alpha_presence);
+    llama_sample_frequency_and_presence_penalties(nullptr, &candidates_p, (const falcon_token *) last_tokens.data(), last_tokens.size(), alpha_frequency, alpha_presence);
     llama_sample_softmax(nullptr, &candidates_p);
     // DUMP(&candidates_p);
 
