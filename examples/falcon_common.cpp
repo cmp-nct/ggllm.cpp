@@ -314,6 +314,8 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.system_prompt = argv[i];
+        } else if (arg == "-sysraw" || arg == "--system-raw") {
+            params.sys_prompt_is_raw = true;
         }
         else if (arg == "--lora") {
             if (++i >= argc) {
@@ -863,7 +865,7 @@ int put_codepoint(console_state & con_st, const char* utf8_codepoint, size_t len
         return expectedWidth;
     }
     COORD initialPosition = bufferInfo.dwCursorPosition;
-    DWORD nNumberOfChars = length;
+    DWORD nNumberOfChars = (DWORD)length;
     WriteConsole(con_st.hConsole, utf8_codepoint, nNumberOfChars, &nNumberOfChars, NULL);
 
     CONSOLE_SCREEN_BUFFER_INFO newBufferInfo;
@@ -1013,7 +1015,7 @@ bool console_readline(console_state & con_st, std::string & line) {
                 } while (count == 0 && !widths.empty());
             }
         } else {
-            int offset = line.length();
+            int offset = (int)line.length();
             append_utf8(input_char, line);
             int width = put_codepoint(con_st, line.c_str() + offset, line.length() - offset, estimateWidth(input_char));
             if (width < 0) {

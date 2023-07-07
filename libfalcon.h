@@ -183,11 +183,11 @@ extern "C" {
     // Copies the state to the specified destination address.
     // Destination needs to have allocated enough memory.
     // Returns the number of bytes copied
-    LLAMA_API size_t llama_copy_state_data(struct falcon_context * ctx, uint8_t * dst);
+    LLAMA_API size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst);
 
     // Set the state reading from the specified address
     // Returns the number of bytes read
-    LLAMA_API size_t llama_set_state_data(struct falcon_context * ctx, uint8_t * src);
+    LLAMA_API size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src);
 
     // Save/load session file
     LLAMA_API bool llama_load_session_file(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out);
@@ -250,6 +250,8 @@ extern "C" {
     LLAMA_API const char * falcon_token_to_str(const struct falcon_context * ctx, falcon_token token);
     typedef enum { FINETUNE_UNSPECIFIED, FINETUNE_NONE, FINETUNE_ALPACA, FINETUNE_OPENASSISTANT, FINETUNE_WIZARD, FINETUNE_FALCONINSTRUCT } t_finetune_type;
     static const char *FINETUNE_NAME[6] = { "UNSPECIFIED", "NONE", "ALPACA", "OPENASSISTANT", "WIZARD", "FALCONINSTRUCT" };
+
+    
 
 
     LLAMA_API t_finetune_type falcon_detect_finetune(falcon_context * ctx, std::string model_path);

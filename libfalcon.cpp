@@ -64,6 +64,7 @@ enum e_model {
     FALCON_7B,
     FALCON_40B,
 };
+static const char *unused0 = FINETUNE_NAME[0]; 
 
 static const size_t MB = 1024*1024;
 
@@ -2169,12 +2170,14 @@ static bool falcon_eval_internal(
             // store key and value to memory
             {
                 struct ggml_tensor* k = ggml_view_1d(
-                    ctx0, kv_self.k, N * n_head_kv * head_dim,
+                    ctx0, kv_self.k, 
+                    N * n_head_kv * head_dim,
                     (ggml_element_size(kv_self.k) * n_head_kv * head_dim) *
-                        (il * n_ctx + n_past));
+                        (il * n_ctx + n_past));  
                 ggml_set_name(k, "k");
                 struct ggml_tensor* v = ggml_view_1d(
-                    ctx0, kv_self.v, N * n_head_kv * head_dim,
+                    ctx0, kv_self.v, 
+                    N * n_head_kv * head_dim,
                     (ggml_element_size(kv_self.v) * n_head_kv * head_dim) *
                         (il * n_ctx + n_past));
                 ggml_set_name(v, "v");
@@ -4058,7 +4061,7 @@ size_t llama_get_state_size(const struct falcon_context * ctx) {
 }
 
 // Copies the state to the specified destination address
-size_t llama_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
+size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
     uint8_t * out = dst;
 
     // copy rng
@@ -4110,6 +4113,8 @@ size_t llama_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
         const int    n_layer = hparams.n_layer;
         const int    n_embd  = hparams.n_embd;
         const int    n_ctx   = hparams.n_ctx;
+        const int    n_head_kv = hparams.n_head_kv;
+        const int    head_dim = hparams.n_embd / hparams.n_head;
 
         const size_t kv_size = kv_self.buf.size;
         const int    kv_ntok = llama_get_kv_cache_token_count(ctx);
@@ -4120,27 +4125,35 @@ size_t llama_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
         if (kv_size) {
             const size_t elt_size = ggml_element_size(kv_self.k);
 
-            char buffer[4096];
-
-            ggml_context * cpy_ctx = ggml_init({ sizeof(buffer), buffer, /* no_alloc */ true });
+            ggml_context * cpy_ctx = ggml_init({ 4096, NULL, /* no_alloc */ true });
             ggml_cgraph gf{};
             gf.n_threads = 1;
 
-            ggml_tensor * kout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_embd, kv_ntok, n_layer);
+            // ggml_tensor * kout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_embd, kv_ntok, n_layer);
+            ggml_tensor * kout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_head_kv*head_dim, kv_ntok, n_layer);
             kout3d->data = out;
             out += ggml_nbytes(kout3d);
 
-            ggml_tensor * vout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_embd, n_layer);
+            // ggml_tensor * vout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_embd, n_layer);
+            ggml_tensor * vout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, n_head_kv*head_dim, kv_ntok, n_layer);
             vout3d->data = out;
             out += ggml_nbytes(vout3d);
 
-            ggml_tensor * k3d = ggml_view_3d(cpy_ctx, kv_self.k,
+            /*ggml_tensor * k3d = ggml_view_3d(cpy_ctx, kv_self.k,
                 n_embd, kv_ntok, n_layer,
                 elt_size*n_embd, elt_size*n_embd*n_ctx, 0);
 
             ggml_tensor * v3d = ggml_view_3d(cpy_ctx, kv_self.v,
                 kv_ntok, n_embd, n_layer,
-                elt_size*n_ctx, elt_size*n_ctx*n_embd, 0);
+                elt_size*n_ctx, elt_size*n_ctx*n_embd, 0);*/
+            // todo: wouldn't this all be more consistent as 1d ?
+            ggml_tensor * k3d = ggml_view_3d(cpy_ctx, kv_self.k,
+                n_head_kv*head_dim, kv_ntok, n_layer,
+                elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
+
+            ggml_tensor * v3d = ggml_view_3d(cpy_ctx, kv_self.v,
+                n_head_kv*head_dim, kv_ntok, n_layer,
+                elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
 
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, k3d, kout3d));
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, v3d, vout3d));
@@ -4158,8 +4171,8 @@ size_t llama_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
     return written;
 }
 
-// Sets the state reading from the specified source address
-size_t llama_set_state_data(struct falcon_context * ctx, uint8_t * src) {
+// Sets (restores) the state reading from the specified source address
+size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
     uint8_t * inp = src;
 
     // set rng
@@ -4209,13 +4222,15 @@ size_t llama_set_state_data(struct falcon_context * ctx, uint8_t * src) {
         }
     }
 
-    // set kv cache
+    // set/restore kv cache
     {
         const auto & kv_self = ctx->model.kv_self;
         const auto & hparams = ctx->model.hparams;
         const int    n_layer = hparams.n_layer;
         const int    n_embd  = hparams.n_embd;
         const int    n_ctx   = hparams.n_ctx;
+        const int    n_head_kv = hparams.n_head_kv;
+        const int    head_dim = hparams.n_embd / hparams.n_head;
 
         size_t kv_size;
         int kv_ntok;
@@ -4228,27 +4243,33 @@ size_t llama_set_state_data(struct falcon_context * ctx, uint8_t * src) {
 
             const size_t elt_size = ggml_element_size(kv_self.k);
 
-            char buffer[4096];
-
-            ggml_context * cpy_ctx = ggml_init({ sizeof(buffer), buffer, /* no_alloc */ true });
+            ggml_context * cpy_ctx = ggml_init({ 4096, NULL, /* no_alloc */ true });
             ggml_cgraph gf{};
             gf.n_threads = 1;
-
-            ggml_tensor * kin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_embd, kv_ntok, n_layer);
+            // ggml_tensor * kin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_embd, kv_ntok, n_layer);
+            ggml_tensor * kin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_head_kv*head_dim, kv_ntok, n_layer);
             kin3d->data = (void *) inp;
             inp += ggml_nbytes(kin3d);
 
-            ggml_tensor * vin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_embd, n_layer);
+            // ggml_tensor * vin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_embd, n_layer);
+            ggml_tensor * vin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, n_head_kv*head_dim, kv_ntok, n_layer);
             vin3d->data = (void *) inp;
             inp += ggml_nbytes(vin3d);
 
-            ggml_tensor * k3d = ggml_view_3d(cpy_ctx, kv_self.k,
+            /*ggml_tensor * k3d = ggml_view_3d(cpy_ctx, kv_self.k,
                 n_embd, kv_ntok, n_layer,
                 elt_size*n_embd, elt_size*n_embd*n_ctx, 0);
 
             ggml_tensor * v3d = ggml_view_3d(cpy_ctx, kv_self.v,
                 kv_ntok, n_embd, n_layer,
-                elt_size*n_ctx, elt_size*n_ctx*n_embd, 0);
+                elt_size*n_ctx, elt_size*n_ctx*n_embd, 0);*/
+            ggml_tensor * k3d = ggml_view_3d(cpy_ctx, kv_self.k,
+                n_head_kv*head_dim, kv_ntok, n_layer,
+                elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
+
+            ggml_tensor * v3d = ggml_view_3d(cpy_ctx, kv_self.v,
+                n_head_kv*head_dim, kv_ntok, n_layer,
+                elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
 
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, kin3d, k3d));
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, vin3d, v3d));
@@ -4268,7 +4289,7 @@ size_t llama_set_state_data(struct falcon_context * ctx, uint8_t * src) {
     return nread;
 }
 
-bool llama_load_session_file(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+static bool llama_load_session_file_internal(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(path_session, "rb");
 
     // sanity checks
@@ -4316,10 +4337,19 @@ bool llama_load_session_file(struct falcon_context * ctx, const char * path_sess
         std::vector<uint8_t> state_data(n_state_size_max);
         file.read_raw(state_data.data(), n_state_size_cur);
 
-        llama_set_state_data(ctx, state_data.data());
+        falcon_set_state_data(ctx, state_data.data());
     }
 
     return true;
+}
+
+bool llama_load_session_file(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    try {
+        return llama_load_session_file_internal(ctx, path_session, tokens_out, n_token_capacity, n_token_count_out);
+    } catch (const std::exception & err) {
+        fprintf(stderr, "error loading session file: %s\n", err.what());
+        return false;
+    }
 }
 
 bool llama_save_session_file(struct falcon_context * ctx, const char * path_session, const falcon_token * tokens, size_t n_token_count) {
@@ -4339,7 +4369,7 @@ bool llama_save_session_file(struct falcon_context * ctx, const char * path_sess
         const size_t n_state_size_max = llama_get_state_size(ctx);
 
         std::vector<uint8_t> state_data(n_state_size_max);
-        const size_t n_state_size_cur = llama_copy_state_data(ctx, state_data.data());
+        const size_t n_state_size_cur = falcon_copy_state_data(ctx, state_data.data());
 
         file.write_raw(state_data.data(), n_state_size_cur);
     }
@@ -4353,6 +4383,7 @@ int falcon_eval(
                          int   n_tokens,
                          int   n_past,
                          int   n_threads, int debug_timings) {
+    // fprintf(stderr, "falcon_eval: n_tokens=%d, n_past=%d, n_threads=%d\n", n_tokens, n_past, n_threads);
     #if defined(GGML_USE_CUBLAS)
     static int no_purge_counter=0; // once the system is stable for 3 iterations, we stop testing
     if (no_purge_counter < 3 || n_past%50==0) {
@@ -4368,6 +4399,7 @@ int falcon_eval(
             no_purge_counter=0;
     }
     #endif
+
     if (!falcon_eval_internal(*ctx, tokens, n_tokens, n_past, n_threads, nullptr, debug_timings)) {
         fprintf(stderr, "%s: failed to eval\n", __func__);
         return 1;

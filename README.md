@@ -1,5 +1,8 @@
 ggllm.cpp is a ggml-based tool to run quantized Falcon Models on CPU and GPU
 
+For detailed (growing) examples and help check the new Wiki:   
+https://github.com/cmp-nct/ggllm.cpp/wiki  
+
 **Features that differentiate from llama.cpp for now:**
 - Support for Falcon 7B and 40B models (inference, quantization and perplexity tool)
 - Fully automated GPU offloading based on available and total VRAM

@@ -66,6 +66,7 @@ struct gpt_params {
 
     std::string stopwords  = ""; // comma separated list of stopwords (<|endoftext|> is handled by --ignore-eos)
     bool enclose_finetune  = false; // enclose prompt with correct tokens for finetuned model
+    bool sys_prompt_is_raw = false; // The given system prompt will be used without adaptation
     bool memory_f16        = true;  // use f16 instead of f32 for memory kv
     bool random_prompt     = false; // do not randomize prompt if none provided
     bool use_color         = false; // use color to distinguish generations and inputs

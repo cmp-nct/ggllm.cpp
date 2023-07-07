@@ -5501,7 +5501,7 @@ struct ggml_tensor * ggml_mean(
     return result;
 }
 
-// ggml_repeat
+// ggml_repeat (interleaving repeat - 1,2,3 -> 1,2,3,1,2,3)
 
 struct ggml_tensor * ggml_repeat(
         struct ggml_context * ctx,
