@@ -204,60 +204,7 @@ struct falcon_kv_cache {
     }
 };
 
-struct falcon_model {
-    e_model type = FALCON_UNKNOWN;
 
-    falcon_hparams hparams;
-
-    struct ggml_tensor* tok_embeddings;
-    struct ggml_tensor* output_norm;
-    struct ggml_tensor* output_norm_b;
-    struct ggml_tensor* lm_head;
-
-    std::vector<falcon_layer> layers;
-
-    int n_gpu_layers;
-    int i_gpu_start;
-    int i_gpu_last;
-
-    // context
-    struct ggml_context * ctx = NULL;
-    std::map<std::string, struct ggml_tensor*> tensors;
-
-    // key + value cache for the self attention
-    // TODO: move to llama_state
-    struct falcon_kv_cache kv_self;
-
-    // the model memory buffer
-    llama_ctx_buffer buf;
-
-    // model memory mapped file
-    std::unique_ptr<llama_mmap> mapping;
-
-    // objects representing data potentially being locked in memory
-    llama_mlock mlock_buf;
-    llama_mlock mlock_mmap;
-
-    // for quantize-stats only
-    std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
-
-
-    ~falcon_model() {
-        if (ctx) {
-            ggml_free(ctx);
-        }
-
-#ifdef GGML_USE_CUBLAS
-        for (size_t i = 0; i < tensors_by_name.size(); ++i) {
-            ggml_cuda_free_data(tensors_by_name[i].second);
-        }
-#elif defined(GGML_USE_CLBLAST)
-        for (size_t i = 0; i < tensors_by_name.size(); ++i) {
-            ggml_cl_free_data(tensors_by_name[i].second);
-        }
-#endif
-    }
-};
 
 
 #if 1
@@ -527,10 +474,69 @@ struct falcon_vocab {
 
 };
 #endif
+struct falcon_model {
+    e_model type = FALCON_UNKNOWN;
 
+    falcon_hparams hparams;
+
+    falcon_vocab vocab;
+
+    struct ggml_tensor* tok_embeddings;
+    struct ggml_tensor* output_norm;
+    struct ggml_tensor* output_norm_b;
+    struct ggml_tensor* lm_head;
+
+    std::vector<falcon_layer> layers;
+
+    int n_gpu_layers;
+    int i_gpu_start;
+    int i_gpu_last;
+
+    // context
+    struct ggml_context * ctx = NULL;
+    std::map<std::string, struct ggml_tensor*> tensors;
+
+    // key + value cache for the self attention
+    // TODO: move to llama_state
+    struct falcon_kv_cache kv_self;
+
+    // the model memory buffer
+    llama_ctx_buffer buf;
+
+    // model memory mapped file
+    std::unique_ptr<llama_mmap> mapping;
+
+    // objects representing data potentially being locked in memory
+    llama_mlock mlock_buf;
+    llama_mlock mlock_mmap;
+
+    // for quantize-stats only
+    std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+
+
+    ~falcon_model() {
+        if (ctx) {
+            ggml_free(ctx);
+        }
+
+#ifdef GGML_USE_CUBLAS
+        for (size_t i = 0; i < tensors_by_name.size(); ++i) {
+            ggml_cuda_free_data(tensors_by_name[i].second);
+        }
+#elif defined(GGML_USE_CLBLAST)
+        for (size_t i = 0; i < tensors_by_name.size(); ++i) {
+            ggml_cl_free_data(tensors_by_name[i].second);
+        }
+#endif
+    }
+};
 
 
 struct falcon_context {
+    falcon_context(falcon_model &model, falcon_vocab &vocab)
+        : model(model), vocab(vocab) { 
+    }
+    std::string context_name = "default";
     std::mt19937 rng;
 
     int64_t t_load_us = 0;
@@ -545,8 +551,8 @@ struct falcon_context {
     int32_t n_eval   = 0; // number of eval calls
     int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
 
-    falcon_model model;
-    falcon_vocab vocab;
+    falcon_model &model;
+    falcon_vocab &vocab;
 
     size_t mem_per_token = 0;
 
@@ -600,6 +606,7 @@ struct falcon_context {
 #endif
     }
 };
+
 
 template <typename T>
 static T checked_mul(T a, T b) {
@@ -705,7 +712,7 @@ struct falcon_load_tensor {
             }
         }
         ne = first_shard.ne;
-        LLAMA_ASSERT(shards.size() <= UINT32_MAX);
+        FALCON_ASSERT(shards.size() <= UINT32_MAX);
         uint32_t n_shards = (uint32_t) shards.size();
         switch (split_type) {
             case SPLIT_NONE:
@@ -1013,7 +1020,7 @@ struct llama_file_saver {
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
                 break;
-            default: LLAMA_ASSERT(false);
+            default: FALCON_ASSERT(false);
         }
         file.write_u32((uint32_t) tensor.ne.size());
         file.write_u32((uint32_t) tensor.name.size());
@@ -1021,7 +1028,7 @@ struct llama_file_saver {
         file.write_raw(tensor.ne.data(), sizeof(tensor.ne[0]) * tensor.ne.size());
         file.write_raw(tensor.name.data(), tensor.name.size());
         file.seek(-static_cast<ptrdiff_t>(file.tell()) & 31, SEEK_CUR);
-        LLAMA_ASSERT(new_size == llama_calc_tensor_size(tensor.ne, new_type));
+        FALCON_ASSERT(new_size == llama_calc_tensor_size(tensor.ne, new_type));
         file.write_raw(new_data, new_size);
     }
 };
@@ -1126,7 +1133,7 @@ struct llama_model_loader {
                 tensor = ggml_new_tensor_2d(ggml_ctx, lt.type, lt.ne.at(0), lt.ne.at(1));
             }
         } else {
-            LLAMA_ASSERT(lt.ne.size() == 1);
+            FALCON_ASSERT(lt.ne.size() == 1);
             tensor = ggml_new_tensor_1d(ggml_ctx, lt.type, lt.ne.at(0));
         }
         
@@ -1151,7 +1158,7 @@ struct llama_model_loader {
         } 
             
         // printf("falcon.cpp: creating tensor %s\n", lt.name.c_str());
-        LLAMA_ASSERT(lt.ggml_tensor == NULL ); // if this fails, we called get_tensor twice on the same tensor
+        FALCON_ASSERT(lt.ggml_tensor == NULL ); // if this fails, we called get_tensor twice on the same tensor
 
         if (backend != GGML_BACKEND_CPU) {
             ggml_set_no_alloc(ggml_ctx, use_mmap);
@@ -1199,7 +1206,7 @@ struct llama_model_loader {
 
                 progress_callback((float) done_size / data_size, progress_callback_user_data,status);
             }
-            LLAMA_ASSERT(lt.ggml_tensor); // unused tensors should have been caught by load_data already
+            FALCON_ASSERT(lt.ggml_tensor); // unused tensors should have been caught by load_data already
             lt.data = (uint8_t *) lt.ggml_tensor->data;
 
             // allocate temp buffer if not using mmap
@@ -1246,7 +1253,7 @@ struct llama_model_loader {
 
     void load_data_for(falcon_load_tensor & lt) {
         if (use_mmap) {
-            LLAMA_ASSERT(lt.shards.size() == 1);
+            FALCON_ASSERT(lt.shards.size() == 1);
             lt.data = (uint8_t *) mapping->addr + lt.shards.at(0).file_off;
         } else if (lt.split_type == SPLIT_NONE) {
             llama_file & file = file_loaders.at(lt.shards.at(0).file_idx)->file;
@@ -1260,7 +1267,7 @@ struct llama_model_loader {
                 file.read_raw(lt.data + offset, shard.size);
                 offset += shard.size;
             }
-            LLAMA_ASSERT(offset == lt.size);
+            FALCON_ASSERT(offset == lt.size);
         } else if (lt.split_type == SPLIT_BY_COLUMNS) {
             // Let's load the data into temporary buffers to ensure the OS performs large loads.
             std::vector<llama_buffer> tmp_bufs(lt.shards.size());
@@ -1283,7 +1290,7 @@ struct llama_model_loader {
                     out_offset += per_shard_row_size;
                 }
             }
-            LLAMA_ASSERT(out_offset == lt.size);
+            FALCON_ASSERT(out_offset == lt.size);
         }
         if (0) {
             print_checksum(lt);
@@ -1455,7 +1462,7 @@ static const char *falcon_model_type_name(e_model type) {
     switch (type) {
         case FALCON_7B: return "7B";
         case FALCON_40B: return "40B";
-        default: LLAMA_ASSERT(false);
+        default: FALCON_ASSERT(false);
     }
 }
 
@@ -1507,9 +1514,8 @@ size_t calculate_layer_vram_bytes(const falcon_layer& layer) {
     return size;
 }
 
-static void falcon_model_load_internal(
+static falcon_model * falcon_model_load_internal(
         const std::string & fname,
-        falcon_context & lctx,
         int n_ctx,
         int n_batch,
         int n_gpu_layers,
@@ -1520,13 +1526,13 @@ static void falcon_model_load_internal(
         bool vocab_only,
         falcon_progress_callback progress_callback,
         void * progress_callback_user_data) {
-
-    lctx.t_start_us = ggml_time_us(); 
+    falcon_model * model_ = new falcon_model();
+    falcon_model & model = *model_;
+   
 
     std::unique_ptr<llama_model_loader> ml(new llama_model_loader(fname, use_mmap, vocab_only));
 
-    lctx.vocab = std::move(ml->file_loaders.at(0)->vocab);
-    auto & model = lctx.model;
+    model.vocab = std::move(ml->file_loaders.at(0)->vocab);
     model.hparams = ml->file_loaders.at(0)->hparams;
     model.n_gpu_layers = n_gpu_layers;
 
@@ -1545,7 +1551,7 @@ static void falcon_model_load_internal(
                     if (hparams.n_falcon_type == 40) {
                         model.type = e_model::FALCON_40B;
                     } else {
-                        LLAMA_ASSERT(false);
+                        FALCON_ASSERT(false);
                     }
                 } break;
         }
@@ -1574,7 +1580,7 @@ static void falcon_model_load_internal(
     }
 
     if (vocab_only) {
-        return;
+        return model_;
     }
 
     auto & ctx = model.ctx;
@@ -1586,19 +1592,19 @@ static void falcon_model_load_internal(
 
     // create the ggml context
     {
-        lctx.model.buf.resize(ctx_size);
+        model.buf.resize(ctx_size);
         if (use_mlock) {
-            lctx.model.mlock_buf.init(lctx.model.buf.addr);
-            lctx.model.mlock_buf.grow_to(lctx.model.buf.size);
+            model.mlock_buf.init(model.buf.addr);
+            model.mlock_buf.grow_to(model.buf.size);
         }
 
-        struct ggml_init_params params = {
-            /*.mem_size   =*/ lctx.model.buf.size,
-            /*.mem_buffer =*/ lctx.model.buf.addr,
+        struct ggml_init_params ggml_params = {
+            /*.mem_size   =*/ model.buf.size,
+            /*.mem_buffer =*/ model.buf.addr,
             /*.no_alloc   =*/ ml->use_mmap,
         };
 
-        model.ctx = ggml_init(params);
+        model.ctx = ggml_init(ggml_params);
         if (!model.ctx) {
             throw std::runtime_error(format("ggml_init() failed"));
         }
@@ -1621,7 +1627,7 @@ static void falcon_model_load_internal(
 #endif
 
     
-    int vram_reserved=128*MB;    // that amount of VRAM is to stay free on GPU (needs to become a user parameter)
+    int64_t vram_reserved=128*MB;    // that amount of VRAM is to stay free on GPU (needs to become a user parameter)
     size_t vram_overhead = 32*MB;    // this amount of vram is estimated for non weight storage buffers on VRAM
     size_t vram_free = 0; // for vram simulation below
 
@@ -1634,7 +1640,7 @@ static void falcon_model_load_internal(
     {
         vram_reserved = system_gpu_status->device_vram_reserved[main_gpu];
     }
-    // cublas is used in 32 bit mode, temporary cuda storage/conversion buffers are needed for batch ingestion ( could be run in 16 bit mode without performance downgrade and save half the VRAM)
+    // cublas is used in 16 bit mode, temporary cuda storage/conversion buffers are needed for batch ingestion ( could be run in 16 bit mode without performance downgrade and save half the VRAM)
 
     if (system_gpu_status->num_devices > 0)
     {
@@ -1893,7 +1899,7 @@ static void falcon_model_load_internal(
         progress_callback(0.01f, progress_callback_user_data,"Loading weights");
     }
     
-    ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &lctx.model.mlock_mmap : NULL);
+    ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &model.mlock_mmap : NULL);
 
     if (progress_callback) {
         progress_callback(0.98f, progress_callback_user_data,"Tensors populated");
@@ -1912,13 +1918,12 @@ static void falcon_model_load_internal(
 
     // loading time will be recalculate after the first eval, so
     // we take page faults deferred by mmap() into consideration
-    lctx.t_load_us = ggml_time_us() - lctx.t_start_us;
     
+    return model_;
 }
 
-static bool falcon_model_load(
+static falcon_model * falcon_model_load(
         const std::string & fname,
-        falcon_context & lctx,
         int n_ctx,
         int n_batch,
         int n_gpu_layers,
@@ -1930,12 +1935,12 @@ static bool falcon_model_load(
         falcon_progress_callback progress_callback,
         void *progress_callback_user_data) {
     try {
-        falcon_model_load_internal(fname, lctx, n_ctx, n_batch, n_gpu_layers, main_gpu, memory_type,
+        falcon_model *model = falcon_model_load_internal(fname, n_ctx, n_batch, n_gpu_layers, main_gpu, memory_type,
                                   use_mmap, use_mlock, vocab_only, progress_callback, progress_callback_user_data);
-        return true;
+        return model;
     } catch (const std::exception & err) {
         fprintf(stderr, "error loading model: %s\n", err.what());
-        return false;
+        return nullptr;
     }
 }
 
@@ -1968,7 +1973,7 @@ static bool falcon_eval_internal(
 
     const auto & kv_self = model.kv_self;
 
-    LLAMA_ASSERT(!!kv_self.ctx);
+    FALCON_ASSERT(!!kv_self.ctx);
 
     const int n_embd       = hparams.n_embd;
     const int n_layer      = hparams.n_layer;
@@ -3365,7 +3370,7 @@ static void llama_convert_tensor_internal(const falcon_load_tensor & tensor, lla
         } else if (ggml_is_quantized(tensor.type)) {
             qtype.dequantize_row_q(tensor.data, f32_output, nelements);
         } else {
-            LLAMA_ASSERT(false); // unreachable
+            FALCON_ASSERT(false); // unreachable
         }
         return;
     }
@@ -3373,7 +3378,7 @@ static void llama_convert_tensor_internal(const falcon_load_tensor & tensor, lla
     auto block_size = tensor.type == GGML_TYPE_F16 ? 1 : (size_t)ggml_blck_size(tensor.type);
     auto block_size_bytes = ggml_type_size(tensor.type);
 
-    LLAMA_ASSERT(nelements % block_size == 0);
+    FALCON_ASSERT(nelements % block_size == 0);
     auto nblocks = nelements / block_size;
     auto blocks_per_thread = nblocks / nthread;
     auto spare_blocks = nblocks - (blocks_per_thread * nthread); // if blocks aren't divisible by thread count
@@ -3613,17 +3618,104 @@ static void falcon_model_quantize_internal(const std::string & fname_inp, const 
     }
 }
 
+// set context memory buffers
+void falcon_context_set_buffers(falcon_context *ctx, int n_batch, int n_ctx)
+{
+    FALCON_ASSERT(ctx->model.type != FALCON_UNKNOWN);
+    ctx->buf_compute.resize(MEM_REQ_EVAL().at(ctx->model.type));
+    ctx->buf_scratch[0].resize(MEM_REQ_SCRATCH0().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).first);
+    ctx->buf_scratch[1].resize(MEM_REQ_SCRATCH1().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).second);
+    // fprintf(stderr, "Buffers: compute %.2f MB, scratch0 %.2f MB, scratch1 %.2f MB\n", MEM_REQ_EVAL().at(ctx->model.type)/1024.0/1024.0, (MEM_REQ_SCRATCH0().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).first)/1024.0/1024.0, (MEM_REQ_SCRATCH1().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).second)/1024.0/1024.0);
+}
+// create a new context with KV cache - if model type is set falcon_context_set_buffers() is called as well
+struct falcon_context * falcon_context_prepare(falcon_context_params params, falcon_model *model, std::string context_name, bool verbose)
+{
+    falcon_context * ctx = new falcon_context(*model, model->vocab); // ctx model/vocab only references to the globals
+    ctx->context_name=context_name;
+    if (params.seed < 0) {
+        params.seed = time(NULL);
+    }
+
+    ctx->rng = std::mt19937(params.seed);
+    ctx->logits_all = params.logits_all;
+
+    ggml_type memory_type = params.f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    ctx->t_start_us = ggml_time_us(); 
+
+    if (!params.vocab_only)
+    {
+        // reserve memory for context buffers
+        if (!kv_cache_init(ctx->model.hparams, ctx->model.kv_self, memory_type, ctx->model.hparams.n_ctx, params.n_gpu_layers)) {
+            fprintf(stderr, "%s: kv_cache_init() failed for self-attention cache\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+
+        
+        const auto & hparams = ctx->model.hparams;
+
+        // resized during inference
+        if (params.logits_all) {
+            ctx->logits.reserve(hparams.n_ctx*hparams.n_vocab);
+        } else {
+            ctx->logits.reserve(hparams.n_vocab);
+        }
+
+        if (params.embedding){
+            ctx->embedding.resize(hparams.n_embd);
+        }
+        
+        if (verbose && model->type != FALCON_UNKNOWN)
+        {
+            const size_t memory_size = ggml_nbytes(ctx->model.kv_self.k) + ggml_nbytes(ctx->model.kv_self.v);
+            falcon_context_set_buffers(ctx, params.n_batch, params.n_ctx);
+            fprintf(stderr, "%s: Context %s RAM buffers - key_val = %7.2f MB, Compute = %7.2f MB, Scratch 0 = %7.2f MB, Scratch 1 = %7.2f MB \n", __func__, context_name.c_str(), memory_size / 1024.0 / 1024.0, ctx->buf_compute.size /1024.0/1024.0, (ctx->buf_scratch[0].size)/1024.0/1024.0, (ctx->buf_scratch[1].size)/1024.0/1024.0);
+        }
+
+    }
+    #ifdef GGML_USE_METAL
+    if (params.n_gpu_layers > 0) {
+        // this allocates all Metal resources and memory buffers
+        ctx->ctx_metal = ggml_metal_init();
+
+        void *data_ptr = NULL;
+        size_t data_size = 0;
+        if (params.use_mmap) {
+            data_ptr = ctx->model.mapping->addr;
+            data_size= ctx->model.mapping->size;
+        } else {
+            data_ptr = ggml_get_mem_buffer(ctx->model.ctx);
+            data_size= ggml_get_mem_size(ctx->model.ctx);
+        }
+
+    #define LLAMA_METAL_CHECK_BUF(result)                                          \
+    if (!(result)) {                                                           \
+        fprintf(stderr, "%s: failed to add buffer\n", __func__);               \
+        llama_free(ctx);                                                       \
+        return NULL;                                                           \
+    }
+
+        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "data", data_ptr, data_size));
+        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "eval", ctx->buf_compute.addr, ctx->buf_compute.size));
+
+        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "kv",   ctx->model.kv_self.buf.addr, ctx->model.kv_self.buf.size));
+        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "scr0", ctx->buf_scratch[0].addr,    ctx->buf_scratch[0].size));
+        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "scr1", ctx->buf_scratch[1].addr,    ctx->buf_scratch[1].size));
+    #undef LLAMA_METAL_CHECK_BUF
+    }
+    #endif
+
+    return ctx;
+}
+
 
 struct falcon_context * falcon_init_from_file(
                              const char * path_model,
             struct falcon_context_params   params) {
     ggml_time_init();
 
-    falcon_context * ctx = new falcon_context;
     
-    if (params.seed < 0) {
-        params.seed = time(NULL);
-    }
+ 
 
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
@@ -3664,89 +3756,30 @@ struct falcon_context * falcon_init_from_file(
         };
     }
 
-    ctx->rng = std::mt19937(params.seed);
-    ctx->logits_all = params.logits_all;
-
     ggml_type memory_type = params.f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
-
-    if (!falcon_model_load(path_model, *ctx, params.n_ctx, params.n_batch, params.n_gpu_layers,
+    falcon_model *model = falcon_model_load(path_model, params.n_ctx, params.n_batch, params.n_gpu_layers,
                 params.main_gpu, memory_type, params.use_mmap, params.use_mlock,
-                params.vocab_only, params.progress_callback, params.progress_callback_user_data)) {
+                params.vocab_only, params.progress_callback, params.progress_callback_user_data);
+    if (model == nullptr) {
         fprintf(stderr, "%s: failed to load model\n", __func__);
-        llama_free(ctx);
+        // llama_free(f_ctx);
         return nullptr;
     }
     // model_load_internal() may change this if VRAM runs out
-    params.n_gpu_layers = ctx->model.n_gpu_layers; 
-    params.i_gpu_start = ctx->model.i_gpu_start; // first layer that's GPU accelerated
-    params.i_gpu_last = ctx->model.i_gpu_last; // last layer that's GPU accelerated
+    params.n_gpu_layers = model->n_gpu_layers; 
+    params.i_gpu_start = model->i_gpu_start; // first layer that's GPU accelerated
+    params.i_gpu_last = model->i_gpu_last; // last layer that's GPU accelerated
+    falcon_context * f_ctx = falcon_context_prepare(params, model, "falcon_main",true);
     
+    //falcon_context_set_buffers(f_ctx,params.n_batch,params.n_ctx);
+    //const size_t memory_size = ggml_nbytes(model->kv_self.k) + ggml_nbytes(model->kv_self.v);
+    //fprintf(stderr, "%s: RAM buffers - key_val = %7.2f MB, Compute = %7.2f MB, Scratch 0 = %7.2f MB, Scratch 1 = %7.2f MB \n", __func__, memory_size / 1024.0 / 1024.0, f_ctx->buf_compute.size /1024.0/1024.0, (f_ctx->buf_scratch[0].size)/1024.0/1024.0, (f_ctx->buf_scratch[1].size)/1024.0/1024.0);
 
-    // reserve memory for context buffers
-    if (!params.vocab_only) {
-        if (!kv_cache_init(ctx->model.hparams, ctx->model.kv_self, memory_type, ctx->model.hparams.n_ctx, params.n_gpu_layers)) {
-            fprintf(stderr, "%s: kv_cache_init() failed for self-attention cache\n", __func__);
-            llama_free(ctx);
-            return nullptr;
-        }
-
-        {
-            const size_t memory_size = ggml_nbytes(ctx->model.kv_self.k) + ggml_nbytes(ctx->model.kv_self.v);
-            fprintf(stderr, "%s: kv self size  = %7.2f MB\n", __func__, memory_size / 1024.0 / 1024.0);
-        }
-
-        const auto & hparams = ctx->model.hparams;
-
-        // resized during inference
-        if (params.logits_all) {
-            ctx->logits.reserve(hparams.n_ctx*hparams.n_vocab);
-        } else {
-            ctx->logits.reserve(hparams.n_vocab);
-        }
-
-        if (params.embedding){
-            ctx->embedding.resize(hparams.n_embd);
-        }
-
-    }
-
-#ifdef GGML_USE_METAL
-    if (params.n_gpu_layers > 0) {
-        // this allocates all Metal resources and memory buffers
-        ctx->ctx_metal = ggml_metal_init();
-
-        void *data_ptr = NULL;
-        size_t data_size = 0;
-        if (params.use_mmap) {
-            data_ptr = ctx->model.mapping->addr;
-            data_size= ctx->model.mapping->size;
-        } else {
-            data_ptr = ggml_get_mem_buffer(ctx->model.ctx);
-            data_size= ggml_get_mem_size(ctx->model.ctx);
-        }
-
-#define LLAMA_METAL_CHECK_BUF(result)                                          \
-    if (!(result)) {                                                           \
-        fprintf(stderr, "%s: failed to add buffer\n", __func__);               \
-        llama_free(ctx);                                                       \
-        return NULL;                                                           \
-    }
-
-        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "data", data_ptr, data_size));
-        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "eval", ctx->buf_compute.addr, ctx->buf_compute.size));
-
-        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "kv",   ctx->model.kv_self.buf.addr, ctx->model.kv_self.buf.size));
-        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "scr0", ctx->buf_scratch[0].addr,    ctx->buf_scratch[0].size));
-        LLAMA_METAL_CHECK_BUF(ggml_metal_add_buffer(ctx->ctx_metal, "scr1", ctx->buf_scratch[1].addr,    ctx->buf_scratch[1].size));
-#undef LLAMA_METAL_CHECK_BUF
-    }
-#endif
-
-    return ctx;
+    return f_ctx;
 }
 
-void llama_free(struct falcon_context * ctx) {
-    delete ctx;
+void llama_free(struct falcon_context * f_ctx) {
+    delete f_ctx;
 }
 
 int falcon_model_quantize(
@@ -4166,7 +4199,7 @@ size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
     const size_t written  = out - dst;
     const size_t max_size = llama_get_state_size(ctx);
 
-    LLAMA_ASSERT(written <= max_size);
+    FALCON_ASSERT(written <= max_size);
 
     return written;
 }
@@ -4187,7 +4220,7 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
         rng_ss.str(std::string(&rng_buf[0], rng_size));
         rng_ss >> ctx->rng;
 
-        LLAMA_ASSERT(rng_ss.fail() == false);
+        FALCON_ASSERT(rng_ss.fail() == false);
     }
 
     // set logits
@@ -4198,7 +4231,7 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
         memcpy(&logits_cap,  inp, sizeof(logits_cap));  inp += sizeof(logits_cap);
         memcpy(&logits_size, inp, sizeof(logits_size)); inp += sizeof(logits_size);
 
-        LLAMA_ASSERT(ctx->logits.capacity() == logits_cap);
+        FALCON_ASSERT(ctx->logits.capacity() == logits_cap);
 
         if (logits_size) {
             ctx->logits.resize(logits_size);
@@ -4214,7 +4247,7 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
 
         memcpy(&embedding_size, inp, sizeof(embedding_size)); inp += sizeof(embedding_size);
 
-        LLAMA_ASSERT(ctx->embedding.capacity() == embedding_size);
+        FALCON_ASSERT(ctx->embedding.capacity() == embedding_size);
 
         if (embedding_size) {
             memcpy(ctx->embedding.data(), inp, embedding_size * sizeof(float));
@@ -4239,7 +4272,7 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
         memcpy(&kv_ntok, inp, sizeof(kv_ntok)); inp += sizeof(kv_ntok);
 
         if (kv_size) {
-            LLAMA_ASSERT(kv_self.buf.size == kv_size);
+            FALCON_ASSERT(kv_self.buf.size == kv_size);
 
             const size_t elt_size = ggml_element_size(kv_self.k);
 
@@ -4284,7 +4317,7 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
     const size_t nread    = inp - src;
     const size_t max_size = llama_get_state_size(ctx);
 
-    LLAMA_ASSERT(nread <= max_size);
+    FALCON_ASSERT(nread <= max_size);
 
     return nread;
 }
@@ -4413,14 +4446,7 @@ int falcon_eval(
     return 0;
 }
 
-void falcon_prepare_buffers(falcon_context *ctx, int n_batch, int n_ctx)
-{
-    ctx->buf_compute.resize(MEM_REQ_EVAL().at(ctx->model.type));
-    ctx->buf_scratch[0].resize(MEM_REQ_SCRATCH0().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).first);
-    ctx->buf_scratch[1].resize(MEM_REQ_SCRATCH1().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).second);
 
-    // fprintf(stderr, "Buffers: compute %.2f MB, scratch0 %.2f MB, scratch1 %.2f MB\n", MEM_REQ_EVAL().at(ctx->model.type)/1024.0/1024.0, (MEM_REQ_SCRATCH0().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).first)/1024.0/1024.0, (MEM_REQ_SCRATCH1().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).second)/1024.0/1024.0);
-}
 
 int falcon_eval_export(struct falcon_context * ctx, const char * fname) {
     const int n_batch = 1;

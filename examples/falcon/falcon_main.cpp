@@ -175,7 +175,7 @@ int main(int argc, char ** argv) {
     // determine the maximum memory usage needed to do inference for the given n_batch and n_predict parameters
     // uncomment the "used_mem" line in llama.cpp to see the results
     if (params.mem_test) {
-        falcon_prepare_buffers(ctx, params.n_batch, params.n_ctx);
+        // falcon_context_set_buffers(ctx, params.n_batch, params.n_ctx);
         {
             const std::vector<falcon_token> tmp((int)params.n_batch, falcon_token_bos());
             falcon_eval(ctx, tmp.data(), (int)tmp.size(), 0, params.n_threads,params.debug_timings);
@@ -264,7 +264,7 @@ int main(int argc, char ** argv) {
                 inp_sfx = ::falcon_tokenize(ctx, "<|endoftext|><|assistant|>", false);
                 if (params.system_prompt.size() &&!params.sys_prompt_is_raw)
                 {
-                    inp_system = ::falcon_tokenize(ctx, "<|system|>Behavior:"+params.system_prompt+"<|endoftext|>", false);
+                    inp_system = ::falcon_tokenize(ctx, ">>DOMAIN<<<|prefix_begin|>"+params.system_prompt+"<|prefix_end|>", false);
                     // inp_system = ::falcon_tokenize(ctx, "<|prefix_begin|>"+params.system_prompt+"<|prefix_end|>", false);
                 }
                 break;
@@ -341,7 +341,7 @@ int main(int argc, char ** argv) {
         embd_inp = session_tokens;
     }
 
-    if ( !params.interactive && params.enclose_finetune && (inp_pfx.size() || inp_sfx.size()) )
+    if ( !params.interactive && params.enclose_finetune && (inp_pfx.size() || inp_sfx.size() || inp_system.size()) )
     {
         // enclose finetune - non interactive mode
         if (inp_pfx.size())
@@ -365,7 +365,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s: error: prompt is too long (%d tokens, max %d)\n", __func__, (int) embd_inp.size(), n_ctx - 4);
         return 1;
     }
-    falcon_prepare_buffers(ctx, params.n_batch, (int)(embd_inp.size()+1));
+    // falcon_context_set_buffers(ctx, params.n_batch, (int)(embd_inp.size()+1));
     // debug message about similarity of saved session, if applicable
     size_t n_matching_session_tokens = 0;
     if (session_tokens.size()) {
@@ -487,7 +487,7 @@ int main(int argc, char ** argv) {
     }
 
 size_t prompt_size = embd_inp.size();
-if (params.enclose_finetune || params.instruct)
+if (inp_system.size())
 {
     prompt_size+=inp_pfx.size()+inp_sfx.size()+inp_system.size();
 }
@@ -541,6 +541,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
     bool need_to_save_session = !path_session.empty() && n_matching_session_tokens < embd_inp.size();
 
     int n_past             = 0;
+    int n_past_system      = 0;
     int n_remain           = params.n_predict;
     int n_consumed         = 0;
     int n_session_consumed = 0;

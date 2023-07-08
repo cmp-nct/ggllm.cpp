@@ -3167,7 +3167,7 @@ void ggml_cuda_set_main_device(int main_device) {
     // we accept setting it before initialization
     g_system_gpu_status.main_device_id = main_device;
 }
-void ggml_cuda_set_vram_reserved(int vram_reserved_bytes) {
+void ggml_cuda_set_vram_reserved(int64_t vram_reserved_bytes) {
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i)
     {
         g_system_gpu_status.device_vram_reserved[i] = vram_reserved_bytes;

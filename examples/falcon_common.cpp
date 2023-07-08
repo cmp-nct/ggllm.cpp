@@ -384,7 +384,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             }
             #ifdef GGML_USE_CUBLAS
             params.mb_reserve_gpu_main = std::stoi(argv[i]);
-            ggml_cuda_set_vram_reserved(params.mb_reserve_gpu_main * 1024*1024);
+            ggml_cuda_set_vram_reserved(((int64_t)params.mb_reserve_gpu_main)*1024*1024);
             #else
             fprintf(stderr, "warning: falcon.cpp was compiled without cuBLAS. VRAM not available.\n");
             #endif

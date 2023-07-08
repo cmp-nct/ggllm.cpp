@@ -45,7 +45,13 @@
             abort(); \
         } \
     } while (0)
-
+#define FALCON_ASSERT(x) \
+    do { \
+        if (!(x)) { \
+            fprintf(stderr, "FALCON_ASSERT: %s:%d: %s\n", __FILE__, __LINE__, #x); \
+            abort(); \
+        } \
+    } while (0)
 #ifdef __GNUC__
 #ifdef __MINGW32__
 __attribute__((format(gnu_printf, 1, 2)))
@@ -66,6 +72,8 @@ static std::string format(const char * fmt, ...) {
     va_end(ap);
     return std::string(buf.data(), size);
 }
+
+
 
 struct llama_file {
     // use FILE * so we don't have to re-open the file to mmap

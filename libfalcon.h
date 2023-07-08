@@ -128,6 +128,8 @@ extern "C" {
         bool quantize_output_tensor; // quantize output.weight
     } llama_model_quantize_params;
 
+
+
     LLAMA_API struct falcon_context_params falcon_context_default_params();
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params();
 
@@ -146,9 +148,10 @@ extern "C" {
     // Return NULL on failure
     LLAMA_API struct falcon_context * falcon_init_from_file(
                              const char * path_model,
-            struct falcon_context_params   params);
+            struct falcon_context_params   params
+            );
     // prepare scratch and computation buffers
-    LLAMA_API void falcon_prepare_buffers(falcon_context *ctx, int n_batch, int n_ctx);
+    LLAMA_API void falcon_context_set_buffers(falcon_context *ctx, int n_batch, int n_ctx);
     // Frees all allocated memory
     LLAMA_API void llama_free(struct falcon_context * ctx);
 
