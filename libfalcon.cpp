@@ -2941,7 +2941,7 @@ static std::vector<falcon_vocab::id> falcon_tokenize(const falcon_vocab & vocab,
 //
 // sampling
 //
-
+// softmax normalize
 void llama_sample_softmax(struct falcon_context * ctx, falcon_token_data_array * candidates) {
     assert(candidates->size > 0);
 
@@ -2971,6 +2971,35 @@ void llama_sample_softmax(struct falcon_context * ctx, falcon_token_data_array *
     }
 }
 
+void llama_sample_log_softmax(struct falcon_context * ctx, falcon_token_data_array * candidates) {
+    assert(candidates->size > 0);
+
+    const int64_t t_start_sample_us = ggml_time_us();
+
+    // Sort the logits in descending order
+    if (!candidates->sorted) {
+        std::sort(candidates->data, candidates->data + candidates->size, [](const falcon_token_data & a, const falcon_token_data & b) {
+            return a.logit > b.logit;
+        });
+        candidates->sorted = true;
+    }
+
+    float max_l = candidates->data[0].logit;
+    float cum_sum = 0.0f;
+    for (size_t i = 0; i < candidates->size; ++i) {
+        float p = expf(candidates->data[i].logit - max_l);
+        candidates->data[i].p = p;
+        cum_sum += p;
+    }
+    for (size_t i = 0; i < candidates->size; ++i) {
+        candidates->data[i].p = logf(candidates->data[i].p / cum_sum);
+    }
+
+    if (ctx) {
+        ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+    }
+}
+// top_k - cut pool to k best candidates (defaults ~ 40)
 void llama_sample_top_k(struct falcon_context * ctx, falcon_token_data_array * candidates, int k, size_t min_keep) {
     const int64_t t_start_sample_us = ggml_time_us();
 
@@ -2996,6 +3025,7 @@ void llama_sample_top_k(struct falcon_context * ctx, falcon_token_data_array * c
     }
 }
 
+// top_p - cut pool to tokens with cumulative probability > p (defaults 1.0)
 void llama_sample_top_p(struct falcon_context * ctx, falcon_token_data_array * candidates, float p, size_t min_keep) {
     if (p >= 1.0f) {
         return;
@@ -3027,6 +3057,7 @@ void llama_sample_top_p(struct falcon_context * ctx, falcon_token_data_array * c
     }
 }
 
+// remove low probability tail (not too useful with low top_k)
 void llama_sample_tail_free(struct falcon_context * ctx, falcon_token_data_array * candidates, float z, size_t min_keep) {
     if (z >= 1.0f || candidates->size <= 2) {
         return;
@@ -3078,7 +3109,7 @@ void llama_sample_tail_free(struct falcon_context * ctx, falcon_token_data_array
     }
 }
 
-
+// favor more typical tokens out of the pool based on the randomness of the total pool distribution
 void llama_sample_typical(struct falcon_context * ctx, falcon_token_data_array * candidates, float p, size_t min_keep) {
     // Reference implementation:
     // https://github.com/huggingface/transformers/compare/main...cimeister:typical-sampling:typical-pr
@@ -3141,7 +3172,7 @@ void llama_sample_typical(struct falcon_context * ctx, falcon_token_data_array *
         ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
     }
 }
-
+// increases the absolute candidate values, another softmax will make it more peaky at low temperatures (high scale)
 void llama_sample_temperature(struct falcon_context * ctx, falcon_token_data_array * candidates_p, float temp) {
     const int64_t t_start_sample_us = ggml_time_us();
 
@@ -3708,6 +3739,10 @@ struct falcon_context * falcon_context_prepare(falcon_context_params params, fal
     return ctx;
 }
 
+struct falcon_model * falcon_get_falcon_model(falcon_context * ctx)
+{
+    return &ctx->model;
+}
 
 struct falcon_context * falcon_init_from_file(
                              const char * path_model,
@@ -4416,7 +4451,9 @@ int falcon_eval(
                          int   n_tokens,
                          int   n_past,
                          int   n_threads, int debug_timings) {
-    // fprintf(stderr, "falcon_eval: n_tokens=%d, n_past=%d, n_threads=%d\n", n_tokens, n_past, n_threads);
+    //  fprintf(stderr, "falcon_eval: n_tokens=%d, n_past=%d, n_threads=%d\n", n_tokens, n_past, n_threads);
+    // fprintf(stderr, "n_ctx=%d, n_embd=%d, n_head=%d, n_layer=%d, n_vocab=%d\n", ctx->model.hparams.n_ctx, ctx->model.hparams.n_embd, ctx->model.hparams.n_head, ctx->model.hparams.n_layer, ctx->model.hparams.n_vocab);
+    FALCON_ASSERT(ctx->model.hparams.n_ctx >= (n_past+n_tokens)); // kv buffer overflow
     #if defined(GGML_USE_CUBLAS)
     static int no_purge_counter=0; // once the system is stable for 3 iterations, we stop testing
     if (no_purge_counter < 3 || n_past%50==0) {

@@ -57,6 +57,8 @@ extern "C" {
     //
 
     struct falcon_context;
+    struct falcon_model;
+    struct falcon_vocab;
 
     typedef int falcon_token;
 
@@ -152,6 +154,7 @@ extern "C" {
             );
     // prepare scratch and computation buffers
     LLAMA_API void falcon_context_set_buffers(falcon_context *ctx, int n_batch, int n_ctx);
+    LLAMA_API struct falcon_model * falcon_get_falcon_model(falcon_context * ctx);
     // Frees all allocated memory
     LLAMA_API void llama_free(struct falcon_context * ctx);
 
@@ -238,6 +241,9 @@ extern "C" {
                                  float * scores,
                                    int   capacity);
 
+    // prepares a falcon_context based on a model, also allocates scratch buffers based on parameters
+    LLAMA_API struct falcon_context * falcon_context_prepare(falcon_context_params params, falcon_model *model, std::string context_name, bool verbose);
+
     // Token logits obtained from the last call to llama_eval()
     // The logits for the last token are stored in the last row
     // Can be mutated in order to change the probabilities of the next token
@@ -273,6 +279,8 @@ extern "C" {
 
     /// @details Sorts candidate tokens by their logits in descending order and calculate probabilities based on logits.
     LLAMA_API void llama_sample_softmax(struct falcon_context * ctx, falcon_token_data_array * candidates);
+    // logarithmic scaled softmax (just a log after softmax)
+    LLAMA_API void llama_sample_log_softmax(struct falcon_context * ctx, falcon_token_data_array * candidates);
 
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     LLAMA_API void llama_sample_top_k(struct falcon_context * ctx, falcon_token_data_array * candidates, int k, size_t min_keep);

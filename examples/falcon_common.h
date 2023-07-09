@@ -39,9 +39,9 @@ struct gpt_params {
     // sampling parameters
     std::unordered_map<falcon_token, float> logit_bias; // logit bias for specific tokens
     int32_t top_k             = 40;    // <= 0 to use vocab size
-    float   top_p             = 0.95f; // 1.0 = disabled
-    float   tfs_z             = 1.00f; // 1.0 = disabled
-    float   typical_p         = 1.00f; // 1.0 = disabled
+    float   top_p             = 0.95f; // 1.0 = disabled 
+    float   tfs_z             = 1.00f; // 1.0 = disabled (temperature, frequency, and presence scaling)
+    float   typical_p         = 1.00f; // 1.0 = disabled 
     float   temp              = 0.80f; // 1.0 = disabled
     float   repeat_penalty    = 1.10f; // 1.0 = disabled
     int32_t repeat_last_n     = 64;    // last n tokens to penalize (0 = disable penalty, -1 = context size)
@@ -50,12 +50,14 @@ struct gpt_params {
     int     mirostat          = 0;     // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
     float   mirostat_tau      = 5.00f; // target entropy
     float   mirostat_eta      = 0.10f; // learning rate
+    float   system_prompt_intensity = 0.50f; // -1.0 to +1.0 the intensity of the system prompt (not with simple mode)
 
     std::string model             = "models/7B/ggml-model.bin"; // model path
     std::string model_alias       = "unknown"; // model alias
     t_finetune_type finetune_type = FINETUNE_UNSPECIFIED; // finetune type
     std::string prompt            = "";
     std::string system_prompt     = ""; // optional system prompt for complex finetunes
+    std::string system_baseline_prompt     = ""; // not in use
     std::string path_prompt_cache = "";  // path to file for saving/loading prompt eval state
     std::string input_prefix      = "";  // string to prefix user inputs with
     std::string input_suffix      = "";  // string to suffix user inputs with
@@ -67,6 +69,8 @@ struct gpt_params {
     std::string stopwords  = ""; // comma separated list of stopwords (<|endoftext|> is handled by --ignore-eos)
     bool enclose_finetune  = false; // enclose prompt with correct tokens for finetuned model
     bool sys_prompt_is_raw = false; // The given system prompt will be used without adaptation
+    bool sys_prompt_simple = true; // System prompt is a simple prompt prefix kept in top context instead of the deep eval method (not ready yet)
+
     bool memory_f16        = true;  // use f16 instead of f32 for memory kv
     bool random_prompt     = false; // do not randomize prompt if none provided
     bool use_color         = false; // use color to distinguish generations and inputs
@@ -104,7 +108,7 @@ std::vector<falcon_token> falcon_tokenize(struct falcon_context * ctx, const std
 //
 // Model utils
 //
-
+struct falcon_context_params falcon_context_params_create(const gpt_params &params);
 struct falcon_context * falcon_init_from_gpt_params(const gpt_params & params);
 
 //
