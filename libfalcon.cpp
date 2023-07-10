@@ -317,6 +317,9 @@ struct falcon_vocab {
         for (int i = 65024; i < (int)id_to_token.size(); i++) {
             special_tokens[id_to_token[i].tok] = i;
         }
+        // token_to_id["</s>"] = 11; // bugfix for TII instruct training (blocks stopwords)
+        // special_tokens["</s>"] = 11; // bugfix for TII instruct training (blocks stopwords)
+
 
         return bpe_merges_.size();
     }

@@ -38,23 +38,6 @@
 static console_state con_st;
 static falcon_context ** g_ctx;
 
-std::unordered_map<std::string, int> special_tokens_ids = {
-     {">>TITLE<<", 0},
-     {">>ABSTRACT<<", 1},
-     {">>INTRODUCTION<<", 2},
-     {">>SUMMARY<<", 3},
-     {">>COMMENT<<", 4},
-     {">>ANSWER<<", 5},
-     {">>QUESTION<<", 6},
-     {">>DOMAIN<<", 7},
-     {">>PREFIX<<", 8},
-     {">>SUFFIX<<", 9},
-     {">>MIDDLE<<", 10},
-     {"<|endoftext|>", 11},
-};
-
-
-
 
 static bool is_interacting = false;
 
@@ -292,25 +275,46 @@ int main(int argc, char ** argv) {
                         inp_system_baseline = ::falcon_tokenize(ctx, "<|endoftext|>", false);
                     }
                 }
+                if (params.stopwords.size() == 0)
+                {
+                    stopwords.push_back(::falcon_tokenize(ctx, "###", false));
+                    stopwords.push_back(::falcon_tokenize(ctx, " ###", false));
+                }
                 break;
             case FINETUNE_WIZARD:
                 inp_pfx = {};
                 inp_sfx = ::falcon_tokenize(ctx, "\n### Response:", false);
                 if (params.system_prompt.size() &&!params.sys_prompt_is_raw)
                 {
-                    inp_system = ::falcon_tokenize(ctx, "### Behavior:\""+params.system_prompt+"\"\n", false);
+                    inp_system = ::falcon_tokenize(ctx, ">>INTRODUCTION<<"+params.system_prompt+"\n", false);
                     if(!params.sys_prompt_simple)
-                        inp_system_baseline = ::falcon_tokenize(ctx, "### Behavior:\""+params.system_baseline_prompt+"\"\n", false);
+                        inp_system_baseline = ::falcon_tokenize(ctx, ">>INTRODUCTION<<"+params.system_baseline_prompt+"\n", false);
                 }
                 break;
             case FINETUNE_FALCONINSTRUCT:
-                inp_pfx = ::falcon_tokenize(ctx, "User: \"", false);
-                inp_sfx = ::falcon_tokenize(ctx, "\"\nAssistant:", false); // must not include space
+                inp_pfx = ::falcon_tokenize(ctx, "User: ", false);
+                inp_sfx = ::falcon_tokenize(ctx, "\nAssistant:", false); // must not include space
                 if (params.system_prompt.size() &&!params.sys_prompt_is_raw)
                 {
-                    inp_system = ::falcon_tokenize(ctx, "System command: \""+params.system_prompt+"\"\n", false);
+                    inp_system = ::falcon_tokenize(ctx, ">>INTRODUCTION<<"+params.system_prompt+"\n", false);
                     if(!params.sys_prompt_simple)
-                        inp_system_baseline = ::falcon_tokenize(ctx, "System command: \""+params.system_baseline_prompt+"\"\n", false);
+                        inp_system_baseline = ::falcon_tokenize(ctx, ">>INTRODUCTION<<"+params.system_baseline_prompt+"\"\n", false);
+                    if (params.stopwords.size() == 0)
+                    {
+                        stopwords.push_back(::falcon_tokenize(ctx, "Assistant:", false));
+                        stopwords.push_back(::falcon_tokenize(ctx, " Assistant:", false));
+                        stopwords.push_back(::falcon_tokenize(ctx, " User:", false));
+                        stopwords.push_back(::falcon_tokenize(ctx, "User:", false));
+                        stopwords.push_back(::falcon_tokenize(ctx, ".</s>", false)); // TII strangely trained their own model with non documented stop sequences that are not matching with their tokenizer
+                        stopwords.push_back(::falcon_tokenize(ctx, " .</s>", false)); 
+                        stopwords.push_back(::falcon_tokenize(ctx, "</s>", false)); 
+                        stopwords.push_back(::falcon_tokenize(ctx, " </s>", false));
+                        stopwords.push_back(::falcon_tokenize(ctx, "?</s>", false));
+                        stopwords.push_back(::falcon_tokenize(ctx, " ?</s>", false));
+                        stopwords.push_back(::falcon_tokenize(ctx, "!</s>", false));
+                        stopwords.push_back(::falcon_tokenize(ctx, " !</s>", false));
+                        stopwords.push_back(::falcon_tokenize(ctx, "<s>", false));
+                    }
                 }
                 break;
             default:
@@ -325,6 +329,8 @@ int main(int argc, char ** argv) {
                 if (params.stopwords.size() == 0)
                 {
                     stopwords.push_back(::falcon_tokenize(ctx, ">>COMMENT<<", false));
+                    stopwords.push_back(::falcon_tokenize(ctx, ">>ANSWER<<", false));
+                    stopwords.push_back(::falcon_tokenize(ctx, ">>QUESTION<<", false));
                 }
                 break;
         }
@@ -939,16 +945,17 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
 
         bool stopword_fulfilled = false;
         // stopwords
-        if (!embd.empty()) 
+        if (!embd.empty() && n_past > embd_inp.size()) 
         {
-            
-            for (const auto& stopword : stopwords) {
-                if (embd.size() < stopword.size()) {
+            for (const auto& stopword : stopwords) 
+            {
+                if (all_generation.size() < stopword.size()) {
                     continue; // if embd is smaller than stopword, skip this iteration
                 }
                 stopword_fulfilled = true; // initially assume stopword is fulfilled
+               
                 for (size_t i = 0; i < stopword.size(); ++i) {
-                    if (embd[embd.size() - i - 1] != stopword[stopword.size() - i - 1]) {
+                    if (all_generation[all_generation.size() - i - 1] != stopword[stopword.size() - i - 1]) {
                         stopword_fulfilled = false;
                         break;
                     }
