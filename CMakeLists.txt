@@ -130,6 +130,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED true)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED true)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
+if (CMAKE_COMPILER_IS_GNUCC OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    # Note: it must be performed before the Threads package finding (CMAKE_HAVE_LIBC_PTHREAD testing)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pthread")
+endif()
 find_package(Threads REQUIRED)
 
 if (NOT MSVC)
@@ -258,6 +262,7 @@ if (LLAMA_CUBLAS)
 
     else()
         message(WARNING "cuBLAS not found")
+        set(LLAMA_CUBLAS OFF CACHE BOOL "LLAMA_CUBLAS set to OFF because cuBLAS is not found" FORCE)
     endif()
 endif()
 
@@ -422,7 +427,8 @@ elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "^(x86_64|i686|AMD64)$")
             add_compile_options($<$<COMPILE_LANGUAGE:C>:/arch:AVX>)
             add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX>)
         endif()
-    else()
+    elseif(NOT ${CUDAToolkit_FOUND})
+        # Note: these flags should be applied to the CPU architecture, but they are passed to nvcc when CUDAToolkit is used
         if (LLAMA_F16C)
             add_compile_options(-mf16c)
         endif()
@@ -470,6 +476,16 @@ add_library(ggml OBJECT
 target_include_directories(ggml PUBLIC . ${LLAMA_EXTRA_INCLUDES})
 target_compile_features(ggml PUBLIC c_std_11) # don't bump
 target_link_libraries(ggml PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
+if(GGML_USE_CUBLAS)
+    # Set the minimum standard, CMake can still decide to use -std=c++17
+    # if the given compilers support C++17
+    target_compile_features(ggml PUBLIC cuda_std_11)
+    set_target_properties(ggml  PROPERTIES
+            CUDA_RUNTIME_LIBRARY SHARED
+            # CUDA_STANDARD 11  # This one cannot be changed by CMake
+            # CUDA_SEPARABLE_COMPILATION ON  # Optional
+    )
+endif()
 
 add_library(ggml_static STATIC $<TARGET_OBJECTS:ggml>)
 if (BUILD_SHARED_LIBS)
@@ -485,6 +501,16 @@ add_library(llama
 
 target_include_directories(llama PUBLIC .)
 target_compile_features(llama PUBLIC cxx_std_11) # don't bump
+if(LLAMA_CUBLAS)
+    # Set the minimum standard, CMake can still decide to use -std=c++17
+    # if the given compilers support C++17
+    target_compile_features(llama PUBLIC cuda_std_11)
+    set_target_properties(llama  PROPERTIES
+            CUDA_RUNTIME_LIBRARY SHARED
+            # CUDA_STANDARD 11  # This one cannot be changed by CMake
+            # CUDA_SEPARABLE_COMPILATION ON  # Optional
+    )
+endif()
 target_link_libraries(llama PRIVATE
     ggml
     ${LLAMA_EXTRA_LIBS}
@@ -527,12 +553,21 @@ endif()
 
 if (GGML_SOURCES_CUDA)
     message(STATUS "GGML CUDA sources found, configuring CUDA architecture")
-    set_property(TARGET ggml  PROPERTY CUDA_ARCHITECTURES OFF)
+    get_target_property(TARG_CUDA_ARCH ggml CUDA_ARCHITECTURES)
+    if ((NOT ${TARG_CUDA_ARCH}) OR "${TARG_CUDA_ARCH}" STREQUAL "TARG_CUDA_ARCH-NOTFOUND")
+        if (NOT ${CUDA_ARCHITECTURES})
+            set(TARG_CUDA_ARCH all)  # all or OFF
+            message(WARNING "CUDA_ARCHITECTURES are not defined for the targets, setting them to ${TARG_CUDA_ARCH}")
+        else()
+            set(TARG_CUDA_ARCH ${CUDA_ARCHITECTURES})
+            message(STATUS "Setting CUDA_ARCHITECTURES to ${TARG_CUDA_ARCH}")
+        endif()
+        set_property(TARGET ggml  PROPERTY CUDA_ARCHITECTURES ${TARG_CUDA_ARCH})
+        set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${TARG_CUDA_ARCH})
+        # falcon
+        set_property(TARGET falcon  PROPERTY CUDA_ARCHITECTURES ${TARG_CUDA_ARCH})
+    endif()
     set_property(TARGET ggml  PROPERTY CUDA_SELECT_NVCC_ARCH_FLAGS "Auto")
-    set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES OFF)
-    # falcon
-    set_property(TARGET falcon  PROPERTY CUDA_ARCHITECTURES OFF)
-
 endif()
 
 
