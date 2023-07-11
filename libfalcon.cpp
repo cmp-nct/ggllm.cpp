@@ -2172,7 +2172,6 @@ static bool falcon_eval_internal(
             ggml_set_name(Vcur, "Vcur");
 
             // using mode = 2 for neox mode
-            // Qcur->meta.f_custom[GGML_CUSTOM_F_ROPE_ANG_SCALE] = 0.25;  Kcur->meta.f_custom[GGML_CUSTOM_F_ROPE_ANG_FREQ] = 0.25;
             Qcur = ggml_rope_inplace(ctx0, Qcur, n_past, head_dim, 2,n_ctx);
             Kcur = ggml_rope_inplace(ctx0, Kcur, n_past, head_dim, 2,n_ctx);
 

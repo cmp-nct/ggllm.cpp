@@ -582,8 +582,9 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
     bool input_echo           = true;
     bool need_to_save_session = !path_session.empty() && n_matching_session_tokens < embd_inp.size();
 
-    int n_past             = 0;
+    int n_past             = 0; // n_past tells eval() which position in KV we are at
     int n_past_system      = 0; // not in use
+    int n_past_total       = 0; // n_past_total does not reset on context switches
     int n_remain           = params.n_predict;
     int n_consumed         = 0;
     int n_session_consumed = 0;
@@ -703,6 +704,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
 
                     n_past++;
                     n_session_consumed++;
+                    n_past_total++;
 
                     if (n_session_consumed >= (int) session_tokens.size()) {
                         ++i;
@@ -763,6 +765,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
                     return 1;
                 }
                 n_past += n_eval;
+                n_past_total += n_eval;
             }
             if (embd.size() > 0 && !path_session.empty()) {
                 session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
@@ -946,7 +949,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
 
         bool stopword_fulfilled = false;
         // stopwords
-        if (!embd.empty() && n_past > embd_inp.size()) 
+        if (!embd.empty() && n_past_total > embd_inp.size()) 
         {
             for (const auto& stopword : stopwords) 
             {
@@ -1122,7 +1125,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
         #endif
 
         // end of text token or stopword detected in generated content
-        if ((!embd.empty() && embd.back() == falcon_token_eos() && n_past > embd_inp.size()) || stopword_fulfilled) 
+        if ((!embd.empty() && embd.back() == falcon_token_eos() && n_past_total > embd_inp.size()) || stopword_fulfilled) 
         {
             if (params.instruct) 
             {
@@ -1132,7 +1135,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
                 if (params.verbose_prompt)
                     fprintf(stderr, " [end of text]\n");
                 // if we are in the prompt ingestion we will not stop
-                if (n_past > (int)embd_inp.size()) {
+                if (n_past_total > (int)embd_inp.size()) {
                     break;
                 }
             }
