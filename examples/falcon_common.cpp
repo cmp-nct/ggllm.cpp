@@ -117,6 +117,8 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
     // until thread scheduling is improved, these numbers are around the optimal (for huge batch processing increase -t manually)
     if (params.n_threads > 8) params.n_threads = 4;
     if (params.n_threads > 4) params.n_threads = 2;
+    params.seed = (int) time(NULL); // initiate a seed - we need one if multiple context used with similar input
+
     
 
     for (int i = 1; i < argc; i++) {
@@ -338,6 +340,8 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             params.interactive_first = true;
         } else if (arg == "-ins" || arg == "--instruct") {
             params.instruct = true;
+            params.interactive = true;
+            params.enclose_finetune = true;
         } else if (arg == "--multiline-input") {
             params.multiline_input = true;
         } else if (arg == "--color") {
@@ -384,7 +388,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             }
             #ifdef GGML_USE_CUBLAS
             params.mb_reserve_gpu_main = std::stoi(argv[i]);
-            ggml_cuda_set_vram_reserved(params.mb_reserve_gpu_main * 1024*1024);
+            ggml_cuda_set_vram_reserved(((int64_t)params.mb_reserve_gpu_main)*1024*1024);
             #else
             fprintf(stderr, "warning: falcon.cpp was compiled without cuBLAS. VRAM not available.\n");
             #endif
@@ -537,19 +541,22 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     fprintf(stderr, "\n");
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h, --help            show this help message and exit\n");
-    fprintf(stderr, "  -i, --interactive     run in interactive mode\n");
-    fprintf(stderr, "  --interactive-first   run in interactive mode and wait for input right away\n");
-    fprintf(stderr, "  -ins, --instruct      run in instruction mode (use with Alpaca models)\n");
+    fprintf(stderr, "  -i, --interactive, -ins \n");
+    fprintf(stderr, "                        run in interactive chat mode\n");
+    fprintf(stderr, "  --interactive-first   wait for user input after prompt ingestion\n");
+    // fprintf(stderr, "  -ins, --instruct      run in instruction mode (use with Alpaca models)\n");
     fprintf(stderr, "  -a,--alias,--finetune Set model name alias and optionally force fine-tune type (or disable it)\n");
     fprintf(stderr, "                        Finetune options: wizard, falcon-ins, open-assistant, alpaca, none\n");
     fprintf(stderr, "                        Use if finetune autodetection does not or wrongly recognizes your model or filename\n");
-    fprintf(stderr, "  -sys, --system        prefix the entire prompt with the system prompt text\n");
+    fprintf(stderr, "  -sys, --system  <>    prefix the entire prompt with the system prompt text\n");
+    fprintf(stderr, "  -sysraw, --system-raw treat the system prompt raw (do not add syntax)\n");
+    // fprintf(stderr, "  --sys_prompt_simple    trust the model to follow the system prompt instead of using evaluated sampling adaption\n");
     fprintf(stderr, "  -enc, --enclose       enclose the prompt in fine-tune optimal syntax\n");
     fprintf(stderr, "                        This automatically chooses the correct syntax to write around your prompt.\n");
     fprintf(stderr, "  --multiline-input     allows you to write or paste multiple lines without ending each in '\\'\n");
-    fprintf(stderr, "  -r PROMPT, --reverse-prompt PROMPT\n");
-    fprintf(stderr, "                        halt generation at PROMPT, return control in interactive mode\n");
-    fprintf(stderr, "                        (can be specified more than once for multiple prompts).\n");
+    // fprintf(stderr, "  -r PROMPT, --reverse-prompt PROMPT\n");
+    // fprintf(stderr, "                        halt generation at PROMPT, return control in interactive mode\n");
+    // fprintf(stderr, "                        (can be specified more than once for multiple prompts).\n");
     fprintf(stderr, "  --color               colorise output to distinguish prompt and user input from generations\n");
     fprintf(stderr, "  -s SEED, --seed SEED  RNG seed (default: -1, use random seed for < 0)\n");
     fprintf(stderr, "  -t N, --threads N     number of threads to use during computation (default: %d)\n", params.n_threads);
@@ -567,7 +574,7 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     fprintf(stderr, "  --in-prefix STRING    string to prefix user inputs with (default: empty)\n");
     fprintf(stderr, "  --in-suffix STRING    string to suffix after user inputs with (default: empty)\n");
     fprintf(stderr, "  -f FNAME, --file FNAME\n");
-    fprintf(stderr, "                        prompt file to start generation.\n");
+    fprintf(stderr, "                        read prompt from a file, optionally -p prompt is prefixed\n");
     fprintf(stderr, "  -n N, --n-predict N   number of tokens to predict (default: %d, -1 = infinity)\n", params.n_predict);
     fprintf(stderr, "  --top-k N             top-k sampling (default: %d, 0 = disabled)\n", params.top_k);
     fprintf(stderr, "  --top-p N             top-p sampling (default: %.1f, 1.0 = disabled)\n", (double)params.top_p);
@@ -653,8 +660,8 @@ std::vector<falcon_token> falcon_tokenize(struct falcon_context * ctx, const std
 
     return res;
 }
-
-struct falcon_context * falcon_init_from_gpt_params(const gpt_params & params) {
+struct falcon_context_params falcon_context_params_create(const gpt_params &params)
+{
     auto lparams = falcon_context_default_params();
 
     lparams.n_ctx        = params.n_ctx;
@@ -669,6 +676,12 @@ struct falcon_context * falcon_init_from_gpt_params(const gpt_params & params) {
     lparams.logits_all   = params.perplexity;
     lparams.embedding    = params.embedding;
 
+    return lparams;
+}
+
+struct falcon_context * falcon_init_from_gpt_params(const gpt_params & params) {
+    
+    struct falcon_context_params lparams = falcon_context_params_create(params);
     falcon_context * lctx = falcon_init_from_file(params.model.c_str(), lparams);
 
     if (lctx == NULL) {
