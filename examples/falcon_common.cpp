@@ -175,6 +175,21 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             if (params.prompt.back() == '\n') {
                 params.prompt.pop_back();
             }
+        } else if (arg == "-sysf" || arg == "--system-file") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            std::ifstream file(argv[i]);
+            if (!file) {
+                fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
+                invalid_param = true;
+                break;
+            }
+            std::copy(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>(), back_inserter(params.system_prompt));
+            if (params.system_prompt.back() == '\n') {
+                params.system_prompt.pop_back();
+            }
         } else if (arg == "-n" || arg == "--n-predict") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -516,10 +531,11 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
     }
     if (escape_prompt) {
         process_escapes(params.prompt);
+        process_escapes(params.system_prompt);
     }
 
 
-      bool all_zero = true;
+    bool all_zero = true;
         for (size_t i = 0; i < LLAMA_MAX_DEVICES; ++i) {
             if (params.tensor_split[i] != 0.0f) {
                 all_zero = false;
@@ -565,7 +581,7 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     fprintf(stderr, "  -S, --stopwords \",,,\" Add stopwords in addition to the usual end-of-sequence\n");
     fprintf(stderr, "                        comma separated list: -S \"\\n,Hello World,stopword\" - overwrites defaults except eos\n");
     fprintf(stderr, "                        Important: 'is' and ' is' are unique tokens in a stopword. Just as 'Hello' and ' Hello' are distinct\n");
-    fprintf(stderr, "  -e                    process prompt escapes sequences (\\n, \\r, \\t, \\', \\\", \\\\)\n");
+    fprintf(stderr, "  -e                    process escapes sequences in prompt and system message (\\n, \\r, \\t, \\', \\\", \\\\)\n");
     fprintf(stderr, "  --prompt-cache FNAME  file to cache prompt state for faster startup (default: none)\n");
     fprintf(stderr, "  --prompt-cache-all    if specified, saves user input and generations to cache as well.\n");
     fprintf(stderr, "                        not supported with --interactive or other interactive options\n");
@@ -575,6 +591,8 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     fprintf(stderr, "  --in-suffix STRING    string to suffix after user inputs with (default: empty)\n");
     fprintf(stderr, "  -f FNAME, --file FNAME\n");
     fprintf(stderr, "                        read prompt from a file, optionally -p prompt is prefixed\n");
+    fprintf(stderr, "  -sysf FNAME, --system-file FNAME\n");
+    fprintf(stderr, "                        read system prompt from a file\n");
     fprintf(stderr, "  -n N, --n-predict N   number of tokens to predict (default: %d, -1 = infinity)\n", params.n_predict);
     fprintf(stderr, "  --top-k N             top-k sampling (default: %d, 0 = disabled)\n", params.top_k);
     fprintf(stderr, "  --top-p N             top-p sampling (default: %.1f, 1.0 = disabled)\n", (double)params.top_p);
