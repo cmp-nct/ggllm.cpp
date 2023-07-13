@@ -397,7 +397,9 @@ extern "C" {
                 float f_custom[4];  
                 int i_custom[4];
 
-                // uint8_t padding;
+                uint8_t debug_flag;
+
+                char padding[15];
         } tensor_meta;
         static const tensor_meta GGML_DEFAULT_TENSOR_META = {
                 /*.layer_id =*/ -1,
@@ -409,6 +411,8 @@ extern "C" {
                 /*.cuda_perf_mal_mul_type =*/ 0,
                 /*.f_custom =*/ {0.0f, 0.0f, 0.0f, 0.0f},
                 /*.i_custom =*/ {0, 0, 0, 0},
+
+                /*.debug_flag =*/ 0,
 
 
                 // /*.padding =*/ 0,

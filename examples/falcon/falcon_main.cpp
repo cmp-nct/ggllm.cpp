@@ -659,7 +659,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
                     {
                         n_regen = 4;
                     }
-                    if (n_regen > all_generation.size()-embd.size()) n_regen = (int)all_generation.size()-embd.size();
+                    if (n_regen > all_generation.size()-embd.size()) n_regen = (int)all_generation.size()-(int)embd.size();
                     
                     // add right sided part of all_generation storage if we still have room remaining
                     if (n_regen)

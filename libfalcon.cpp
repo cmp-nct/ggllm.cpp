@@ -167,8 +167,11 @@ static size_t MEM_REQ_KV_SELF(
     const int n_layer = hparams.n_layer;
 
     const int64_t ne = n_head_kv * head_dim * n_layer * n_ctx;
-
-    return 2u * (ggml_tensor_overhead() + ne * ggml_type_size(wtype));
+    #ifdef FALCON_NO_KV_UPGRADE
+    return ggml_tensor_overhead()*2 + 2u * (ggml_tensor_overhead() + ne * ggml_type_size(wtype));
+    #else
+    return ggml_tensor_overhead() + 3u * (ggml_tensor_overhead() + ne * ggml_type_size(wtype));
+    #endif
 }
 
 struct falcon_layer {
@@ -189,7 +192,12 @@ struct falcon_layer {
 
 struct falcon_kv_cache {
     struct ggml_tensor * k;
-    struct ggml_tensor * v;
+    struct ggml_tensor * v; // only used with FALCON_NO_KV_UPGRADE
+    struct ggml_tensor * v_a;
+    struct ggml_tensor * v_b;
+    
+    typedef enum v_buftype { V_A, V_B } v_buftype_t;
+    v_buftype_t v_current = V_A; 
 
     struct ggml_context * ctx = NULL;
 
@@ -1326,8 +1334,7 @@ static bool kv_cache_init(
 
     const int64_t n_layer = hparams.n_layer;
     const int64_t head_dim = hparams.n_embd / hparams.n_head;
-    const int64_t n_elements =
-        hparams.n_layer * n_ctx * head_dim * hparams.n_head_kv;
+    const int64_t n_elements =  hparams.n_layer * n_ctx * head_dim * hparams.n_head_kv;
 
     cache.buf.resize(MEM_REQ_KV_SELF(hparams, wtype, n_ctx));
 
@@ -1344,9 +1351,17 @@ static bool kv_cache_init(
     }
 
     cache.k = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
-    cache.v = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
+    #ifdef FALCON_NO_KV_UPGRADE
+    cache.v = ggml_new_tensor_1d(cache.ctx, wtype, n_elements); // only used as reference now
+    #else
+    cache.v = ggml_new_tensor_1d(cache.ctx, wtype, 0); // only used as reference now
+    #endif
+    cache.v_a = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
+    cache.v_b = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
     ggml_set_name(cache.k, "cache_k");
     ggml_set_name(cache.v, "cache_v");
+    ggml_set_name(cache.v_a, "cache_v_a");
+    ggml_set_name(cache.v_b, "cache_v_b");
 
     (void) n_gpu_layers;
 #ifdef GGML_USE_CUBLAS
@@ -1354,6 +1369,8 @@ static bool kv_cache_init(
     if (n_gpu_layers > n_layer + 1) {
         ggml_cuda_assign_buffers_no_scratch(cache.k);
         ggml_cuda_assign_buffers_no_scratch(cache.v);
+        ggml_cuda_assign_buffers_no_scratch(cache.v_a);
+        ggml_cuda_assign_buffers_no_scratch(cache.v_b);
     }
 #endif // GGML_USE_CUBLAS
 
@@ -2174,25 +2191,58 @@ static bool falcon_eval_internal(
             // using mode = 2 for neox mode
             Qcur = ggml_rope_inplace(ctx0, Qcur, n_past, head_dim, 2,n_ctx);
             Kcur = ggml_rope_inplace(ctx0, Kcur, n_past, head_dim, 2,n_ctx);
+            // Qcur->meta.f_custom[GGML_CUSTOM_F_ROPE_ANG_SCALE] = 0.25f;  
+            // Kcur->meta.f_custom[GGML_CUSTOM_F_ROPE_ANG_SCALE] = 0.25f;
 
             // store key and value to memory
-            {
+            //{
                 struct ggml_tensor* k = ggml_view_1d(
                     ctx0, kv_self.k, 
                     N * n_head_kv * head_dim,
                     (ggml_element_size(kv_self.k) * n_head_kv * head_dim) *
                         (il * n_ctx + n_past));  
                 ggml_set_name(k, "k");
+                ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Kcur, k));
+        #ifdef FALCON_NO_KV_UPGRADE
                 struct ggml_tensor* v = ggml_view_1d(
                     ctx0, kv_self.v, 
                     N * n_head_kv * head_dim,
                     (ggml_element_size(kv_self.v) * n_head_kv * head_dim) *
                         (il * n_ctx + n_past));
                 ggml_set_name(v, "v");
-
-                ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Kcur, k));
                 ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Vcur, v));
-            }
+        #endif
+                
+        #ifndef FALCON_NO_KV_UPGRADE
+                struct ggml_tensor* V_prev = ggml_view_3d(
+                    ctx0,
+                    (kv_self.v_current == kv_self.V_A)?kv_self.v_a:kv_self.v_b,
+                    n_past, head_dim, n_head_kv,
+                    /*nb1*/(n_past) * ggml_element_size(kv_self.v),
+                    /*nb2*/head_dim * ggml_element_size(kv_self.v) * (n_past),
+                    /*off*/il * n_ctx * ggml_element_size(kv_self.v) * n_head_kv * head_dim);
+                ggml_set_name(V_prev, "V_prev");
+                struct ggml_tensor* V_new = ggml_view_3d(
+                    ctx0,
+                    (kv_self.v_current == kv_self.V_A)?kv_self.v_b:kv_self.v_a,
+                    n_past + N, head_dim, n_head_kv,
+                    /*nb1*/(N+n_past) * ggml_element_size(kv_self.v),
+                    /*nb2*/head_dim * ggml_element_size(kv_self.v) * (N+n_past),
+                    /*off*/il * n_ctx * ggml_element_size(kv_self.v) * n_head_kv * head_dim);
+                ggml_set_name(V_new, "V_new");
+                if (n_past == 0) 
+                {
+                    ggml_build_forward_expand(&gf, ggml_cpy(ctx0, ggml_permute(ctx0,Vcur,1,2,0,3), V_new));
+                } else
+                {
+                   V_new = ggml_set_inplace(ctx0,V_new,V_prev,V_new->nb[1],V_new->nb[2],V_new->nb[3],0);
+                   V_new = ggml_set_inplace(ctx0,V_new,ggml_cont(ctx0,ggml_permute(ctx0,Vcur,1,2,0,3)),V_new->nb[1],V_new->nb[2],V_new->nb[3],n_past*ggml_element_size(kv_self.v));
+                    ggml_build_forward_expand(&gf, V_new);
+                }
+        #endif
+                
+                  
+            //}
 
             struct ggml_tensor * K = ggml_permute(
                 ctx0,
@@ -2238,6 +2288,7 @@ static bool falcon_eval_internal(
             ggml_set_name(KQ_soft_max, "KQ_soft_max");
 
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
+            #ifdef FALCON_NO_KV_UPGRADE
             struct ggml_tensor* V = ggml_permute(
                 ctx0,
                 ggml_view_3d(
@@ -2248,10 +2299,11 @@ static bool falcon_eval_internal(
                     head_dim * n_head_kv * sizeof_wtype,
                     il * n_ctx * ggml_element_size(kv_self.v) * n_head_kv * head_dim),
                 1, 2, 0, 3);
-            
-            {
-                //  0, 2, 1, 3);   // V = ggml_permute(ctx0, V, 1, 0, 2, 3);
                 V = ggml_cont(ctx0, V);
+            #else
+            struct ggml_tensor *V = V_new;
+            #endif
+            {
                 if (!use_broadcasting)
                 {
                     // interleaved repeat for multiplication (now broadcasted)
@@ -2260,8 +2312,6 @@ static bool falcon_eval_internal(
                 }
                 ggml_set_name(V, "V");  
             }
-
-            
 
             // KQV = transpose(V) * KQ_soft_max
             struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
@@ -2443,6 +2493,8 @@ static bool falcon_eval_internal(
 
     // update kv token count
     lctx.model.kv_self.n = n_past + N;
+    // cycle kv/v storage buffer
+    lctx.model.kv_self.v_current = (kv_self.v_current == kv_self.V_A) ? kv_self.V_B : kv_self.V_A;
 
     // extract logits
     {
@@ -4207,7 +4259,11 @@ size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
             out += ggml_nbytes(kout3d);
 
             // ggml_tensor * vout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_embd, n_layer);
+            #ifdef FALCON_NO_KV_UPGRADE
             ggml_tensor * vout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, n_head_kv*head_dim, kv_ntok, n_layer);
+            #else
+            ggml_tensor * vout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_head_kv*head_dim, n_layer);
+            #endif
             vout3d->data = out;
             out += ggml_nbytes(vout3d);
 
@@ -4222,10 +4278,18 @@ size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
             ggml_tensor * k3d = ggml_view_3d(cpy_ctx, kv_self.k,
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
-
+            #ifdef FALCON_NO_KV_UPGRADE
             ggml_tensor * v3d = ggml_view_3d(cpy_ctx, kv_self.v,
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
+            #else
+             ggml_tensor* v3d = ggml_view_3d( cpy_ctx, (kv_self.v_current == kv_self.V_A)?kv_self.v_a:kv_self.v_b,
+                    kv_ntok, n_head_kv*head_dim, n_layer,
+                    /*nb1*/elt_size*kv_ntok,
+                    /*nb2*/n_ctx * head_dim*n_head_kv *elt_size,
+                    /*off*/0);
+
+            #endif
 
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, k3d, kout3d));
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, v3d, vout3d));
@@ -4324,7 +4388,11 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
             inp += ggml_nbytes(kin3d);
 
             // ggml_tensor * vin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_embd, n_layer);
+            #ifdef FALCON_NO_KV_UPGRADE
             ggml_tensor * vin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, n_head_kv*head_dim, kv_ntok, n_layer);
+            #else
+            ggml_tensor * vin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_head_kv*head_dim, n_layer);
+            #endif
             vin3d->data = (void *) inp;
             inp += ggml_nbytes(vin3d);
 
@@ -4339,9 +4407,17 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
 
+            #ifdef FALCON_NO_KV_UPGRADE
             ggml_tensor * v3d = ggml_view_3d(cpy_ctx, kv_self.v,
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
+            #else
+             ggml_tensor* v3d = ggml_view_3d( cpy_ctx, (kv_self.v_current == kv_self.V_A)?kv_self.v_a:kv_self.v_b,
+                    kv_ntok, n_head_kv*head_dim, n_layer,
+                    /*nb1*/elt_size*kv_ntok,
+                    /*nb2*/n_ctx * head_dim*n_head_kv *elt_size,
+                    /*off*/0);
+            #endif
 
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, kin3d, k3d));
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, vin3d, v3d));
