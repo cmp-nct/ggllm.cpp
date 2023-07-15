@@ -62,8 +62,12 @@ void perplexity(falcon_context * ctx, const gpt_params & params) {
             if (j == 0) {
                 // tokens[batch_start] = falcon_token_bos();
             }
-
-            if (falcon_eval(ctx, tokens.data() + batch_start, batch_size, j * n_batch, params.n_threads, params.debug_timings)) {
+            falcon_evaluation_config configuration;
+                configuration.n_past = j * n_batch;
+                configuration.n_tokens = batch_size;
+                configuration.debug_timings = params.debug_timings;
+                configuration.n_threads = params.n_threads;
+            if (falcon_eval(ctx, tokens.data() + batch_start, configuration)) {
                 fprintf(stderr, "%s : failed to eval\n", __func__);
                 return;
             }
