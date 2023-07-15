@@ -12872,8 +12872,30 @@ static void ggml_compute_forward_rope_f32(
 
     // row index used to determine which thread to use
     int ir = 0;
+    const float freq_base = (float)(dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]?dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]:10000);
+    // NTK paper type alpha modification
+    float alpha = 1.0f;
+    GGML_ASSERT(dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA] > 1.0f || dst->meta.i_custom[GGML_CUSTOM_I_ROPE_DYNAMIC_MODE] == 0);
 
-    const float theta_scale = powf((float)(dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]?dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]:10000), -2.0f/n_dims);
+    
+    if (dst->meta.i_custom[GGML_CUSTOM_I_ROPE_DYNAMIC_MODE])
+    {
+        float scale = (float)dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA];
+        if (n_ctx < 2048) 
+            alpha=1.0; 
+        else
+            alpha = powf( ((n_ctx/2048)-1)*scale+1, n_dims / (n_dims - 2.0) );
+    } else
+    {
+        // simple NTK aware scaling - needs fine tuning
+        if (dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA] != 0.0f) {
+            alpha = dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA];
+            alpha = powf(alpha, n_dims / (n_dims - 2.0));
+            // printf("alpha = %f = %f ^ (%d / (%d - 2.0))\n", alpha, dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA], n_dims, n_dims);
+        }
+    }
+    
+    const float theta_scale = powf(alpha * freq_base, -2.0f/n_dims);
 
     const bool is_neox = mode & 2;
     const bool is_glm  = mode & 4;

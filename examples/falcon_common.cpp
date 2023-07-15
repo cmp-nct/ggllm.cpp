@@ -203,6 +203,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.top_k = std::stoi(argv[i]);
+            params.sampling_not_default=true;
         } else if (arg == "-c" || arg == "--ctx-size") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -217,12 +218,14 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.top_p = std::stof(argv[i]);
+            params.sampling_not_default=true;
         } else if (arg == "--temp") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
             }
             params.temp = std::stof(argv[i]);
+            params.sampling_not_default=true;
         } else if (arg == "--tfs") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -235,6 +238,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.typical_p = std::stof(argv[i]);
+            params.sampling_not_default=true;
         } else if (arg == "--repeat-last-n") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -265,6 +269,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.mirostat = std::stoi(argv[i]);
+            params.sampling_not_default=true;
         } else if (arg == "--mirostat-lr") {
             if (++i >= argc) {
                 invalid_param = true;

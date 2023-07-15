@@ -26,7 +26,7 @@ struct gpt_params {
     int32_t seed                           = -1;   // RNG seed
     int32_t n_threads                      = 1;
     int32_t n_predict                      = -1;   // new tokens to predict
-    int32_t n_ctx                          = 512;  // context size
+    int32_t n_ctx                          = 2048;  // context size
     int32_t n_batch                        = 1;  // batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                         = 0;    // number of tokens to keep from initial prompt
     int32_t n_gpu_layers                   = 200;  // number of layers to store in VRAM
@@ -90,6 +90,7 @@ struct gpt_params {
     bool mem_test          = false; // compute maximum memory usage
     bool export_cgraph     = false; // export the computation graph
     bool verbose_prompt    = false; // print prompt tokens before generation
+    bool sampling_not_default = false; // readonly, true if any sampling change is requested
     int debug_timings      = 0;     // print timings (required for GGML_PERF=1)
 };
 

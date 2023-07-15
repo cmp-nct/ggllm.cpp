@@ -108,10 +108,25 @@ int main(int argc, char ** argv) {
     }
 
     if (params.n_ctx > 2048) {
-        fprintf(stderr, "%s: warning: model does not support context sizes greater than 2048 tokens (%d specified);"
-                "expect poor results\n", __func__, params.n_ctx);
+        if (params.sampling_not_default)
+        {
+            // a slightly lower temperature can help offset perplexity increases - those numbers need some tuning
+            if (params.n_ctx >= 4096) {
+                fprintf(stderr, "%s: info: context size is large (%d), reducing default temperature to 0.7.\n", __func__, params.n_ctx);
+                params.temp = 0.7f;
+            } else
+            if (params.n_ctx >= 8192) {
+                fprintf(stderr, "%s: info: context size is very large (%d), reducing default temperature to 0.6.\n", __func__, params.n_ctx);
+                params.temp = 0.6f;
+            } else
+            if (params.n_ctx >= 16384) {
+                fprintf(stderr, "%s: info: context size is extremely large (%d), reducing default temperature to 0.5.\n", __func__, params.n_ctx);
+                params.temp = 0.5f;
+            }
+
+        }
     } else if (params.n_ctx < 8) {
-        fprintf(stderr, "%s: warning: minimum context size is 8, using minimum size.\n", __func__);
+        fprintf(stderr, "%s: warning: minimum context size is 8.\n", __func__);
         params.n_ctx = 8;
     }
 
@@ -175,12 +190,22 @@ int main(int argc, char ** argv) {
         // falcon_context_set_buffers(ctx, params.n_batch, params.n_ctx);
         {
             const std::vector<falcon_token> tmp((int)params.n_batch, falcon_token_bos());
-            falcon_eval(ctx, tmp.data(), (int)tmp.size(), 0, params.n_threads,params.debug_timings);
+            falcon_evaluation_config configuration;
+                configuration.n_past = 0;
+                configuration.debug_timings = params.debug_timings;
+                configuration.n_threads = params.n_threads;
+                configuration.n_tokens = (int)tmp.size();
+            falcon_eval(ctx, tmp.data(), configuration);
         }
 
         {
             const std::vector<falcon_token> tmp = { 0, };
-            falcon_eval(ctx, tmp.data(), (int)tmp.size(), params.n_predict - 1, params.n_threads,params.debug_timings);
+            falcon_evaluation_config configuration;
+                configuration.n_past = params.n_predict - 1;
+                configuration.debug_timings = params.debug_timings;
+                configuration.n_threads = params.n_threads;
+                configuration.n_tokens = (int)tmp.size();
+            falcon_eval(ctx, tmp.data(), configuration);
         }
 
         falcon_print_timings(ctx);
@@ -624,7 +649,12 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
     if(n_matching_session_tokens <= 0)
     {
         const std::vector<falcon_token> tmp = { falcon_token_bos(), };
-        falcon_eval(ctx, tmp.data(), (int)tmp.size(), 0, params.n_threads,0);
+        falcon_evaluation_config configuration;
+                configuration.n_past = 0;
+                configuration.debug_timings = 0;
+                configuration.n_threads = params.n_threads;
+                configuration.n_tokens = (int)tmp.size();
+        falcon_eval(ctx, tmp.data(), configuration);
         llama_reset_timings(ctx);
     }
 
@@ -783,7 +813,14 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
                 }
                 int debug_timings = params.debug_timings;
                 if (n_remain == 1 && debug_timings == 2) debug_timings = 3; // we have no access to the last information in eval()
-                if (falcon_eval(ctx, &embd[i], n_eval, n_past, params.n_threads,debug_timings)) {
+                falcon_evaluation_config configuration;
+                configuration.n_past = n_past;
+                configuration.debug_timings = debug_timings;
+                configuration.n_threads = params.n_threads;
+                configuration.n_tokens = n_eval;
+                if (!params.interactive && params.n_predict > 0)
+                    configuration.n_max_real_ctx = std::min((int)n_ctx, (int)(prompt_size+params.n_predict));
+                if (falcon_eval(ctx, &embd[i], configuration)) {
                     fprintf(stderr, "%s : failed to eval\n", __func__);
                     return 1;
                 }
