@@ -2110,7 +2110,7 @@ static bool falcon_eval_internal(
 
      ggml_type wtype = GGML_TYPE_F32;
     // ggml_type wtype = ggml_ftype_to_ggml_type((ggml_ftype) (model.hparams.ftype));
-     const int sizeof_wtype = ggml_type_sizef(wtype);
+    const int sizeof_wtype = ggml_type_sizef(wtype);
 
     // const int i_gpu_start = n_layer - n_gpu_layers;
     const int i_gpu_start = lctx.model.i_gpu_start;
@@ -2275,8 +2275,8 @@ static bool falcon_eval_internal(
                     ctx0,
                     kv_self.k,
                     head_dim, n_head_kv, n_past + N,
-                    head_dim * sizeof_wtype,
-                    head_dim * n_head_kv * sizeof_wtype,
+                    head_dim * ggml_element_size(kv_self.k),
+                    head_dim * n_head_kv * ggml_element_size(kv_self.k),
                     il * n_ctx * ggml_element_size(kv_self.k) * n_head_kv * head_dim),
                 0, 2, 1, 3);
 
@@ -2293,7 +2293,7 @@ static bool falcon_eval_internal(
             struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
             ggml_set_name(Q, "Q");
             struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-            if (use_broadcasting) KQ->meta.cuda_op_directive=0;
+            if (use_broadcasting) KQ->meta.cuda_op_force=0; // disable cuda for KQ when broadcasting (todo)
             ggml_set_name(KQ, "KQ");
 
             // KQ_scaled = KQ / sqrt(n_embd/n_head)
@@ -2320,8 +2320,8 @@ static bool falcon_eval_internal(
                     ctx0,
                     kv_self.v,
                     head_dim, n_head_kv, n_past + N,
-                    head_dim * sizeof_wtype,
-                    head_dim * n_head_kv * sizeof_wtype,
+                    head_dim * ggml_element_size(kv_self.v),
+                    head_dim * n_head_kv * ggml_element_size(kv_self.v),
                     il * n_ctx * ggml_element_size(kv_self.v) * n_head_kv * head_dim),
                 1, 2, 0, 3);
                 V = ggml_cont(ctx0, V);
@@ -2340,7 +2340,7 @@ static bool falcon_eval_internal(
 
             // KQV = transpose(V) * KQ_soft_max
             struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
-            if (use_broadcasting) KQV->meta.cuda_op_directive=0;
+            if (use_broadcasting) KQV->meta.cuda_op_force=0;
             ggml_set_name(KQV, "KQV");
 
             // KQV_merged = KQV.permute(0, 2, 1, 3)

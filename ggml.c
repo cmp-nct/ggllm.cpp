@@ -2254,6 +2254,8 @@ inline static void ggml_vec_set_i16(const int n, int16_t * x, const int16_t v) {
 inline static void ggml_vec_set_i32(const int n, int32_t * x, const int32_t v) { for (int i = 0; i < n; ++i) x[i] = v; }
 
 inline static void ggml_vec_set_f16(const int n, ggml_fp16_t * x, const int32_t v) { for (int i = 0; i < n; ++i) x[i] = v; }
+inline static void ggml_vec_cpy_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x)      { for (int i = 0; i < n; ++i) y[i]  = x[i];        }
+inline static void ggml_vec_cpy_f32_to_f16(const int n, ggml_fp16_t * y, const float * x) { for (int i = 0; i < n; ++i) {  y[i] = GGML_FP32_TO_FP16(x[i]);  }}
 
 inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, const float * y) { for (int i = 0; i < n; ++i) z[i]  = x[i] + y[i]; }
 inline static void ggml_vec_add1_f32(const int n, float * z, const float * x, const float   v) { for (int i = 0; i < n; ++i) z[i]  = x[i] + v;    }
@@ -11879,6 +11881,98 @@ static void ggml_compute_forward_set_f32(
     }
 }
 
+static void ggml_compute_forward_set_f16(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        const struct ggml_tensor * opt0,
+        struct ggml_tensor * dst) {
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0));
+
+    GGML_ASSERT(opt0->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(opt0) == 5);
+
+    // view src0 and dst with these strides and data offset inbytes during set
+    // nb0 is implicitely element_size because src0 and dst are contiguous
+    size_t nb1     = ((int32_t *) opt0->data)[0];
+    size_t nb2     = ((int32_t *) opt0->data)[1];
+    size_t nb3     = ((int32_t *) opt0->data)[2];
+    size_t offset  = ((int32_t *) opt0->data)[3];
+    bool   inplace = (bool) ((int32_t *) opt0->data)[4];
+
+    if (!inplace && (params->type == GGML_TASK_INIT)) {
+        // memcpy needs to be synchronized across threads to avoid race conditions.
+        // => do it in INIT phase
+        memcpy(
+            ((char *)  dst->data),
+            ((char *) src0->data),
+            ggml_nbytes(dst));
+    }
+
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr = ggml_nrows(src1);
+    const int nc = src1->ne[0];
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+
+    const size_t nb10 = src1->nb[0];
+    const size_t nb11 = src1->nb[1];
+    const size_t nb12 = src1->nb[2];
+    const size_t nb13 = src1->nb[3];
+
+    // src0 and dst as viewed during set
+    const size_t nb0 = ggml_element_size(src0);
+
+    const int im0 = (ne10 == 0 ? 0 : ne10-1);
+    const int im1 = (ne11 == 0 ? 0 : ne11-1);
+    const int im2 = (ne12 == 0 ? 0 : ne12-1);
+    const int im3 = (ne13 == 0 ? 0 : ne13-1);
+
+    GGML_ASSERT(offset + im0*nb0  + im1*nb1  + im2*nb2  + im3*nb3  <= ggml_nbytes(dst));
+    // ggml_tensor_printf(src1, "src1",0,false,true);
+    GGML_ASSERT(nb10 == sizeof(ggml_fp16_t) || nb10 == sizeof(float));
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int ir = ir0; ir < ir1; ++ir) {
+        // src0 and dst are viewed with shape of src1 and offset
+        // => same indices
+        const int i3 = ir/(ne12*ne11);
+        const int i2 = (ir - i3*ne12*ne11)/ne11;
+        const int i1 = (ir - i3*ne12*ne11 - i2*ne11);
+        if (nb10 == sizeof(ggml_fp16_t))
+            ggml_vec_cpy_f16(nc,
+                (ggml_fp16_t *) ((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + offset),
+                (ggml_fp16_t *) ((char *) src1->data + i3*nb13 + i2*nb12 + i1*nb11));
+        else if (nb10 == sizeof(float))
+           ggml_vec_cpy_f32_to_f16(nc,
+                (ggml_fp16_t *) ((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + offset),
+                (float *) ((char *) src1->data + i3*nb13 + i2*nb12 + i1*nb11));
+        else GGML_ASSERT(nb10 == sizeof(float) || nb10 == sizeof(ggml_fp16_t));
+// fp16-fp16:
+//    for (int i0 = 0; i0 < nc; ++i0) {
+//         ggml_fp16_t v = ((ggml_fp16_t *) ((char *) src1->data + i3*nb13 + i2*nb12 + i1*nb11))[i0];
+//         ((ggml_fp16_t *) ((char *)  dst->data + i3*nb3  + i2*nb2  + i1*nb1  + offset))[i0] = v;
+//     }
+    }
+   
+}
+
 static void ggml_compute_forward_set(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
@@ -11892,6 +11986,9 @@ static void ggml_compute_forward_set(
                 ggml_compute_forward_set_f32(params, src0, src1, opt0, dst);
             } break;
         case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_set_f16(params, src0, src1, opt0, dst);
+            } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -13038,8 +13135,30 @@ static void ggml_compute_forward_rope_f16(
 
     // row index used to determine which thread to use
     int ir = 0;
+    const float freq_base = (float)(dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]?dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]:10000);
+    // NTK paper type alpha modification
+    float alpha = 1.0f;
+    GGML_ASSERT(dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA] > 1.0f || dst->meta.i_custom[GGML_CUSTOM_I_ROPE_DYNAMIC_MODE] == 0);
+    // const float theta_scale = powf((float)(dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]?dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]:10000), -2.0f/n_dims);
 
-    const float theta_scale = powf((float)(dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]?dst->meta.i_custom[GGML_CUSTOM_I_ROPE_ANG_FREQ]:10000), -2.0f/n_dims);
+     if (dst->meta.i_custom[GGML_CUSTOM_I_ROPE_DYNAMIC_MODE])
+    {
+        float scale = (float)dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA];
+        if (n_ctx < 2048) 
+            alpha=1.0; 
+        else
+            alpha = powf( ((n_ctx/2048)-1)*scale+1, n_dims / (n_dims - 2.0) );
+    } else
+    {
+        // simple NTK aware scaling - needs fine tuning
+        if (dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA] != 0.0f) {
+            alpha = dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA];
+            alpha = powf(alpha, n_dims / (n_dims - 2.0));
+            // printf("alpha = %f = %f ^ (%d / (%d - 2.0))\n", alpha, dst->meta.f_custom[GGML_CUSTOM_F_ROPE_NTK_ALPHA], n_dims, n_dims);
+        }
+    }
+    
+    const float theta_scale = powf(alpha * freq_base, -2.0f/n_dims);
 
     const bool is_neox = mode & 2;
     const bool is_glm  = mode & 4;

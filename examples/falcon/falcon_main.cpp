@@ -1195,8 +1195,8 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
             {
                 if (params.verbose_prompt)
                     fprintf(stderr, " [end of text]\n");
-                // if we are in the prompt ingestion we will not stop
-                if (n_past_total > (int)embd_inp.size()) {
+                // if we are during  prompt ingestion we will not stop
+                if (n_consumed >= (int)embd_inp.size()) {
                     break;
                 }
             }

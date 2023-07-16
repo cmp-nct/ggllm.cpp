@@ -2848,9 +2848,9 @@ bool ggml_cuda_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_te
     if (g_system_gpu_status.num_devices == 0) {
         return false;
     }
-    if (dst->meta.cuda_op_directive != -1) return dst->meta.cuda_op_directive? true : false;
-    if (src0->meta.cuda_op_directive != -1) return src0->meta.cuda_op_directive? true : false;
-    if (src1->meta.cuda_op_directive != -1) return src1->meta.cuda_op_directive? true : false;
+    if (dst->meta.cuda_op_force != -1) return dst->meta.cuda_op_force? true : false;
+    if (src0->meta.cuda_op_force != -1) return src0->meta.cuda_op_force? true : false;
+    if (src1->meta.cuda_op_force != -1) return src1->meta.cuda_op_force? true : false;
     
     // TODO: find the optimal values for these
     if ((src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
@@ -3199,7 +3199,7 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
     if (g_system_gpu_status.num_devices == 0) 
          return false;
     // allow manual skip
-    if (tensor->meta.cuda_op_directive == 0) 
+    if (tensor->meta.cuda_op_force == 0) 
         return false;
 
 

@@ -698,7 +698,8 @@ struct falcon_context_params falcon_context_params_create(const gpt_params &para
     lparams.main_gpu     = params.main_gpu;
     memcpy(lparams.tensor_split, params.tensor_split, LLAMA_MAX_DEVICES*sizeof(float));
     lparams.seed         = params.seed;
-    lparams.f16_kv       = false; //params.memory_f16; // TODO? unsupported because ggml_repeat2 currently only implemented for f32
+    // lparams.f16_kv       = false; //params.memory_f16; // TODO? unsupported because ggml_repeat2 currently only implemented for f32
+    lparams.f16_kv       = params.memory_f16;
     lparams.use_mmap     = params.use_mmap;
     lparams.use_mlock    = params.use_mlock;
     lparams.logits_all   = params.perplexity;
