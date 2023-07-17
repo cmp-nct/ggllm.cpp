@@ -112,7 +112,7 @@ void validateParams(const std::string& arg, int argc, int& i, char** argv, const
 
     const std::string& nextArg = argv[i];
 
-    if (nextArg.empty() || nextArg[0] == '-') {
+    if (nextArg.empty() || (nextArg[0] == '-' && !std::isdigit(nextArg[1]))) {
         fprintf(stderr, "error: missing value for parameter: %s\n", arg.c_str());
         gpt_print_usage(argc, argv, default_params);
         exit(1);
