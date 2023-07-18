@@ -194,9 +194,6 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             params.n_predict = std::stoi(argv[i]);
         } else if (arg == "--top-k") {
             validateParams(arg, argc, i, argv, default_params);
-            params.seed = std::stoi(argv[i]);
-        } else if (arg == "--top-k") {
-            validateParams(arg, argc, i, argv, default_params);
             params.top_k = std::stoi(argv[i]);
         } else if (arg == "-c" || arg == "--ctx-size") {
             validateParams(arg, argc, i, argv, default_params);
