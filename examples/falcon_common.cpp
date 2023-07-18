@@ -419,7 +419,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
         }
     }
 
-/* Code block obsolete, as check is now performed in void vakidateParams
+/* Code block obsolete, as check is now performed in void validateParams
     if (invalid_param) {
         fprintf(stderr, "error: invalid parameter for argument: %s\n", arg.c_str());
         gpt_print_usage(argc, argv, default_params);
