@@ -1517,6 +1517,10 @@ t_finetune_type falcon_detect_finetune(falcon_context * ctx, std::string model_p
             return FINETUNE_OPENASSISTANT;
         }
     }
+    if (ctx->vocab.id_to_token.size() == 70144)
+    {
+        return FINETUNE_OPENBUDDY;
+    }
     if (model_lower.find("wizard") != std::string::npos) {
         return FINETUNE_WIZARD;
     }

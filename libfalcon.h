@@ -270,8 +270,8 @@ extern "C" {
 
     // Token Id -> String. Uses the vocabulary in the provided context
     LLAMA_API const char * falcon_token_to_str(const struct falcon_context * ctx, falcon_token token);
-    typedef enum { FINETUNE_UNSPECIFIED, FINETUNE_NONE, FINETUNE_ALPACA, FINETUNE_OPENASSISTANT, FINETUNE_OPENASSIST_V1, FINETUNE_WIZARD, FINETUNE_FALCONINSTRUCT } t_finetune_type;
-    static const char *FINETUNE_NAME[7] = { "UNSPECIFIED", "NONE", "ALPACA", "OPENASSISTANT", "OPENASSIST_V1", "WIZARD", "FALCONINSTRUCT" };
+    typedef enum { FINETUNE_UNSPECIFIED, FINETUNE_NONE, FINETUNE_ALPACA, FINETUNE_OPENASSISTANT, FINETUNE_OPENASSIST_V1, FINETUNE_WIZARD, FINETUNE_FALCONINSTRUCT, FINETUNE_OPENBUDDY } t_finetune_type;
+    static const char *FINETUNE_NAME[8] = { "UNSPECIFIED", "NONE", "ALPACA", "OPENASSISTANT", "OPENASSIST_V1", "WIZARD", "FALCONINSTRUCT", "OPENBUDDY"};
 
     
 

@@ -340,6 +340,20 @@ int main(int argc, char ** argv) {
                         inp_system_baseline = ::falcon_tokenize(ctx, ">>INTRODUCTION<<"+params.system_baseline_prompt+"\n", false);
                 }
                 break;
+            case FINETUNE_OPENBUDDY:
+                inp_pfx = ::falcon_tokenize(ctx, "User: ", false);
+                inp_sfx = ::falcon_tokenize(ctx, "\nAssistant:", false);
+                if (!params.system_prompt.size())
+                {
+                    inp_system = ::falcon_tokenize(ctx, "Consider a conversation between User (a human) and Assistant (named Buddy).\nBuddy is an INTP-T, a friendly, intelligent and multilingual AI assistant, by OpenBuddy team, running on https://github.com/cmp-nct/ggllm.cpp\nBuddy cannot access the Internet.\nBuddy can fluently speak the user's language (e.g. English, Chinese).\nBuddy can generate poems, stories, code, essays, songs, and more.\nBuddy possesses knowledge about the world, history, and culture, but not everything. Knowledge cutoff: 2021-09.\nBuddy's responses are always positive, unharmful, safe, creative, high-quality, human-like, and interesting.\n\nUser: Hi.\nAssistant: Hi, I'm Buddy, your AI assistant. How can I help you today?\n", false);
+                } else
+                if (params.system_prompt.size() &&!params.sys_prompt_is_raw)
+                {
+                    inp_system = ::falcon_tokenize(ctx, ">>INTRODUCTION<<"+params.system_prompt+"\n", false);
+                    if(!params.sys_prompt_simple)
+                        inp_system_baseline = ::falcon_tokenize(ctx, ">>INTRODUCTION<<"+params.system_baseline_prompt+"\n", false);
+                }
+                break;
             case FINETUNE_FALCONINSTRUCT:
                 inp_pfx = ::falcon_tokenize(ctx, "User: ", false);
                 inp_sfx = ::falcon_tokenize(ctx, "\nAssistant:", false); // must not include space
