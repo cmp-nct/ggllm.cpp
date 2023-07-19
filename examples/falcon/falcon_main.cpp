@@ -408,7 +408,7 @@ int main(int argc, char ** argv) {
 
             session_tokens.resize(params.n_ctx);
             size_t n_token_count_out = 0;
-            if (!llama_load_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
+            if (!falcon_load_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.capacity(), &n_token_count_out)) {
                 fprintf(stderr, "%s: error: failed to load session file '%s'\n", __func__, path_session.c_str());
                 return 1;
             }
@@ -486,16 +486,28 @@ int main(int argc, char ** argv) {
             }
             n_matching_session_tokens++;
         }
-        if (params.prompt.empty() && n_matching_session_tokens == embd_inp.size()) {
+        if (params.prompt.empty() && n_matching_session_tokens == embd_inp.size())
+        {
             fprintf(stderr, "%s: using full prompt from session file\n", __func__);
-        } else if (n_matching_session_tokens >= embd_inp.size()) {
+        }
+        else if (n_matching_session_tokens >= embd_inp.size())
+        {
             fprintf(stderr, "%s: session file has exact match for prompt!\n", __func__);
-        } else if (n_matching_session_tokens < (embd_inp.size() / 2)) {
+        }
+        else if (n_matching_session_tokens < (embd_inp.size() / 2))
+        {
             fprintf(stderr, "%s: warning: session file has low similarity to prompt (%zu / %zu tokens); will mostly be reevaluated\n",
-                __func__, n_matching_session_tokens, embd_inp.size());
-        } else {
+                    __func__, n_matching_session_tokens, embd_inp.size());
+        }
+        else
+        {
             fprintf(stderr, "%s: session file matches %zu / %zu tokens of prompt\n",
-                __func__, n_matching_session_tokens, embd_inp.size());
+                    __func__, n_matching_session_tokens, embd_inp.size());
+        }
+        if (n_matching_session_tokens < embd_inp.size()) 
+        {
+            // falcon_kv_shave(ctx, 2); 
+            falcon_kv_shave(ctx, (int) n_matching_session_tokens);
         }
     }
 
@@ -857,7 +869,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
             // optionally save the session on first sample (for faster prompt loading next time)
             if (!path_session.empty() && need_to_save_session && !params.prompt_cache_ro) {
                 need_to_save_session = false;
-                llama_save_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
+                falcon_save_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
             }
 
             falcon_token id = 0;
@@ -1213,7 +1225,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
 
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         fprintf(stderr, "\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
-        llama_save_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
+        falcon_save_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
     }
 
     falcon_print_timings(ctx);

@@ -210,8 +210,10 @@ extern "C" {
     LLAMA_API size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src);
 
     // Save/load session file
-    LLAMA_API bool llama_load_session_file(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out);
-    LLAMA_API bool llama_save_session_file(struct falcon_context * ctx, const char * path_session, const falcon_token * tokens, size_t n_token_count);
+    LLAMA_API bool falcon_load_session_file(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out);
+    LLAMA_API bool falcon_save_session_file(struct falcon_context * ctx, const char * path_session, const falcon_token * tokens, size_t n_token_count);
+
+    LLAMA_API bool falcon_kv_shave(struct falcon_context * ctx, int n_maxkv);
 
     // Run the llama inference to obtain the logits and probabilities for the next token.
     // tokens + n_tokens is the provided batch of new tokens to process

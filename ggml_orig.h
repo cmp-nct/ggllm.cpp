@@ -197,7 +197,7 @@
 #define GGML_MAX_NODES         4096
 #define GGML_MAX_PARAMS        256
 #define GGML_MAX_CONTEXTS      64
-#define GGML_MAX_SRC           6
+#define GGML_MAX_OPT           4
 #define GGML_MAX_NAME          64
 #define GGML_DEFAULT_N_THREADS 4
 
@@ -212,14 +212,6 @@
     do { \
         if (!(x)) { \
             fprintf(stderr, "GGML_ASSERT: %s:%d: %s\n", __FILE__, __LINE__, #x); \
-            abort(); \
-        } \
-    } while (0)
-#define GGML_ASSERT_T(x,y) \
-    do { \
-        if (!(x)) { \
-            ggml_tensor_printf(y,__FILE__,__LINE__,true,true); \
-            fprintf(stderr, "GGML_ASSERT_T: %s:%d: %s\n", __FILE__, __LINE__, #x); \
             abort(); \
         } \
     } while (0)
@@ -346,7 +338,6 @@ extern "C" {
         GGML_OP_SUM,
         GGML_OP_SUM_ROWS,
         GGML_OP_MEAN,
-        GGML_OP_ARGMAX,
         GGML_OP_REPEAT,
         GGML_OP_REPEAT2, 
         GGML_OP_REPEAT_BACK,
@@ -355,8 +346,6 @@ extern "C" {
         GGML_OP_SGN,
         GGML_OP_NEG,
         GGML_OP_STEP,
-        GGML_OP_TANH,
-        GGML_OP_ELU,
         GGML_OP_RELU,
         GGML_OP_GELU,
         GGML_OP_GELU_QUICK,
@@ -388,10 +377,9 @@ extern "C" {
         GGML_OP_ROPE_BACK,
         GGML_OP_ALIBI,
         GGML_OP_CLAMP,
-        GGML_OP_CONV_1D,
-        GGML_OP_CONV_2D,
-        GGML_OP_POOL_1D,
-        GGML_OP_POOL_2D,
+        GGML_OP_CONV_1D_S1_PH,
+        GGML_OP_CONV_1D_S2_PH,
+        GGML_OP_CONV_2D_SK_P0,
 
         GGML_OP_FLASH_ATTN,
         GGML_OP_FLASH_FF,
@@ -424,62 +412,42 @@ extern "C" {
     };
 
     static const size_t GGML_OBJECT_SIZE = sizeof(struct ggml_object);
-    enum ggml_cuda_opt_op_force {
-        CUDA_OPT_OP_FORCE_DEFAULT = -1,
-        CUDA_OPT_OP_FORCE_CPU = 0,
-        CUDA_OPT_OP_FORCE_CUDA = 1,
-        CUDA_OPT_OP_FORCE_CUBLAS= 2,
-        CUDA_OPT_OP_FORCE_CUBLAS_16= 3,
-        CUDA_OPT_OP_FORCE_CUBLAS_8= 4,
-        CUDA_OPT_OP_PERMIT_USE_MAT_Q= 100,  // permit the use of quantized full matmul kernel
-    };
-    enum ggml_info_compute_device {
-        GGML_INFO_COMPUTE_DEVICE_UNDEFINED = -2,
-        GGML_INFO_COMPUTE_DEVICE_CPU = -1,
-        GGML_INFO_COMPUTE_DEVICE_GPU = 0,
-    };
-    
 
-    typedef struct
-    {
-            // keep it divisible by 16 bytes
-            int8_t layer_id;                  // -1 = global, 0 = first layer
-            char short_name[GGML_MAX_NAME];   // shorter parameter weight name without layer name - used for debugging visualization only
+        typedef struct
+        {
+                // keep it divisible by 16 bytes
+                int8_t layer_id;                  // -1 = global, 0 = first layer
+                char short_name[GGML_MAX_NAME];   // shorter parameter weight name without layer name - used for debugging visualization only
 
-            enum ggml_cuda_opt_op_force cuda_op_force;       // -1 = default, 0 = no CUDA operation permitted, 1 = CUDA operation enforced (if possible) - allows to skip or force CUDA (needs more implementations)
+                int8_t cuda_op_force;       // -1 = default, 0 = no CUDA operation permitted, 1 = CUDA operation enforced (if possible) - allows to skip or force CUDA (needs more implementations)
 
-            enum ggml_info_compute_device ggml_info_compute_op_device;         // informs where a ggml operation took place
-            uint8_t cuda_perf_mal_mul_type;   // perf info flag for dst tensors: 0 = no matmul, 1-8 = quantized kernel, 16/32 cuBLAS 16 or 32 bit processing
+                int8_t cuda_info_op_on_device;         // -2 = not computed, -1 = on CPU, 0+ = on GPU device # not implemented yet
+                uint8_t cuda_perf_mal_mul_type;   // perf flag for dst tensors: 0 = no matmul, 1 = quantized kernel, 16/32 cuBLAS 16 or 32 bit processing
 
-            // custom parameters for quick ggml function alteration (for example: rope)
-            float f_custom[4];  
-            int i_custom[4];
+                // custom parameters for quick ggml function alteration (for example: rope)
+                float f_custom[4];  
+                int i_custom[4];
 
-            uint8_t debug_flag;
+                uint8_t debug_flag;
 
-            char padding[3];
-    } tensor_meta;
-    const static tensor_meta GGML_DEFAULT_TENSOR_META = {
-            /*.layer_id =*/ -1,
-            /*.short_name =*/ "",
+                char padding[15];
+        } tensor_meta;
+        static const tensor_meta GGML_DEFAULT_TENSOR_META = {
+                /*.layer_id =*/ -1,
+                /*.short_name =*/ "",
 
-            /*.cuda_op_force =*/ CUDA_OPT_OP_FORCE_DEFAULT,
+                /*.cuda_op_force =*/ -1,
 
-            /*.ggml_info_compute_op_device =*/ GGML_INFO_COMPUTE_DEVICE_UNDEFINED,
-            /*.cuda_perf_mal_mul_type =*/ 0,
-            /*.f_custom =*/ {0.0f, 0.0f, 0.0f, 0.0f},
-            /*.i_custom =*/ {0, 0, 0, 0},
+                /*.cuda_info_op_on_device =*/ -2,
+                /*.cuda_perf_mal_mul_type =*/ 0,
+                /*.f_custom =*/ {0.0f, 0.0f, 0.0f, 0.0f},
+                /*.i_custom =*/ {0, 0, 0, 0},
 
-            /*.debug_flag =*/ 0,
+                /*.debug_flag =*/ 0,
 
 
-            /*.padding =*/ {0,0,0},
-    };
-    static tensor_meta GGML_CURRENT_DEFAULT_TENSOR_META;
-    tensor_meta* ggml_tensor_default_meta_change();
-    void ggml_tensor_default_meta_reset();
-
-
+                /*.padding =*/ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        };
     // n-dimensional tensor
     struct ggml_tensor {
         enum ggml_type    type;
@@ -498,7 +466,12 @@ extern "C" {
         bool is_param;
 
         struct ggml_tensor * grad;
-        struct ggml_tensor * src[GGML_MAX_SRC];
+        struct ggml_tensor * src0;
+        struct ggml_tensor * src1;
+        struct ggml_tensor * opt[GGML_MAX_OPT];
+
+        // thread scheduling
+        int n_tasks;
 
         // performance
         int     perf_runs;
@@ -508,6 +481,7 @@ extern "C" {
         void * data;
 
         char name[GGML_MAX_NAME];
+
 
         void * extra; // extra things (populated in ggml-cuda.cu, so it's cuBLAS only)
         tensor_meta meta; // structured generic meta data - increase in chunks of 16 bytes only
@@ -524,12 +498,9 @@ extern "C" {
         uint8_t * work_data; // work buffer, to be allocated by caller before calling to `ggml_graph_compute()`
 
         int n_threads;
-        bool bind_core; // if true, use hard cpu affinity to bind each worker on it's core. (also binds main thread to core 1!)
-        bool conditional_scheduler; // if true, use conditional scheduler to avoid busy waiting.
 
         // the `n_tasks` of nodes, 1:1 mapping to cgraph nodes
         int n_tasks[GGML_MAX_NODES];
-        
 
         // abort ggml_graph_compute when true
         bool (*abort_callback)(void * data);
@@ -697,7 +668,7 @@ extern "C" {
     GGML_API const char *         ggml_get_name(const struct ggml_tensor * tensor);
     GGML_API struct ggml_tensor * ggml_set_name(struct ggml_tensor * tensor, const char * name);
     GGML_API struct ggml_tensor * ggml_format_name(struct ggml_tensor * tensor, const char * fmt, ...);
-
+    
     int8_t ggml_get_current_layer_id(void);
     void ggml_set_current_layer_id(int8_t layer_id);
 
@@ -816,11 +787,6 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
-    // argmax along rows
-    GGML_API struct ggml_tensor * ggml_argmax(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a);
-
     // if a is the same shape as b, and a is not parameter, return a
     // otherwise, return a new tensor: repeat(a) to fit in b
     GGML_API struct ggml_tensor * ggml_repeat(
@@ -846,7 +812,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_abs(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
-
+            
     GGML_API struct ggml_tensor * ggml_abs_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -872,22 +838,6 @@ extern "C" {
             struct ggml_tensor  * a);
 
     GGML_API struct ggml_tensor * ggml_step_inplace(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a);
-
-    GGML_API struct ggml_tensor * ggml_tanh(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a);
-
-    GGML_API struct ggml_tensor * ggml_tanh_inplace(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a);
-
-    GGML_API struct ggml_tensor * ggml_elu(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a);
-
-    GGML_API struct ggml_tensor * ggml_elu_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
@@ -1241,33 +1191,45 @@ extern "C" {
             float                 min,
             float                 max);
 
-    GGML_API struct ggml_tensor * ggml_conv_1d(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            struct ggml_tensor  * b,
-            int                   s0,  // stride
-            int                   p0,  // padding
-            int                   d0); // dilation
+    // TODO: implement general-purpose convolutions
+    // GGML_API struct ggml_tensor * ggml_conv_1d(
+    //        struct ggml_context * ctx,
+    //        struct ggml_tensor  * a,
+    //        struct ggml_tensor  * b,
+    //        int                   s0
+    //        int                   p0,
+    //        int                   d0);
+    //
+    // GGML_API struct ggml_tensor * ggml_conv_2d(
+    //        struct ggml_context * ctx,
+    //        struct ggml_tensor  * a,
+    //        struct ggml_tensor  * b,
+    //        int                   s0,
+    //        int                   s1,
+    //        int                   p0,
+    //        int                   p1,
+    //        int                   d0,
+    //        int                   d1);
 
-    GGML_API struct ggml_tensor * ggml_conv_2d(
+    // padding = half
+    // TODO: we don't support extra parameters for now
+    //       that's why we are hard-coding the stride, padding, and dilation
+    //       not great ..
+    // example:
+    // a:      3   80  768    1
+    // b:   3000   80    1    1
+    // res: 3000  768    1    1
+    // used in whisper
+    GGML_API struct ggml_tensor * ggml_conv_1d_s1_ph(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
-            struct ggml_tensor  * b,
-            int                   s0,
-            int                   s1,
-            int                   p0,
-            int                   p1,
-            int                   d0,
-            int                   d1);
+            struct ggml_tensor  * b);
 
-    // conv_1d with padding = half
-    // alias for ggml_conv_1d(a, b, s, a->ne[0]/2, d)
-    GGML_API struct ggml_tensor* ggml_conv_1d_ph(
+    // used in whisper
+    GGML_API struct ggml_tensor * ggml_conv_1d_s2_ph(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
-            struct ggml_tensor  * b,
-            int                   s,
-            int                   d);
+            struct ggml_tensor  * b);
 
     enum ggml_op_pool {
         GGML_OP_POOL_MAX,
@@ -1423,7 +1385,7 @@ extern "C" {
 
     GGML_API void ggml_set_param(
             struct ggml_context * ctx,
-            struct ggml_tensor  * tensor);
+            struct ggml_tensor * tensor);
 
     GGML_API void ggml_build_forward_expand(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
 
@@ -1445,13 +1407,13 @@ extern "C" {
     GGML_API void               ggml_graph_export(const struct ggml_cgraph * cgraph, const char * fname);
     GGML_API struct ggml_cgraph ggml_graph_import(const char * fname, struct ggml_context ** ctx_data, struct ggml_context ** ctx_eval);
 
-    // print info and performance information for the graph (graph, print_nodes, print_leafs, limit to operation or NULL, limit layers (1 is a compressed output))
-    GGML_API void ggml_graph_print_impl(const struct ggml_cgraph * cgraph,bool print_nodes, bool print_leafs, enum ggml_op filter_operation, int max_layer_id);
+    // print info and performance information for the graph (graph, print_nodes, print_leafs, limit to operation or NULL)
+    GGML_API void ggml_graph_print_impl(const struct ggml_cgraph * cgraph,bool print_nodes, bool print_leafs, enum ggml_op filter_operation);
     GGML_API void ggml_graph_print(const struct ggml_cgraph * cgraph); // wrapper of ggml_graph_print_impl()
 
     // dump the graph into a file using the dot format
     GGML_API void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename);
-
+    
     // visualize the tensor - extended adds more information - when printing sample content extended will also print src0 and src1 content
     void ggml_tensor_printf(const struct ggml_tensor *tensor, char *prefix, int line,  bool extended, bool print_sample);
     // helper to accessa specific single index value (tested for fp32 only, though nb[] is considered)
@@ -1674,7 +1636,7 @@ extern "C" {
     //
 
 #ifdef  __cplusplus
-// restrict not standard in C++
+    // restrict not standard in C++
 #define GGML_RESTRICT
 #else
 #define GGML_RESTRICT restrict
@@ -1692,6 +1654,21 @@ extern "C" {
     } ggml_type_traits_t;
 
     ggml_type_traits_t ggml_internal_get_type_traits(enum ggml_type i);
+    
+    typedef void (*dequantize_row_q_t)(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int k);
+    typedef void (*quantize_row_q_t)  (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int k);
+    typedef void (*vec_dot_q_t)       (const int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT x, const void * GGML_RESTRICT y);
+
+    typedef struct {
+        dequantize_row_q_t dequantize_row_q;
+        quantize_row_q_t   quantize_row_q;
+        quantize_row_q_t   quantize_row_q_reference;
+        quantize_row_q_t   quantize_row_q_dot;
+        vec_dot_q_t        vec_dot_q;
+        enum ggml_type     vec_dot_type;
+    } quantize_fns_t;
+
+    quantize_fns_t ggml_internal_get_quantize_fn(size_t i);
 
 #ifdef  __cplusplus
 }

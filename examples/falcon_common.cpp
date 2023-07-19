@@ -210,8 +210,12 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.n_ctx = std::stoi(argv[i]);
+        } else if (arg == "--memory-f16") {
+            params.memory_f16 = true;
+            params.kvmem_not_default=true;
         } else if (arg == "--memory-f32") {
             params.memory_f16 = false;
+            params.kvmem_not_default=true;
         } else if (arg == "--top-p") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -624,8 +628,8 @@ void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
     fprintf(stderr, "  -c N, --ctx-size N    size of the prompt context (default: %d)\n", params.n_ctx);
     fprintf(stderr, "  --ignore-eos          ignore end of stream token and continue generating (implies --logit-bias 2-inf)\n");
     fprintf(stderr, "  --no-penalize-nl      do not penalize newline token\n");
-    fprintf(stderr, "  --memory-f32          use f32 instead of f16 for memory key+value (default: disabled)\n");
-    fprintf(stderr, "                        not recommended: doubles context memory required and no measurable increase in quality\n");
+    fprintf(stderr, "  --memory-f16          force f16 kv mem instead of f32 for memory key+value (default: adaptive)\n");
+    fprintf(stderr, "  --memory-f32          force f32 kv mem (default: adaptive)\n");
     fprintf(stderr, "  --temp N              temperature (default: %.1f)\n", (double)params.temp);
     fprintf(stderr, "  -b N, --batch-size N  batch size for prompt processing (default: %d)\n", params.n_batch);
     fprintf(stderr, "  --perplexity          compute perplexity over the prompt\n");
@@ -698,7 +702,6 @@ struct falcon_context_params falcon_context_params_create(const gpt_params &para
     lparams.main_gpu     = params.main_gpu;
     memcpy(lparams.tensor_split, params.tensor_split, LLAMA_MAX_DEVICES*sizeof(float));
     lparams.seed         = params.seed;
-    // lparams.f16_kv       = false; //params.memory_f16; // TODO? unsupported because ggml_repeat2 currently only implemented for f32
     lparams.f16_kv       = params.memory_f16;
     lparams.use_mmap     = params.use_mmap;
     lparams.use_mlock    = params.use_mlock;

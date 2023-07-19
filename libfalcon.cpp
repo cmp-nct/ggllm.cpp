@@ -78,6 +78,24 @@ void llama_nop(struct ggml_tensor * tensor) { // don't offload by default
     (void) tensor;
 }
 
+
+// default hparams (Falcon 7B)
+struct falcon_hparams {
+    int32_t n_vocab = 65024;
+    int32_t n_ctx   = 2048;
+    int32_t n_embd  = 4544;
+    int32_t n_head  = 71;
+    int32_t n_head_kv = 1;
+    int32_t n_layer = 32;
+    int32_t n_falcon_type = 7; // 7 for Falcon-7B, 40 for Falcon-40B
+    int32_t n_bpe_merges = 64784; // in binary starting with FALCON_FILE_VERSION_GGCC_V1
+    enum llama_ftype ftype = LLAMA_FTYPE_MOSTLY_F16;
+
+    bool operator!=(const falcon_hparams & other) const {
+        return static_cast<bool>(memcmp(this, &other, sizeof(falcon_hparams)));
+    }
+};
+
 static const std::map<e_model, size_t> & MEM_REQ_SCRATCH0()
 {
     static std::map<e_model, size_t> k_sizes = {
@@ -131,33 +149,24 @@ static std::pair<size_t, size_t> MEM_REQ_EVAL_BATCH(
 }
 
 // this is mostly needed for temporary mul_mat buffers to dequantize the data
-// todo: check if this is actually needed - most happens in scratch 0
-static const std::map<e_model, size_t> & MEM_REQ_EVAL()
+static size_t MEM_REQ_EVAL(
+    e_model model,const falcon_hparams & hparams, ggml_type kvmtype, int32_t n_ctx,int32_t n_batch, int32_t n_ctx_prompt)
 {
     static std::map<e_model, size_t> k_sizes = {
         { FALCON_7B,   160ull * MB }, 
         { FALCON_40B, 256ull * MB }, // for full offload matmul GPU this is oversized
     };
-    return k_sizes;
+    if (ggml_type_size(kvmtype) == sizeof(ggml_fp16_t))
+    {
+        auto x = MEM_REQ_EVAL_BATCH(model, n_batch, n_ctx_prompt);
+        return (size_t)k_sizes[model] + x.second*2; // todo: fp16 ggml internal overheads are huge - check if those can be done in scratch
+    }
+    return k_sizes[model];
+        
 }
 
 
-// default hparams (Falcon 7B)
-struct falcon_hparams {
-    int32_t n_vocab = 65024;
-    int32_t n_ctx   = 2048;
-    int32_t n_embd  = 4544;
-    int32_t n_head  = 71;
-    int32_t n_head_kv = 1;
-    int32_t n_layer = 32;
-    int32_t n_falcon_type = 7; // 7 for Falcon-7B, 40 for Falcon-40B
-    int32_t n_bpe_merges = 64784; // in binary starting with FALCON_FILE_VERSION_GGCC_V1
-    enum llama_ftype ftype = LLAMA_FTYPE_MOSTLY_F16;
 
-    bool operator!=(const falcon_hparams & other) const {
-        return static_cast<bool>(memcmp(this, &other, sizeof(falcon_hparams)));
-    }
-};
 
 static size_t MEM_REQ_KV_SELF(
     const falcon_hparams & hparams, ggml_type wtype, int32_t n_ctx)
@@ -168,10 +177,26 @@ static size_t MEM_REQ_KV_SELF(
 
     const int64_t ne = n_head_kv * head_dim * n_layer * n_ctx;
     #ifdef FALCON_NO_KV_UPGRADE
-    return ggml_tensor_overhead()*2 + 2u * (ggml_tensor_overhead() + ne * ggml_type_size(wtype));
+    return ggml_tensor_overhead()*3 + 2u * (ggml_tensor_overhead() + ne * ggml_type_size(wtype));
     #else
-    return ggml_tensor_overhead() + 3u * (ggml_tensor_overhead() + ne * ggml_type_size(wtype));
+    return ggml_tensor_overhead()*3 + 3u * (ggml_tensor_overhead() + ne * ggml_type_size(wtype));
     #endif
+}
+
+
+//
+// ggml helpers
+//
+
+static void ggml_graph_compute_w_plan(std::vector<uint8_t> & buf, ggml_cgraph * graph, int n_threads) {
+    struct ggml_cplan plan = ggml_graph_plan(graph, n_threads);
+
+    if (plan.work_size > 0) {
+        buf.resize(plan.work_size);
+        plan.work_data = buf.data();
+    }
+
+    ggml_graph_compute(graph, &plan);
 }
 
 struct falcon_layer {
@@ -578,6 +603,8 @@ struct falcon_context {
     // TODO: move in llama_state
     llama_ctx_buffer buf_compute;
     llama_ctx_buffer buf_scratch[LLAMA_MAX_SCRATCH_BUFFERS];
+    // reusable buffer for `struct ggml_graph_plan.work_data`
+    std::vector<uint8_t> buf_plan;
 
 #ifdef GGML_USE_METAL
     ggml_metal_context * ctx_metal = NULL;
@@ -587,7 +614,6 @@ struct falcon_context {
     size_t buf_max_size[LLAMA_MAX_SCRATCH_BUFFERS] = { 0 };
 
     void use_buf(struct ggml_context * ctx, int i) {
-#if defined(LLAMA_USE_SCRATCH)
         size_t last_size = 0;
 
         if (i == -1) {
@@ -602,19 +628,10 @@ struct falcon_context {
         }
 
         buf_last = i;
-#else
-        (void) i;
-        (void) ctx;
-#endif
     }
 
     size_t get_buf_max_mem(int i) const {
-#if defined(LLAMA_USE_SCRATCH)
         return buf_max_size[i];
-#else
-        (void) i;
-        return 0;
-#endif
     }
 };
 
@@ -1353,11 +1370,14 @@ static bool kv_cache_init(
     cache.k = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
     #ifdef FALCON_NO_KV_UPGRADE
     cache.v = ggml_new_tensor_1d(cache.ctx, wtype, n_elements); // only used as reference now
+    cache.v_a = ggml_new_tensor_1d(cache.ctx, wtype, 0);
+    cache.v_b = ggml_new_tensor_1d(cache.ctx, wtype, 0);
     #else
     cache.v = ggml_new_tensor_1d(cache.ctx, wtype, 0); // only used as reference now
-    #endif
     cache.v_a = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
     cache.v_b = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
+    #endif
+
     ggml_set_name(cache.k, "cache_k");
     ggml_set_name(cache.v, "cache_v");
     ggml_set_name(cache.v_a, "cache_v_a");
@@ -1888,7 +1908,7 @@ static falcon_model * falcon_model_load_internal(
             MEM_REQ_SCRATCH1().at(model.type) +
             MEM_REQ_EVAL_BATCH(model.type,n_batch,n_ctx).first + // only prompt context relevant but 
             MEM_REQ_EVAL_BATCH(model.type,n_batch,n_ctx).second +// only prompt context actually scales
-            MEM_REQ_EVAL().at    (model.type);
+            MEM_REQ_EVAL(model.type,model.hparams,memory_type,n_ctx,n_batch,n_ctx);
         
         if (mem_required < 0) mem_required = 0;
 
@@ -2001,7 +2021,7 @@ static bool falcon_eval_internal(
             falcon_evaluation_config &configuration) {
 
     const int64_t t_start_us = ggml_time_us();
-    bool use_broadcasting = true;//(n_tokens == 1); // switched from interleaving repeat to broadcasting
+    bool use_broadcasting = true;   //(n_tokens == 1); // switched from interleaving repeat to broadcasting
     
     const int N = configuration.n_tokens;
     //const int N = embd_inp.size();
@@ -2041,11 +2061,11 @@ static bool falcon_eval_internal(
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
+    ggml_tensor_default_meta_change()->cuda_op_force = CUDA_OPT_OP_FORCE_CPU; // we default to CPU for all operations
 
     // for big prompts, if BLAS is enabled, it is better to use only one thread
     // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance
     ggml_cgraph gf = {};
-    gf.n_threads = N >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas() ? 1 : configuration.n_threads;
 
             
 #if 0
@@ -2153,12 +2173,12 @@ static bool falcon_eval_internal(
             layernorm_output = ggml_norm(ctx0, inpL);
 
             ggml_tensor * il_a = ggml_mul(ctx0, layernorm_output, model.layers[il].input_layernorm);
-            offload_func(il_a); // (todo: uses vram scratch)
+            // offload_func(il_a); // (todo: uses vram scratch)
 
             layernorm_output = ggml_add(ctx0,
                                         il_a,
                                         ggml_repeat(ctx0, model.layers[il].input_layernorm_b, layernorm_output));
-            offload_func(layernorm_output);
+            // offload_func(layernorm_output);
             ggml_set_name(layernorm_output, "layernorm_output");
 
             if (model.type == FALCON_40B || n_falcon_type == 40)
@@ -2177,7 +2197,12 @@ static bool falcon_eval_internal(
             // compute QKV
 
             cur = ggml_mul_mat(ctx0, model.layers[il].query_key_value, cur);
-            // offload_func(cur);
+            /// offload_func(cur);
+            ggml_set_name(cur, "qkv = W_qkv * cur");
+             cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+            //  cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CUBLAS;
+            //  cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
+// TODO: garbage output on dequantizer kernel
 
             // Note that the strides for Kcur, Vcur are set up so that the
             // resulting views are misaligned with the tensor's storage
@@ -2265,7 +2290,7 @@ static bool falcon_eval_internal(
                 V_new = ggml_set_inplace(ctx0,V_new,ggml_cont(ctx0,ggml_permute(ctx0,Vcur,1,2,0,3)),V_new->nb[1],V_new->nb[2],V_new->nb[3],n_past*ggml_element_size(kv_self.v));
                 ggml_build_forward_expand(&gf, V_new);
                 }
-        #endif
+        #endif 
                                   
             
 
@@ -2293,8 +2318,11 @@ static bool falcon_eval_internal(
             struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
             ggml_set_name(Q, "Q");
             struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-            if (use_broadcasting) KQ->meta.cuda_op_force=0; // disable cuda for KQ when broadcasting (todo)
+            if (use_broadcasting) 
+                KQ->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU; // disable cuda for KQ when broadcasting (todo)
+    // TODO
             ggml_set_name(KQ, "KQ");
+            
 
             // KQ_scaled = KQ / sqrt(n_embd/n_head)
             struct ggml_tensor * KQ_scaled =
@@ -2311,6 +2339,7 @@ static bool falcon_eval_internal(
             // KQ = soft_max(KQ_masked)
             struct ggml_tensor * KQ_soft_max = ggml_soft_max_inplace(ctx0, KQ_masked);
             ggml_set_name(KQ_soft_max, "KQ_soft_max");
+            //   KQ_soft_max->meta.cuda_op_force = CUDA_OPT_OP_FORCE_DEFAULT;
 
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
             #ifdef FALCON_NO_KV_UPGRADE
@@ -2340,8 +2369,9 @@ static bool falcon_eval_internal(
 
             // KQV = transpose(V) * KQ_soft_max
             struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
-            if (use_broadcasting) KQV->meta.cuda_op_force=0;
+            if (use_broadcasting) KQV->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
             ggml_set_name(KQV, "KQV");
+            KQV->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
 
             // KQV_merged = KQV.permute(0, 2, 1, 3)
             struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
@@ -2357,29 +2387,35 @@ static bool falcon_eval_internal(
                 cur = ggml_mul_mat(ctx0,
                         model.layers[il].wo,
                         cur);
-                // offload_func(cur);
+                /// offload_func(cur);
+                cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
                 ggml_set_name(cur, "result_wo");
             } 
         } // end of attention
 
         lctx.use_buf(ctx0, 1);
-        //ggml_cuda_set_scratch(1);
 
 
         struct ggml_tensor* inpFF = layernorm_output;
         ggml_set_name(inpFF, "inpFF");
         struct ggml_tensor* attn_out = ggml_cpy(
             ctx0, cur, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, N));
-        //offload_func(attn_out);
+        ///offload_func(attn_out);
         ggml_set_name(attn_out, "attn_out");
         {
             cur = ggml_mul_mat(ctx0, model.layers[il].ffn_up, inpFF);
-            //offload_func(cur);
+            // cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
+            cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+            // cur->meta.cuda_op_force=CUDA_OPT_OP_PERMIT_USE_MAT_Q;
+            ///offload_func(cur);
             ggml_set_name(cur, "inpFF*ff_up"); 
             cur = ggml_gelu_inplace(ctx0, cur);
-            //offload_func(cur);
+            ///offload_func(cur);
             cur = ggml_mul_mat(ctx0, model.layers[il].ffn_down, cur);
-            //offload_func(cur);
+            // cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
+            cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+            // cur->meta.cuda_op_force=CUDA_OPT_OP_PERMIT_USE_MAT_Q;
+            // offload_func(cur);
             ggml_set_name(cur, "gelu_cur*ff_down");
         }
 
@@ -2391,7 +2427,8 @@ static bool falcon_eval_internal(
     } // end of layer loop
     ggml_set_current_layer_id(-1);
     lctx.use_buf(ctx0, 0);
-    //ggml_cuda_set_scratch(0);
+    // ggml_cuda_set_scratch_size(0);
+    ggml_cuda_set_scratch_size((size_t)5*1024*1024*1024); // DEBUG
 
     // used at the end to optionally extract the embeddings
     struct ggml_tensor * embeddings = NULL;
@@ -2401,13 +2438,14 @@ static bool falcon_eval_internal(
 #ifdef GGML_USE_CUBLAS
         if (n_gpu_layers > 0 && n_layer >= i_gpu_start && n_layer <= i_gpu_last) {
             offload_func = ggml_cuda_assign_buffers; // sets the output backend to GPU
+            //ggml_cuda_assign_buffers / ggml_cuda_assign_buffers_no_scratch / ggml_cuda_assign_buffers_force_inplace
         }
 #endif // GGML_USE_CUBLAS
 
     // norm
     {
         cur = ggml_norm(ctx0, inpL);
-        // offload_func(cur);
+        /// offload_func(cur);
         ggml_set_name(cur, "norm_cur");
 
         // inpL = ln_f_g*inpL + ln_f_b
@@ -2425,12 +2463,12 @@ static bool falcon_eval_internal(
 
     // language modelling head
     cur = ggml_mul_mat(ctx0, model.lm_head, cur); 
+    cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+    // cur->meta.cuda_op_force=CUDA_OPT_OP_PERMIT_USE_MAT_Q;
+    /// offload_func(cur);
     
-    //offload_func(cur);
+    ///offload_func(cur);
     ggml_set_name(cur, "result_lm_head");
-
-    //  cur = ggml_mul_mat(ctx0, model.output, cur);
-    // ggml_set_name(cur, "result_output");
 
     lctx.use_buf(ctx0, -1);
 #if 0
@@ -2454,34 +2492,29 @@ static bool falcon_eval_internal(
     
     ggml_backend lm_head_backend = model.lm_head->backend;
     // uneven lm_head from manually added tokens causes cublas errors with 7B
-    if (model.type == FALCON_7B && (configuration.n_tokens > 1) && model.lm_head->ne[1]%2 != 0)
-        model.lm_head->backend = GGML_BACKEND_CPU;  // cublas fails
+     if (model.type == FALCON_7B && (configuration.n_tokens > 1) && model.lm_head->ne[1]%2 != 0)
+         model.lm_head->backend = GGML_BACKEND_CPU;  // cublas fails // todo - better use the new force flag, and check WHY this is necessary
         
 #ifdef GGML_USE_METAL
     if (lctx.ctx_metal && N == 1) {
+        ggml_metal_set_n_cb     (lctx.ctx_metal, configuration.n_threads);
         ggml_metal_graph_compute(lctx.ctx_metal, &gf);
         ggml_metal_get_tensor   (lctx.ctx_metal, cur);
     } else {
-        // IMPORTANT:
         // Since we don't have efficient Matrix x Matrix Metal multiplication yet, we fallback to vanilla
         // ggml_graph_compute(). It uses Apple's Accelerate CBLAS API which takes advantage of the ANE or the AMX
-        // coprocessor.
-        //
-        // When we implement Matrix x Matrix Metal multiplication, we can avoid this branch.
-        // But for now, we have focused only on Matrix x Vector Metal multiplication.
-        //
-        // TODO: avoid these syncs via shared memory (ref #1696)
-        //
         if (lctx.ctx_metal) {
             // We need to sync the GPU KV cache with the CPU KV cache
             ggml_metal_get_tensor(lctx.ctx_metal, kv_self.k);
             ggml_metal_get_tensor(lctx.ctx_metal, kv_self.v);
+            ggml_metal_get_tensor(lctx.ctx_metal, kv_self.v_a);
+            ggml_metal_get_tensor(lctx.ctx_metal, kv_self.v_b);
         }
 
         ggml_graph_compute(ctx0, &gf);
     }
 #else
-    ggml_graph_compute(ctx0, &gf);
+    ggml_graph_compute_w_plan(lctx.buf_plan, &gf, configuration.n_threads);
 #endif
     model.lm_head->backend = lm_head_backend;
     if (configuration.cgraph_fname) {
@@ -2498,8 +2531,8 @@ static bool falcon_eval_internal(
             if ((first && configuration.debug_timings <=2) || configuration.debug_timings > 2)
             {
                 first = false;
-                //ggml_graph_print_impl(&gf,true,false,GGML_OP_MUL_MAT); // GGML_OP_MUL_MAT / GGML_OP_NONE
-                ggml_graph_print_impl(&gf,true,false,GGML_OP_NONE); // GGML_OP_MUL_MAT / GGML_OP_NONE
+                // ggml_graph_print_impl(&gf,true,false,GGML_OP_MUL_MAT); // GGML_OP_MUL_MAT / GGML_OP_NONE
+                ggml_graph_print_impl(&gf,true,false,GGML_OP_NONE,0); // GGML_OP_MUL_MAT / GGML_OP_NONE
             }
         }
         // requires GGML_PERF to be defined for actual timing information
@@ -3465,10 +3498,10 @@ static void llama_convert_tensor_internal(const falcon_load_tensor & tensor, lla
     }
     float * f32_output = (float *) output.addr;
 
-    quantize_fns_t qtype;
+    ggml_type_traits_t qtype;
     if (ggml_is_quantized(tensor.type)) {
-        qtype = ggml_internal_get_quantize_fn(tensor.type);
-        if (qtype.dequantize_row_q == NULL) {
+        qtype = ggml_internal_get_type_traits(tensor.type);
+        if (qtype.to_float == NULL) {
             throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(tensor.type)));
         }
     } else if (tensor.type != GGML_TYPE_F16) {
@@ -3479,9 +3512,9 @@ static void llama_convert_tensor_internal(const falcon_load_tensor & tensor, lla
         if (tensor.type == GGML_TYPE_F16) {
             ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor.data, f32_output, nelements);
         } else if (ggml_is_quantized(tensor.type)) {
-            qtype.dequantize_row_q(tensor.data, f32_output, nelements);
+            qtype.to_float(tensor.data, f32_output, nelements);
         } else {
-            FALCON_ASSERT(false); // unreachable
+            LLAMA_ASSERT(false); // unreachable
         }
         return;
     }
@@ -3489,7 +3522,7 @@ static void llama_convert_tensor_internal(const falcon_load_tensor & tensor, lla
     auto block_size = tensor.type == GGML_TYPE_F16 ? 1 : (size_t)ggml_blck_size(tensor.type);
     auto block_size_bytes = ggml_type_size(tensor.type);
 
-    FALCON_ASSERT(nelements % block_size == 0);
+    LLAMA_ASSERT(nelements % block_size == 0);
     auto nblocks = nelements / block_size;
     auto blocks_per_thread = nblocks / nthread;
     auto spare_blocks = nblocks - (blocks_per_thread * nthread); // if blocks aren't divisible by thread count
@@ -3504,7 +3537,7 @@ static void llama_convert_tensor_internal(const falcon_load_tensor & tensor, lla
             if (typ == GGML_TYPE_F16) {
                 ggml_fp16_to_fp32_row((ggml_fp16_t *)inbuf, outbuf, nels);
             } else {
-                qtype.dequantize_row_q(inbuf, outbuf, nels);
+                qtype.to_float(inbuf, outbuf, nels);
             }
         };
         workers.push_back(std::thread(compute, tensor.type, tensor.data + in_buff_offs, f32_output + out_buff_offs, thr_elems));
@@ -3733,7 +3766,7 @@ static void falcon_model_quantize_internal(const std::string & fname_inp, const 
 void falcon_context_set_buffers(falcon_context *ctx, int n_batch, int n_ctx)
 {
     FALCON_ASSERT(ctx->model.type != FALCON_UNKNOWN);
-    ctx->buf_compute.resize(MEM_REQ_EVAL().at(ctx->model.type));
+    ctx->buf_compute.resize(MEM_REQ_EVAL(ctx->model.type,ctx->model.hparams,ctx->model.kv_self.v->type,n_ctx,n_batch,n_ctx));
     ctx->buf_scratch[0].resize(MEM_REQ_SCRATCH0().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).first);
     ctx->buf_scratch[1].resize(MEM_REQ_SCRATCH1().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).second);
     // fprintf(stderr, "Buffers: compute %.2f MB, scratch0 %.2f MB, scratch1 %.2f MB\n", MEM_REQ_EVAL().at(ctx->model.type)/1024.0/1024.0, (MEM_REQ_SCRATCH0().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).first)/1024.0/1024.0, (MEM_REQ_SCRATCH1().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).second)/1024.0/1024.0);
@@ -4129,8 +4162,9 @@ int llama_apply_lora_from_file_internal(struct falcon_context * ctx, const char 
             }
 
             struct ggml_cgraph gf = ggml_build_forward(r);
-            gf.n_threads = n_threads;
-            ggml_graph_compute(lora_ctx, &gf);
+            // gf.n_threads = n_threads;
+            // ggml_graph_compute(lora_ctx, &gf);
+            // lora todo when falcon loras
 
             // we won't need these tensors again, reset the context to save memory
             ggml_free(lora_ctx);
@@ -4276,7 +4310,6 @@ size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
 
             ggml_context * cpy_ctx = ggml_init({ 4096, NULL, /* no_alloc */ true });
             ggml_cgraph gf{};
-            gf.n_threads = 1;
 
             // ggml_tensor * kout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_embd, kv_ntok, n_layer);
             ggml_tensor * kout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_head_kv*head_dim, kv_ntok, n_layer);
@@ -4299,7 +4332,6 @@ size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
             ggml_tensor * v3d = ggml_view_3d(cpy_ctx, kv_self.v,
                 kv_ntok, n_embd, n_layer,
                 elt_size*n_ctx, elt_size*n_ctx*n_embd, 0);*/
-            // todo: wouldn't this all be more consistent as 1d ?
             ggml_tensor * k3d = ggml_view_3d(cpy_ctx, kv_self.k,
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
@@ -4318,7 +4350,7 @@ size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
 
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, k3d, kout3d));
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, v3d, vout3d));
-            ggml_graph_compute(cpy_ctx, &gf);
+            ggml_graph_compute_w_plan(ctx->buf_plan, &gf, 1);
 
             ggml_free(cpy_ctx);
         }
@@ -4404,9 +4436,8 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
 
             const size_t elt_size = ggml_element_size(kv_self.k);
 
-            ggml_context * cpy_ctx = ggml_init({ 4096, NULL, /* no_alloc */ true });
+            ggml_context * cpy_ctx = ggml_init({ 4096*2, NULL, /* no_alloc */ true });
             ggml_cgraph gf{};
-            gf.n_threads = 1;
             // ggml_tensor * kin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_embd, kv_ntok, n_layer);
             ggml_tensor * kin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_head_kv*head_dim, kv_ntok, n_layer);
             kin3d->data = (void *) inp;
@@ -4433,20 +4464,22 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
 
             #ifdef FALCON_NO_KV_UPGRADE
-            ggml_tensor * v3d = ggml_view_3d(cpy_ctx, kv_self.v,
+            ggml_tensor * v3d_cur = ggml_view_3d(cpy_ctx, kv_self.v,
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
             #else
-             ggml_tensor* v3d = ggml_view_3d( cpy_ctx, (kv_self.v_current == kv_self.V_A)?kv_self.v_a:kv_self.v_b,
-                    kv_ntok, n_head_kv*head_dim, n_layer,
-                    /*nb1*/elt_size*kv_ntok,
-                    /*nb2*/n_ctx * head_dim*n_head_kv *elt_size,
-                    /*off*/0);
+            ggml_tensor* v3d_cur = ggml_view_3d( cpy_ctx, (kv_self.v_current == kv_self.V_A)?kv_self.v_a:kv_self.v_b,
+                kv_ntok, n_head_kv*head_dim, n_layer,
+                /*nb1*/elt_size*kv_ntok,
+                /*nb2*/n_ctx * head_dim*n_head_kv *elt_size,
+                /*off*/0);
             #endif
 
+
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, kin3d, k3d));
-            ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, vin3d, v3d));
-            ggml_graph_compute(cpy_ctx, &gf);
+            ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, vin3d, v3d_cur));
+            ggml_graph_compute_w_plan(ctx->buf_plan, &gf, 1);
+            
 
             ggml_free(cpy_ctx);
         }
@@ -4460,6 +4493,52 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
     FALCON_ASSERT(nread <= max_size);
 
     return nread;
+}
+
+bool falcon_kv_shave(struct falcon_context * ctx, int n_maxkv)
+{
+    const auto & kv_self = ctx->model.kv_self;
+    const auto & hparams = ctx->model.hparams;
+    const int    n_layer = hparams.n_layer;
+    const int    n_embd  = hparams.n_embd;
+    const int    n_ctx   = hparams.n_ctx;
+    const int    n_head_kv = hparams.n_head_kv;
+    const int    head_dim = hparams.n_embd / hparams.n_head;
+
+    int kv_ntok = ctx->model.kv_self.n;
+    FALCON_ASSERT(kv_ntok > n_maxkv);
+
+    const size_t elt_size = ggml_element_size(kv_self.k);
+    #ifndef FALCON_NO_KV_UPGRADE    
+    ggml_context * cpy_ctx = ggml_init({ 1024*1024, NULL, /* no_alloc */ true });
+    ggml_cgraph gf{};
+    for (int il = 0; il < n_layer; il++)
+    {
+        struct ggml_tensor* V_prev = ggml_view_3d(
+                cpy_ctx,
+                (kv_self.v_current == kv_self.V_A)?kv_self.v_a:kv_self.v_b,
+                kv_ntok, head_dim, n_head_kv,
+                /*nb1*/(kv_ntok) * ggml_element_size(kv_self.v),
+                /*nb2*/head_dim * ggml_element_size(kv_self.v) * (kv_ntok),
+                /*off*/il * n_ctx * ggml_element_size(kv_self.v) * n_head_kv * head_dim);
+        ggml_set_name(V_prev, "V_prev");
+
+        struct ggml_tensor* V_new = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, n_maxkv, head_dim, n_head_kv);
+        V_new->data = (void *) (kv_self.v_current != kv_self.V_A)?kv_self.v_a->data:kv_self.v_b->data;
+        char *tmp = (char *)V_new->data;
+        tmp += il * n_ctx * ggml_element_size(kv_self.v) * n_head_kv * head_dim;
+        V_new->data = (void *)tmp;
+        ggml_set_name(V_new, "V_new");
+        V_new = ggml_set_inplace(cpy_ctx,V_new,V_prev,V_new->nb[1],V_new->nb[2],V_new->nb[3],0);
+        ggml_build_forward_expand(&gf, V_new);
+           
+    }
+    ggml_graph_compute_w_plan(ctx->buf_plan, &gf, 2);
+    ggml_free(cpy_ctx);
+    ctx->model.kv_self.v_current = (ctx->model.kv_self.v_current == kv_self.V_A)?kv_self.V_B:kv_self.V_A;
+    #endif
+    ctx->model.kv_self.n = n_maxkv;
+    return true;
 }
 
 static bool llama_load_session_file_internal(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
@@ -4516,7 +4595,7 @@ static bool llama_load_session_file_internal(struct falcon_context * ctx, const 
     return true;
 }
 
-bool llama_load_session_file(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+bool falcon_load_session_file(struct falcon_context * ctx, const char * path_session, falcon_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     try {
         return llama_load_session_file_internal(ctx, path_session, tokens_out, n_token_capacity, n_token_count_out);
     } catch (const std::exception & err) {
@@ -4525,7 +4604,7 @@ bool llama_load_session_file(struct falcon_context * ctx, const char * path_sess
     }
 }
 
-bool llama_save_session_file(struct falcon_context * ctx, const char * path_session, const falcon_token * tokens, size_t n_token_count) {
+bool falcon_save_session_file(struct falcon_context * ctx, const char * path_session, const falcon_token * tokens, size_t n_token_count) {
     llama_file file(path_session, "wb");
 
     file.write_u32(LLAMA_SESSION_MAGIC);

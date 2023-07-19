@@ -4,8 +4,8 @@ project("ggllm.cpp" C CXX)
 add_definitions(-DGGML_PERF=1) # use "--debug-timings 1-3" to enable timing output
 
 if(WIN32)
-    include_directories("C:/program files/NVIDIA GPU Computing Toolkit/CUDA/v12.0/include")
-    include_directories("C:/program files/NVIDIA GPU Computing Toolkit/CUDA/v12.0/lib/x64")
+    include_directories("C:/program files/NVIDIA GPU Computing Toolkit/CUDA/v12.2/include")
+    include_directories("C:/program files/NVIDIA GPU Computing Toolkit/CUDA/v12.2/lib/x64")
 else()
     include_directories("/usr/local/cuda/include")
 endif()
@@ -466,7 +466,9 @@ add_library(ggml OBJECT
             ${GGML_SOURCES_METAL}
             ${GGML_SOURCES_EXTRA}
             )
-
+if (LLAMA_CUBLAS)
+    target_compile_options(ggml PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
+endif()
 target_include_directories(ggml PUBLIC . ${LLAMA_EXTRA_INCLUDES})
 target_compile_features(ggml PUBLIC c_std_11) # don't bump
 target_link_libraries(ggml PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
@@ -527,12 +529,12 @@ endif()
 
 if (GGML_SOURCES_CUDA)
     message(STATUS "GGML CUDA sources found, configuring CUDA architecture")
-    set_property(TARGET ggml  PROPERTY CUDA_ARCHITECTURES OFF)
+    # set_property(TARGET ggml  PROPERTY CUDA_ARCHITECTURES OFF)
+    set_property(TARGET ggml  PROPERTY CUDA_ARCHITECTURES  "52;61")
     set_property(TARGET ggml  PROPERTY CUDA_SELECT_NVCC_ARCH_FLAGS "Auto")
     set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES OFF)
     # falcon
     set_property(TARGET falcon  PROPERTY CUDA_ARCHITECTURES OFF)
-
 endif()
 
 
@@ -547,5 +549,4 @@ endif ()
 
 if (LLAMA_BUILD_EXAMPLES)
     add_subdirectory(examples)
-    add_subdirectory(pocs)
 endif()

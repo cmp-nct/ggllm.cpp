@@ -272,6 +272,7 @@ struct llama_context {
     // TODO: move in llama_state
     llama_ctx_buffer buf_compute;
     llama_ctx_buffer buf_scratch[LLAMA_MAX_SCRATCH_BUFFERS];
+    std::vector<uint8_t> buf_plan;
 
 #ifdef GGML_USE_METAL
     ggml_metal_context * ctx_metal = NULL;
@@ -1343,7 +1344,20 @@ static bool llama_model_load(
         return false;
     }
 }
+//
+// ggml helpers
+//
 
+static void ggml_graph_compute_w_plan(std::vector<uint8_t> & buf, ggml_cgraph * graph, int n_threads) {
+    struct ggml_cplan plan = ggml_graph_plan(graph, n_threads);
+
+    if (plan.work_size > 0) {
+        buf.resize(plan.work_size);
+        plan.work_data = buf.data();
+    }
+
+    ggml_graph_compute(graph, &plan);
+}
 // evaluate the transformer
 //
 //   - lctx:         llama context
@@ -1387,6 +1401,7 @@ static bool llama_eval_internal(
 
     auto & mem_per_token = lctx.mem_per_token;
     auto & buf_compute   = lctx.buf_compute;
+    
 
     struct ggml_init_params params = {
         /*.mem_size   =*/ buf_compute.size,
@@ -1399,7 +1414,7 @@ static bool llama_eval_internal(
     // for big prompts, if BLAS is enabled, it is better to use only one thread
     // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance
     ggml_cgraph gf = {};
-    gf.n_threads = N >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas() ? 1 : n_threads;
+    int threads = N >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_gpublas() ? 1 : n_threads;
 
     struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
     ggml_set_name(embd, "embd");
@@ -1703,7 +1718,7 @@ static bool llama_eval_internal(
         ggml_graph_compute(ctx0, &gf);
     }
 #else
-    ggml_graph_compute(ctx0, &gf);
+    ggml_graph_compute_w_plan(lctx.buf_plan, &gf, threads);
 #endif
 
     if (cgraph_fname) {
@@ -2346,10 +2361,10 @@ static void llama_convert_tensor_internal(const llama_load_tensor & tensor, llam
     }
     float * f32_output = (float *) output.addr;
 
-    quantize_fns_t qtype;
+    ggml_type_traits_t qtype;
     if (ggml_is_quantized(tensor.type)) {
-        qtype = ggml_internal_get_quantize_fn(tensor.type);
-        if (qtype.dequantize_row_q == NULL) {
+        qtype = ggml_internal_get_type_traits(tensor.type);
+        if (qtype.to_float == NULL) {
             throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(tensor.type)));
         }
     } else if (tensor.type != GGML_TYPE_F16) {
@@ -2360,7 +2375,7 @@ static void llama_convert_tensor_internal(const llama_load_tensor & tensor, llam
         if (tensor.type == GGML_TYPE_F16) {
             ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor.data, f32_output, nelements);
         } else if (ggml_is_quantized(tensor.type)) {
-            qtype.dequantize_row_q(tensor.data, f32_output, nelements);
+            qtype.to_float(tensor.data, f32_output, nelements);
         } else {
             LLAMA_ASSERT(false); // unreachable
         }
@@ -2385,7 +2400,7 @@ static void llama_convert_tensor_internal(const llama_load_tensor & tensor, llam
             if (typ == GGML_TYPE_F16) {
                 ggml_fp16_to_fp32_row((ggml_fp16_t *)inbuf, outbuf, nels);
             } else {
-                qtype.dequantize_row_q(inbuf, outbuf, nels);
+                qtype.to_float(inbuf, outbuf, nels);
             }
         };
         workers.push_back(std::thread(compute, tensor.type, tensor.data + in_buff_offs, f32_output + out_buff_offs, thr_elems));
@@ -2397,7 +2412,6 @@ static void llama_convert_tensor_internal(const llama_load_tensor & tensor, llam
     }
 
 }
-
 static void llama_model_quantize_internal(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
     ggml_type quantized_type;
     llama_ftype ftype = params->ftype;
@@ -2827,7 +2841,7 @@ int llama_apply_lora_from_file_internal(struct llama_context * ctx, const char *
             model_loader->mapping.reset(new llama_mmap(&model_loader->file_loaders.at(0)->file, /* prefetch */ 0));
         }
     }
-
+ std::vector<uint8_t> work_buffer;
     // read tensors and apply
     bool warned = false;
     int n_tensors = 0;
@@ -2961,8 +2975,8 @@ int llama_apply_lora_from_file_internal(struct llama_context * ctx, const char *
             }
 
             struct ggml_cgraph gf = ggml_build_forward(r);
-            gf.n_threads = n_threads;
-            ggml_graph_compute(lora_ctx, &gf);
+
+            ggml_graph_compute_w_plan(work_buffer, &gf,n_threads);
 
             // we won't need these tensors again, reset the context to save memory
             ggml_free(lora_ctx);
@@ -3108,7 +3122,6 @@ size_t llama_copy_state_data(struct llama_context * ctx, uint8_t * dst) {
 
             ggml_context * cpy_ctx = ggml_init({ sizeof(buffer), buffer, /* no_alloc */ true });
             ggml_cgraph gf{};
-            gf.n_threads = 1;
 
             ggml_tensor * kout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_embd, kv_ntok, n_layer);
             kout3d->data = out;
@@ -3128,7 +3141,7 @@ size_t llama_copy_state_data(struct llama_context * ctx, uint8_t * dst) {
 
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, k3d, kout3d));
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, v3d, vout3d));
-            ggml_graph_compute(cpy_ctx, &gf);
+            ggml_graph_compute_w_plan(ctx->buf_plan, &gf,1);
 
             ggml_free(cpy_ctx);
         }
@@ -3216,7 +3229,6 @@ size_t llama_set_state_data(struct llama_context * ctx, uint8_t * src) {
 
             ggml_context * cpy_ctx = ggml_init({ sizeof(buffer), buffer, /* no_alloc */ true });
             ggml_cgraph gf{};
-            gf.n_threads = 1;
 
             ggml_tensor * kin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.k->type, n_embd, kv_ntok, n_layer);
             kin3d->data = (void *) inp;
@@ -3236,7 +3248,7 @@ size_t llama_set_state_data(struct llama_context * ctx, uint8_t * src) {
 
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, kin3d, k3d));
             ggml_build_forward_expand(&gf, ggml_cpy(cpy_ctx, vin3d, v3d));
-            ggml_graph_compute(cpy_ctx, &gf);
+            ggml_graph_compute_w_plan(ctx->buf_plan, &gf,1);
 
             ggml_free(cpy_ctx);
         }

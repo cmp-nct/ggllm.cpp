@@ -154,7 +154,7 @@ ifdef LLAMA_CUBLAS
 	LDFLAGS   += -lcublas -lculibos -lcudart -lcublasLt -lpthread -ldl -lrt -L/usr/local/cuda/lib64 -L/opt/cuda/lib64 -L$(CUDA_PATH)/targets/x86_64-linux/lib
 	OBJS      += ggml-cuda.o
 	NVCC      = nvcc
-	NVCCFLAGS = --forward-unknown-to-host-compiler -arch=native
+	NVCCFLAGS = --forward-unknown-to-host-compiler -arch=native -use_fast_math
 ifdef LLAMA_CUDA_DMMV_X
 	NVCCFLAGS += -DGGML_CUDA_DMMV_X=$(LLAMA_CUDA_DMMV_X)
 else
@@ -337,9 +337,6 @@ build-info.h: $(wildcard .git/index) scripts/build-info.sh
 benchmark-matmult: examples/benchmark/benchmark-matmult.cpp build-info.h ggml.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 	./$@
-
-vdot: pocs/vdot/vdot.cpp ggml.o $(OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 .PHONY: tests clean
 tests:

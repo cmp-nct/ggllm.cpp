@@ -91,6 +91,7 @@ struct gpt_params {
     bool export_cgraph     = false; // export the computation graph
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool sampling_not_default = false; // readonly, true if any sampling change is requested
+    bool kvmem_not_default = false; // readonly
     int debug_timings      = 0;     // print timings (required for GGML_PERF=1)
 };
 
