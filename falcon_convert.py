@@ -108,7 +108,15 @@ byte_decoder = {v:k for k, v in byte_encoder.items()}
 
 for i in range(hparams["vocab_size"]):
     if i in reverse_vocab:
-        text = bytearray([byte_decoder[c] for c in reverse_vocab[i]])
+        try:
+            text = bytearray([byte_decoder[c] for c in reverse_vocab[i]])
+        except KeyError:
+            text = bytearray()
+            for c in reverse_vocab[i]:
+                if ord(c) < 256:  # single byte character
+                    text.append(byte_decoder[ord(c)])
+                else:  # multibyte special token character
+                    text.extend(c.encode('utf-8'))
     else:
         print(f"Key {i} not in tokenizer vocabulary. Padding with an arbitrary token.")
         padding_token = f"[PAD{i}]".encode("utf8")
