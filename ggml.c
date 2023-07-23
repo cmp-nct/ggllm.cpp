@@ -18051,6 +18051,8 @@ void ggml_graph_print_impl(const struct ggml_cgraph * cgraph, bool print_nodes, 
                 else
                 if (node->meta.cuda_perf_mal_mul_type < 16)
                     strcat(str_device_info, "xXQ"); // quantized multiplication
+                if (node->meta.cuda_perf_mal_mul_type == 84)
+                    strcat(str_device_info, "xcuBl8e4"); // cuBLAS 16-bit
                 if (node->meta.cuda_perf_mal_mul_type == 16)
                     strcat(str_device_info, "xcuBl16"); // cuBLAS 16-bit
                 if (node->meta.cuda_perf_mal_mul_type == 32)

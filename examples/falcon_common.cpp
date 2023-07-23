@@ -566,102 +566,188 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
 }
 
 void gpt_print_usage(int /*argc*/, char ** argv, const gpt_params & params) {
-    fprintf(stderr, "usage: %s [options]\n", argv[0]);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "options:\n");
-    fprintf(stderr, "  -h, --help            show this help message and exit\n");
-    fprintf(stderr, "  -i, --interactive, -ins \n");
-    fprintf(stderr, "                        run in interactive chat mode\n");
-    fprintf(stderr, "  --interactive-first   wait for user input after prompt ingestion\n");
-    // fprintf(stderr, "  -ins, --instruct      run in instruction mode (use with Alpaca models)\n");
-    fprintf(stderr, "  -a,--alias,--finetune Set model name alias and optionally force fine-tune type (or disable it)\n");
-    fprintf(stderr, "                        Finetune options: wizard, falcon-ins, open-assistant, alpaca, none\n");
-    fprintf(stderr, "                        Use if finetune autodetection does not or wrongly recognizes your model or filename\n");
-    fprintf(stderr, "  -sys, --system  <>    prefix the entire prompt with the system prompt text\n");
-    fprintf(stderr, "  -sysraw, --system-raw treat the system prompt raw (do not add syntax)\n");
-    // fprintf(stderr, "  --sys_prompt_simple    trust the model to follow the system prompt instead of using evaluated sampling adaption\n");
-    fprintf(stderr, "  -enc, --enclose       enclose the prompt in fine-tune optimal syntax\n");
-    fprintf(stderr, "                        This automatically chooses the correct syntax to write around your prompt.\n");
-    fprintf(stderr, "  --multiline-input     allows you to write or paste multiple lines without ending each in '\\'\n");
-    // fprintf(stderr, "  -r PROMPT, --reverse-prompt PROMPT\n");
-    // fprintf(stderr, "                        halt generation at PROMPT, return control in interactive mode\n");
-    // fprintf(stderr, "                        (can be specified more than once for multiple prompts).\n");
-    fprintf(stderr, "  --color               colorise output to distinguish prompt and user input from generations\n");
-    fprintf(stderr, "  -s SEED, --seed SEED  RNG seed (default: -1, use random seed for < 0)\n");
-    fprintf(stderr, "  -t N, --threads N     number of threads to use during computation (default: %d)\n", params.n_threads);
-    fprintf(stderr, "  -p PROMPT, --prompt PROMPT\n");
-    fprintf(stderr, "                        prompt to start generation with (default: empty)\n");
-    fprintf(stderr, "                        you can use multiple -p to append them, also in combination with -f\n");
-    fprintf(stderr, "  -S, --stopwords \",,,\" Add stopwords in addition to the usual end-of-sequence\n");
-    fprintf(stderr, "                        comma separated list: -S \"\\n,Hello World,stopword\" - overwrites defaults except eos\n");
-    fprintf(stderr, "                        Important: 'is' and ' is' are unique tokens in a stopword. Just as 'Hello' and ' Hello' are distinct\n");
-    fprintf(stderr, "  -e                    process escapes sequences in prompt and system message (\\n, \\r, \\t, \\', \\\", \\\\)\n");
-    fprintf(stderr, "  --prompt-cache FNAME  file to cache prompt state for faster startup (default: none)\n");
-    fprintf(stderr, "  --prompt-cache-all    if specified, saves user input and generations to cache as well.\n");
-    fprintf(stderr, "                        not supported with --interactive or other interactive options\n");
-    fprintf(stderr, "  --prompt-cache-ro     if specified, uses the prompt cache but does not update it.\n");
-    fprintf(stderr, "  --random-prompt       start with a randomized prompt.\n");
-    fprintf(stderr, "  --in-prefix STRING    string to prefix user inputs with (default: empty)\n");
-    fprintf(stderr, "  --in-suffix STRING    string to suffix after user inputs with (default: empty)\n");
-    fprintf(stderr, "  -f FNAME, --file FNAME\n");
-    fprintf(stderr, "                        read prompt from a file, optionally -p prompt is prefixed\n");
-    fprintf(stderr, "  -sysf FNAME, --system-file FNAME\n");
-    fprintf(stderr, "                        read system prompt from a file\n");
-    fprintf(stderr, "  -n N, --n-predict N   number of tokens to predict (default: %d, -1 = infinity)\n", params.n_predict);
-    fprintf(stderr, "  --top-k N             top-k sampling (default: %d, 0 = disabled)\n", params.top_k);
-    fprintf(stderr, "  --top-p N             top-p sampling (default: %.1f, 1.0 = disabled)\n", (double)params.top_p);
-    fprintf(stderr, "  --tfs N               tail free sampling, parameter z (default: %.1f, 1.0 = disabled)\n", (double)params.tfs_z);
-    fprintf(stderr, "  --typical N           locally typical sampling, parameter p (default: %.1f, 1.0 = disabled)\n", (double)params.typical_p);
-    fprintf(stderr, "  --repeat-last-n N     last n tokens to consider for penalize (default: %d, 0 = disabled, -1 = ctx_size)\n", params.repeat_last_n);
-    fprintf(stderr, "  --repeat-penalty N    penalize repeat sequence of tokens (default: %.1f, 1.0 = disabled)\n", (double)params.repeat_penalty);
-    fprintf(stderr, "  --presence-penalty N  repeat alpha presence penalty (default: %.1f, 0.0 = disabled)\n", (double)params.presence_penalty);
-    fprintf(stderr, "  --frequency-penalty N repeat alpha frequency penalty (default: %.1f, 0.0 = disabled)\n", (double)params.frequency_penalty);
-    fprintf(stderr, "  --mirostat N          use Mirostat sampling.\n");
-    fprintf(stderr, "                        Top K, Nucleus, Tail Free and Locally Typical samplers are ignored if used.\n");
-    fprintf(stderr, "                        (default: %d, 0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0)\n", params.mirostat);
-    fprintf(stderr, "  --mirostat-lr N       Mirostat learning rate, parameter eta (default: %.1f)\n", (double)params.mirostat_eta);
-    fprintf(stderr, "  --mirostat-ent N      Mirostat target entropy, parameter tau (default: %.1f)\n", (double)params.mirostat_tau);
-    fprintf(stderr, "  -l TOKEN_ID(+/-)BIAS, --logit-bias TOKEN_ID(+/-)BIAS\n");
-    fprintf(stderr, "                        modifies the likelihood of token appearing in the completion,\n");
-    fprintf(stderr, "                        i.e. `--logit-bias 15043+1` to increase likelihood of token ' Hello',\n");
-    fprintf(stderr, "                        or `--logit-bias 15043-1` to decrease likelihood of token ' Hello'\n");
-    fprintf(stderr, "  -c N, --ctx-size N    size of the prompt context (default: %d)\n", params.n_ctx);
-    fprintf(stderr, "  --ignore-eos          ignore end of stream token and continue generating (implies --logit-bias 2-inf)\n");
-    fprintf(stderr, "  --no-penalize-nl      do not penalize newline token\n");
-    fprintf(stderr, "  --memory-f16          force f16 kv mem instead of f32 for memory key+value (default: adaptive)\n");
-    fprintf(stderr, "  --memory-f32          force f32 kv mem (default: adaptive)\n");
-    fprintf(stderr, "  --temp N              temperature (default: %.1f)\n", (double)params.temp);
-    fprintf(stderr, "  -b N, --batch-size N  batch size for prompt processing (default: %d)\n", params.n_batch);
-    fprintf(stderr, "  --perplexity          compute perplexity over the prompt\n");
-    fprintf(stderr, "  --keep                number of tokens to keep from the initial prompt (default: %d, -1 = all)\n", params.n_keep);
+    fprintf(stdout, "Usage: %s [-option ARGUMENT] ...\n", argv[0]);
+    fprintf(stdout, R"(
+
+Options:
+
+-h, --help            show this help message and exit
+
+
+Examples:
+---------
+Quick start with practice
+
+  The most basic invocations with a given model are:
+  (Examples assume a model with given name residing in the same directory as falcon-main)
+
+)");
+    fprintf(stdout, " >> %s -m falcon-7b-instruct.ggccv1.q4_0.bin --random-prompt\n", argv[0]);
+    fprintf(stdout, "  This will start %s with a random prompt on given model and generate according output.\n", argv[0]);
+    fprintf(stdout, "  => Loading Models, Prompt Options\n\n");
+
+    fprintf(stdout, " >> %s -m falcon-7b-instruct.ggccv1.q4_0.bin -p \"the meaning of life is\"\n", argv[0]);
+    fprintf(stdout, "  will start falcon-main with the given prompt.\n\n");
+
+    fprintf(stdout, "  It is recommended to use the -enc option with prompts, as falcon model have certain expectations\n");
+    fprintf(stdout, "  on the format of prompts in order to respond in a useful manner. The -enc option provides a\n");
+    fprintf(stdout, "  fine-tuned syntax automatically. If automatic finetuning fails, have a look at --alias option.\n");
+    fprintf(stdout, "  => Prompt Options\n\n");
+
+
+    fprintf(stdout, "  To create a chat-like experience, use interaction options as:\n");
+
+    fprintf(stdout, " >> %s -m falcon-7b-instruct.ggccv1.q4_0.bin -ins -enc --color\n", argv[0]);
+    fprintf(stdout, "  -enc is added as suggested, as well as --color, which will start the program with colorful\n");
+    fprintf(stdout, "  output to distinguish initial prompts, user prompts and generated output.\n");
+    fprintf(stdout, "  => Interaction Options, Context Options, Generation flags\n\n");
+
+
+    fprintf(stdout, "Loading Models:\n");
+    fprintf(stdout, "---------------\n");
+    fprintf(stdout, "This software is specifically designed to run Falcon LLM derivatives in GGML format\n\n");
+
+    fprintf(stdout, "-m,     --model FNAME       model path (default: %s)", params.model.c_str());
+    fprintf(stdout, R"(
+                            If there is a model with the exact name under the specified relative path,
+                            it will be loaded automatically if no other is specified.
+        --lora FNAME        apply LoRA adapter (implies --no-mmap)
+        --lora-base FNAME   optional model to use as a base for the layers modified by the LoRA adapter
+
+
+Prompt Options:
+---------------
+Options for providing or manipulating prompts
+
+Use -p, -f, -sys, and -sysf options to add multiple prompts.
+System prompts are inserted first, followed by regular prompts
+
+-p,     --prompt PROMPT     prompt to start generation with (default: empty)
+                            -p options can be used multiple times to stack prompts, also in combination with -f
+-sys,   --system PROMPT     prefix the entire prompt with the system prompt text
+-sysraw,--system-raw        treat the system prompt raw (do not add syntax)
+-r,     --reverse-prompt PROMPT (deprecated - use --stopwords instead)
+                            halt generation at PROMPT, return control in interactive mode
+                            (can be specified more than once for multiple prompts).
+-S,     --stopwords ",,,"   Add stopwords in addition to the usual end-of-sequence
+                            comma separated list: -S "\n,Hello World,stopword" - overwrites defaults except eos
+                            Note: 'is' and ' is' are unique tokens in a stopword, Just as 'Hello' and ' Hello'
+-e                          process escape sequences in prompt and system message (\n, \r, \t, \', \", \\)
+        --prompt-cache FNAME file to cache prompt state for faster startup (default: none)
+        --prompt-cache-all   if specified, saves user input and generations to cache as well.
+                            not supported with --interactive or other interactive options
+        --prompt-cache-ro   if specified, uses the prompt cache but does not update it.
+        --random-prompt     start with a randomized prompt.
+        --in-prefix STRING  string to prefix user inputs with (default: empty)
+        --in-suffix STRING  string to suffix after user inputs with (default: empty)
+-f,     --file FNAME        read prompt from a file, optionally -p prompt is prefixed
+-sysf,  --system-file FNAME
+                            read system prompt from a file
+-enc,   --enclose           enclose the prompt in fine-tune optimal syntax
+                            This automatically chooses the correct syntax to write around a prompt
+-a,     --alias,--finetune ALIAS
+                            Set model name alias and optionally force fine-tune type (or disable it)
+                            Finetune options: wizard, falcon-ins, open-assistant, alpaca, none
+                            Use if finetune autodetection does not or wrongly recognize a model or filename
+        --color             colorise output to distinguish prompt and user input from generations
+
+
+Interaction options:
+--------------------
+Permits chatting with Falcon models
+
+Currently --ins is the reommended interactive option with Falcon models, combined with -enc
+
+-i,     --interactive, -ins run in interactive chat mode
+        --interactive-first wait for user input after prompt ingestion
+        --multiline-input   allows to write or paste multiple lines without ending each in '\'
+
+
+Context options:
+----------------
+Falcon works quite well with large context sizes of e.g. 8k, 16k or even more
+
+Although Falcon models have been trained on a limited context size of 2048 tokens you may confidently
+use way larger context sizes (at cost of memory consumption and speed) for inference, resulting in a
+much better quality in long conversations
+)");
+    fprintf(stdout, "-c,     --ctx-size N        size of the prompt context (default: %d)\n", params.n_ctx);
+    fprintf(stdout, "        --keep N            number of tokens to keep from the initial prompt (default: %d, -1 = all)\n", params.n_keep);
+    fprintf(stdout, R"(
+
+Generation flags:
+-----------------
+These options allow to control and fine-tune the text generation process 
+
+)");
+
+    fprintf(stdout, "        --temp N            temperature (default: %.1f)", (double)params.temp);
+    fprintf(stdout, R"(
+                            Higher values (e.g., 1.5) make the output more random and creative, 
+                            lower values (e.g., 0.5) makes it more focused, deterministic, conservative.
+-n,     --n-predict N       number of tokens to predict (default: -1, -1 = infinity)
+-s,     --seed SEED         RNG seed (default: -1, use random seed for < 0)
+)");
+
+
+    fprintf(stdout, "        --top-k N           top-k sampling (default: %d, 0 = disabled)\n", params.top_k);
+    fprintf(stdout, "        --top-p N           top-p sampling (default: %.1f, 1.0 = disabled)\n", (double)params.top_p);
+    fprintf(stdout, "        --tfs N             tail free sampling, parameter z (default: %.1f, 1.0 = disabled)\n", (double)params.tfs_z);
+    fprintf(stdout, "        --typical N         locally typical sampling, parameter p (default: %.1f, 1.0 = disabled)\n", (double)params.typical_p);
+    fprintf(stdout, "        --repeat-last-n N   last n tokens to consider for penalize (default: %d, 0 = disabled, -1 = ctx_size)\n", params.repeat_last_n);
+    fprintf(stdout, "        --repeat-penalty N  penalize repeat sequence of tokens (default: %.1f, 1.0 = disabled)\n", (double)params.repeat_penalty);
+    fprintf(stdout, "        --presence-penalty N  repeat alpha presence penalty (default: %.1f, 0.0 = disabled)\n", (double)params.presence_penalty);
+    fprintf(stdout, "        --frequency-penalty N repeat alpha frequency penalty (default: %.1f, 0.0 = disabled)\n", (double)params.frequency_penalty);
+    fprintf(stdout, "        --mirostat N        use Mirostat sampling.\n");
+    fprintf(stdout, "                            Top K, Nucleus, Tail Free and Locally Typical samplers are ignored if used.\n");
+    fprintf(stdout, "                            (default: %d, 0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0)\n", params.mirostat);
+    fprintf(stdout, "        --mirostat-lr N     Mirostat learning rate, parameter eta (default: %.1f)\n", (double)params.mirostat_eta);
+    fprintf(stdout, "        --mirostat-ent N    Mirostat target entropy, parameter tau (default: %.1f)\n", (double)params.mirostat_tau);
+    fprintf(stdout, "-l,     --logit-bias TOKEN_ID(+/-)BIAS\n");
+    fprintf(stdout, "                            modifies the likelihood of token appearing in the completion,\n");
+    fprintf(stdout, "                            i.e. `--logit-bias 15043+1` to increase likelihood of token ' Hello',\n");
+    fprintf(stdout, "                            or `--logit-bias 15043-1` to decrease likelihood of token ' Hello'\n");
+    fprintf(stdout, "-c,     --ctx-size N        size of the prompt context (default: %d)\n", params.n_ctx);
+    fprintf(stdout, "        --ignore-eos        ignore end of stream token and continue generating (implies --logit-bias 2-inf)\n");
+    fprintf(stdout, "        --no-penalize-nl    do not penalize newline token\n\n\n");
+
+    fprintf(stdout, "Performance options:\n");
+    fprintf(stdout, "--------------------\n");
+    fprintf(stdout, "Most default setings should already be optimal. Be careful.\n\n");
+
+
+    fprintf(stdout, "-t,     --threads N         number of threads to use during computation (default: %d)\n", params.n_threads);
+    fprintf(stdout, "        --memory-f32        use f32 instead of f16 for memory key+value (default: disabled)\n");
+    fprintf(stdout, "                            not recommended: doubles context memory required and no measurable increase in quality\n");
+    fprintf(stdout, "-b,     --batch-size N      batch size for prompt processing (default: %d)\n", params.n_batch);
+    fprintf(stdout, "        --perplexity        compute perplexity over the prompt\n");
     if (llama_mlock_supported()) {
-        fprintf(stderr, "  --mlock               force system to keep model in RAM rather than swapping or compressing\n");
+        fprintf(stdout, "        --mlock             force system to keep model in RAM rather than swapping or compressing\n");
     }
     if (llama_mmap_supported()) {
-        fprintf(stderr, "  --no-mmap             Do not memory-map model (slower load but may reduce pageouts if not using mlock)\n");
+        fprintf(stdout, "        --no-mmap           Do not memory-map model (slower load but may reduce pageouts if not using mlock)\n");
     }
 #ifdef LLAMA_SUPPORTS_GPU_OFFLOAD
-    fprintf(stderr, "  -ngl N, --n-gpu-layers N\n");
-    fprintf(stderr, "                        number of layers to store in VRAM, default is to fill VRAM \n");
-    fprintf(stderr, "  -ts SPLIT --tensor-split SPLIT\n");
-    fprintf(stderr, "                        how to split tensors across multiple GPUs, comma-separated list of proportions, e.g. 3,1\n");
-    fprintf(stderr, "  -mg i, --main-gpu i   the GPU to use for scratch and small tensors (0 = first)\n" );
-    fprintf(stderr, "  --override-max-gpu N\n");
-    fprintf(stderr, "                        limits the number of GPUs visible (allows to disable multi/single GPU processing)\n");
-    fprintf(stderr, "  --gpu-reserve-mb-main override reserved total VRAM MB (can be negative if your driver supports swapping into RAM) \n");
-    //fprintf(stderr, "  --gpu_reserve_mb_other override reserved VRAM MB for other GPUs (for multi GPU systems)\n");
+    fprintf(stdout, "-ngl,       --n-gpu-layers N\n");
+    fprintf(stdout, "                            number of layers to store in VRAM, default is to fill VRAM \n");
+    fprintf(stdout, "-ts,        --tensor-split SPLIT\n");
+    fprintf(stdout, "                            how to split tensors across multiple GPUs, comma-separated list of proportions, e.g. 3,1\n");
+    fprintf(stdout, "-mg,        --main-gpu N    the GPU to use for scratch and small tensors (0 = first)\n" );
+    fprintf(stdout, "    --override-max-gpu N    limits the number of GPUs visible (allows to disable multi/single GPU processing)\n");
+    fprintf(stdout, "    --gpu-reserve-mb-main N override reserved total VRAM MB (can be negative if driver supports swapping into RAM) \n\n\n");
+    //fprintf(stdout, "  --gpu_reserve_mb_other override reserved VRAM MB for other GPUs (for multi GPU systems)\n");
 #endif
-    fprintf(stderr, "  --mtest               compute maximum memory usage\n");
-    fprintf(stderr, "  --export              export the computation graph to 'llama.ggml'\n");
-    fprintf(stderr, "  --verbose-prompt      print prompt before generation\n");
-    fprintf(stderr, "  -dt, --debug-timings  print GGML_PERF debug output (requires GGML_PERF=1 for timings)\n");
-    fprintf(stderr, "                        1 = print first layer, 2 = print first and last layer, 3+ = all layers\n");
-    fprintf(stderr, "  --lora FNAME          apply LoRA adapter (implies --no-mmap)\n");
-    fprintf(stderr, "  --lora-base FNAME     optional model to use as a base for the layers modified by the LoRA adapter\n");
-    fprintf(stderr, "  -m FNAME, --model FNAME\n");
-    fprintf(stderr, "                        model path (default: %s)\n", params.model.c_str());
-    fprintf(stderr, "\n");
+    fprintf(stdout, "Monitoring options:\n");
+    fprintf(stdout, "-------------------\n");
+    fprintf(stdout, "Options for monitoring, control, debugging\n\n");
+    fprintf(stdout, "        --mtest             compute maximum memory usage\n");
+    fprintf(stdout, "        --export            export the computation graph to 'llama.ggml'\n");
+    fprintf(stdout, "        --verbose-prompt    print prompt before generation\n");
+    fprintf(stdout, "-dt,    --debug-timings N   print GGML_PERF debug output (requires GGML_PERF=1 for timings)\n");
+    fprintf(stdout, "                            1 = print first layer, 2 = print first and last layer, 3+ = all layers\n");
+    fprintf(stdout, "\n");
 }
+
 
 std::string gpt_random_prompt(std::mt19937 & rng) {
     const int r = rng() % 10;

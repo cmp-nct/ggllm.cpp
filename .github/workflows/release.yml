@@ -316,7 +316,8 @@ jobs:
             ggllm-falcon-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-bin-win-${{ matrix.build }}-cu${{ matrix.cuda }}-x64.zip
 
       - name: Copy and pack Cuda runtime
-        if: ${{ matrix.cuda == '12.1.0' }}
+      # if any 12.* variant:
+        if: ${{ matrix.cuda == '12.1.0' || matrix.cuda == '12.2.0' }}
         # TODO(green-sky): paths are cuda 12 specific
         run: |
           echo "Cuda install location: ${{steps.cuda-toolkit.outputs.CUDA_PATH}}"

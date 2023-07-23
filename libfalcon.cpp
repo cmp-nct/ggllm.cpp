@@ -1386,12 +1386,14 @@ static bool kv_cache_init(
     (void) n_gpu_layers;
 #ifdef GGML_USE_CUBLAS
 // TODO : gpu kv offloading not implemented
+#if 0
     if (n_gpu_layers > n_layer + 1) {
         ggml_cuda_assign_buffers_no_scratch(cache.k);
         ggml_cuda_assign_buffers_no_scratch(cache.v);
         ggml_cuda_assign_buffers_no_scratch(cache.v_a);
         ggml_cuda_assign_buffers_no_scratch(cache.v_b);
     }
+#endif
 #endif // GGML_USE_CUBLAS
 
     return true;
@@ -1517,8 +1519,9 @@ t_finetune_type falcon_detect_finetune(falcon_context * ctx, std::string model_p
             return FINETUNE_OPENASSISTANT;
         }
     }
-    if (ctx->vocab.id_to_token.size() == 70144)
+    if (ctx->vocab.id_to_token.size() == 70144 || ctx->vocab.id_to_token.size() == 70656)
     {
+        // todo: best to do a token match instead
         return FINETUNE_OPENBUDDY;
     }
     if (model_lower.find("wizard") != std::string::npos) {
@@ -2066,6 +2069,17 @@ static bool falcon_eval_internal(
 
     struct ggml_context * ctx0 = ggml_init(params);
     ggml_tensor_default_meta_change()->cuda_op_force = CUDA_OPT_OP_FORCE_CPU; // we default to CPU for all operations
+    #ifdef GGML_USE_CUBLAS
+
+    if (ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major >8 || ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major ==8 && ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].minor >=9)
+        ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_8E4;
+    else if (ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major >6 || ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major ==6 && ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].minor >=1)
+        ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_F16;
+
+    #endif
+    ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_8E4;
+    //  ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_F16;
+
 
     // for big prompts, if BLAS is enabled, it is better to use only one thread
     // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance

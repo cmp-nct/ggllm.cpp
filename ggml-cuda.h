@@ -26,7 +26,17 @@ typedef struct {
 
 } GPUStatus;
 
-
+typedef  unsigned char __fp8e4;
+typedef  unsigned char __fp8e5;
+/*void ggllm_lggemm(cublasHandle_t handle, 
+                       cublasOperation_t transa,  cublasOperation_t transb, 
+                       int m, int n, int k,
+                       const void *alpha, 
+                       const void *A, cudaDataType_t Atype, int lda,
+                       const void *B, cudaDataType_t Btype, int ldb,
+                       const void *beta, 
+                       void *D, cudaDataType_t Dtype, int ldc,
+                       cublasComputeType_t computeType, cublasGemmAlgo_t algo,cudaStream_t stream);*/
 
 const GPUStatus* ggml_cuda_get_system_gpu_status(void);
 

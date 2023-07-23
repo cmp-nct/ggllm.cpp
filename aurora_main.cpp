@@ -7,7 +7,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-#include "cmpnct_cuda_122.h"
+// #include "cmpnct_cuda_122.h"
 #include "falcon_common.h"
 #include "libfalcon.h"
 #include "build-info.h"
@@ -55,11 +55,9 @@ void sigint_handler(int signo) {
 }
 #endif
 
-
-
 int main(int argc, char ** argv) {
-    printf("TESTING:\n");
-    cublas_test(nullptr,CUBLAS_OP_T,CUBLAS_OP_N,64,64,64,nullptr,nullptr,CUDA_R_8F_E4M3,64,nullptr,CUDA_R_8F_E4M3,64,nullptr,nullptr,CUDA_R_32F,64,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_ALGO0_TENSOR_OP,0);
+    // cublas_test(nullptr,CUBLAS_OP_T,CUBLAS_OP_N,64,64,64,nullptr,nullptr,CUDA_R_8F_E4M3,64,nullptr,CUDA_R_8F_E4M3,64,nullptr,nullptr,CUDA_R_32F,64,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_ALGO0_TENSOR_OP,0);
+    // ggllm_lggemm(nullptr,CUBLAS_OP_T,CUBLAS_OP_N,64,64,64,nullptr,nullptr,CUDA_R_8F_E4M3,64,nullptr,CUDA_R_8F_E4M3,64,nullptr,nullptr,CUDA_R_32F,64,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_ALGO0_TENSOR_OP,0);
     #if defined(_WIN32)
     SetConsoleOutputCP(CP_UTF8);
     int wargc;

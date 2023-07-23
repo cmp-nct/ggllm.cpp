@@ -245,6 +245,13 @@ if (LLAMA_CUBLAS)
 
         set(GGML_SOURCES_CUDA ggml-cuda.cu ggml-cuda.h)
 
+        set(CUDART_LIBRARY cudart)
+        set(CUBLASLT_LIBRARY cublasLt)
+        if(NOT WIN32)
+            find_library(CUDART_LIBRARY cudart ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+            find_library(CUBLASLT_LIBRARY cublasLt ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+        endif() 
+
         add_compile_definitions(GGML_USE_CUBLAS)
         add_compile_definitions(GGML_CUDA_DMMV_X=${LLAMA_CUDA_DMMV_X})
         add_compile_definitions(GGML_CUDA_DMMV_Y=${LLAMA_CUDA_DMMV_Y})
@@ -254,6 +261,11 @@ if (LLAMA_CUBLAS)
             set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
         else()
             set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} CUDA::cudart CUDA::cublas CUDA::cublasLt)
+        endif()
+        if (FALCON_NO_FP8)
+            set(CMAKE_CUDA_ARCHITECTURES "60;61")
+        else()
+            set(CMAKE_CUDA_ARCHITECTURES "61;86;89") # 86 = rtx30 ; 89 = rtx 40 fp8
         endif()
 
     else()
@@ -457,7 +469,11 @@ endif()
 #
 # Build libraries
 #
-
+# add_library(cmpnct_cuda_122 OBJECT
+#     cmpnct_cuda_122.cu
+#     ${CUDART_LIBRARY}
+#     ${CUBLASLT_LIBRARY}
+# )
 add_library(ggml OBJECT
             ggml.c
             ggml.h
@@ -467,11 +483,12 @@ add_library(ggml OBJECT
             ${GGML_SOURCES_EXTRA}
             )
 if (LLAMA_CUBLAS)
-    target_compile_options(ggml PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
+    # target_compile_options(ggml PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
 endif()
 target_include_directories(ggml PUBLIC . ${LLAMA_EXTRA_INCLUDES})
 target_compile_features(ggml PUBLIC c_std_11) # don't bump
-target_link_libraries(ggml PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
+target_link_libraries(ggml PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS} )
+
 
 add_library(ggml_static STATIC $<TARGET_OBJECTS:ggml>)
 if (BUILD_SHARED_LIBS)
@@ -509,7 +526,28 @@ target_link_libraries(falcon PRIVATE
     ggml
     ${LLAMA_EXTRA_LIBS}
     )
-#
+
+# add_library(cmpnct_cuda_122 OBJECT
+#     cmpnct_cuda_122.cu
+#     cmpnct_cuda_122.h
+# )
+add_executable(aurora
+    aurora_main.cpp
+    # cmpnct_cuda_122.cu
+)
+target_link_libraries(aurora
+    # cmpnct_cuda_122
+    falcon_common falcon
+    ${LLAMA_EXTRA_LIBS}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+#  target_include_directories(cmpnct_test PRIVATE
+#      ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+#  )
+
+
+
+
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -528,13 +566,15 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 if (GGML_SOURCES_CUDA)
-    message(STATUS "GGML CUDA sources found, configuring CUDA architecture")
+    # message(STATUS "GGML CUDA sources found, configuring CUDA architecture")
     # set_property(TARGET ggml  PROPERTY CUDA_ARCHITECTURES OFF)
-    set_property(TARGET ggml  PROPERTY CUDA_ARCHITECTURES  "52;61")
-    set_property(TARGET ggml  PROPERTY CUDA_SELECT_NVCC_ARCH_FLAGS "Auto")
-    set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES OFF)
-    # falcon
-    set_property(TARGET falcon  PROPERTY CUDA_ARCHITECTURES OFF)
+    # set_property(TARGET ggml  PROPERTY CUDA_ARCHITECTURES  "52;61;90")
+    # set_property(TARGET ggml_static  PROPERTY CUDA_ARCHITECTURES  "52;61;90")
+    # set_property(TARGET ggml  PROPERTY CUDA_ARCHITECTURES  OFF)
+    # set_property(TARGET ggml_static  PROPERTY CUDA_ARCHITECTURES  "native")
+    # set_property(TARGET ggml  PROPERTY CUDA_SELECT_NVCC_ARCH_FLAGS "Auto")
+    # set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES OFF)
+    # set_property(TARGET falcon  PROPERTY CUDA_ARCHITECTURES OFF)
 endif()
 
 
