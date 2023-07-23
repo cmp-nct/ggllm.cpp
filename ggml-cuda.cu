@@ -10,6 +10,7 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cublasLt.h>
 
 #include "ggml-cuda.h"
 #include "ggml.h"
@@ -39,6 +40,15 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
         if (err_ != CUBLAS_STATUS_SUCCESS) {                                            \
             fprintf(stderr, "\ncuBLAS error %d at %s:%d: %s\n",                         \
                     err_, __FILE__, __LINE__, cublasGetStatusString(err_));             \
+            exit(1);                                                                    \
+        }                                                                               \
+    } while (0)
+#define CUBLASLT_CHECK(err)                                                               \
+    do {                                                                                \
+        cublasStatus_t err_ = (err);                                                    \
+        if (err_ != CUBLAS_STATUS_SUCCESS) {                                            \
+            fprintf(stderr, "\ncuBLAS error %d at %s:%d\n",                         \
+                    err_, __FILE__, __LINE__);             \
             exit(1);                                                                    \
         }                                                                               \
     } while (0)
@@ -92,6 +102,7 @@ static __device__ __forceinline__ int get_int_from_uint8_aligned(const uint8_t *
 typedef void (*dequantize_kernel_t)(const void * vx, const int ib, const int iqs, dfloat2 & v);
 typedef void (*to_fp32_cuda_t)(const void * __restrict__ x, float * __restrict__ y, int k, cudaStream_t stream);
 typedef void (*to_fp16_cuda_t)(const void * x, half * y, int k, cudaStream_t stream);
+typedef void (*to_fp8e4_cuda_t)(const void * x, __fp8e4 * y, int k, cudaStream_t stream);
 typedef void (*dot_kernel_k_t)(const void * __restrict__ vx, const int ib, const int iqs, const float * __restrict__ y, float & v);
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 typedef void (*ggml_cuda_func_t)(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
@@ -255,6 +266,7 @@ static_assert(sizeof(block_q6_K) == sizeof(ggml_fp16_t) + 13*QK_K/16, "wrong q6_
 
 #define WARP_SIZE 32
 #define MATRIX_ROW_PADDING 256 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
+#define MATRIX_SPLIT_DIVISIBLE 16 // tensor split row correction
 
 #define CUDA_ADD_BLOCK_SIZE 256
 #define CUDA_MUL_BLOCK_SIZE 256
@@ -288,7 +300,40 @@ static_assert(K_QUANTS_PER_ITERATION == 1 || K_QUANTS_PER_ITERATION == 2, "K_QUA
 struct ggml_tensor_extra_gpu {
     void * data_device[GGML_CUDA_MAX_DEVICES]; // 1 pointer for each device for split tensors
     cudaEvent_t events[GGML_CUDA_MAX_DEVICES]; // events for synchronizing multiple GPUs
+    int64_t row_low, row_high; // row range for split tensors
 };
+
+
+static __global__ void float_to_half(const float* src, __half* dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = __float2half(src[idx]);
+    }
+}
+// static inline __fp8e4 __float2fp8e4(float x) {
+//     return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+// }
+// static inline __fp8e5 __float2fp8e5(float x) {
+//     return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E5M2);
+// }
+// as a define:
+#define __FLOAT2FP8E4(x) __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3)
+#define __FLOAT2FP8E5(x) __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E5M2)
+//CUDA_R_8F_E4M3 - saturation to infinite instead of nan
+static __global__ void float_to_fp8e4(const float* src,  __fp8e4 * dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = __nv_cvt_float_to_fp8((src[idx]), __NV_SATFINITE, __NV_E4M3);
+    }
+}
+//CUDA_R_8F_E5M2 - saturation to infinite instead of nan
+/*static __global__ void float_to_fp8e5(const float* src,  __fp8e5 * dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = __nv_cvt_float_to_fp8((src[idx]), __NV_SATFINITE, __NV_E5M2);
+    }
+}*/
+
 
 static __global__ void add_f32(const float * x, const float * y, float * dst, const int kx, const int ky) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
@@ -733,14 +778,29 @@ static __device__ void dequantize_q4_0_f16(const void * __restrict__ vx, const i
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
     const half d = __float2half(x[ib].d);
+    const dfloat d_float = x[ib].d;
 
     const uint8_t vui = x[ib].qs[iqs];
 
     const int8_t vi0 = vui & 0xF;
     const int8_t vi1 = vui >> 4;
 
-    v0 = __float2half((vi0 - 8)*__half2float(d));
-    v1 = __float2half((vi1 - 8)*__half2float(d));
+    v0 = __float2half((vi0 - 8)*d_float);
+    v1 = __float2half((vi1 - 8)*d_float);
+}
+static __device__ void dequantize_q4_0_f8e4(const void * __restrict__ vx, const int ib, const int iqs, __fp8e4 & v0, __fp8e4 & v1){
+    const block_q4_0 * x = (const block_q4_0 *) vx;
+
+    const __fp8e4 d = __FLOAT2FP8E4(x[ib].d);
+    const dfloat d_float = x[ib].d;
+
+    const uint8_t vui = x[ib].qs[iqs];
+
+    const int8_t vi0 = vui & 0xF;
+    const int8_t vi1 = vui >> 4;
+
+    v0 = __FLOAT2FP8E4((vi0 - 8)*d_float);
+    v1 = __FLOAT2FP8E4((vi1 - 8)*d_float);
 }
 
 static __device__ void dequantize_q4_1_f16(const void * __restrict__ vx, const int ib, const int iqs, half & v0, half & v1){
@@ -748,20 +808,40 @@ static __device__ void dequantize_q4_1_f16(const void * __restrict__ vx, const i
 
     const half d = __float2half(x[ib].dm.x);
     const half m = __float2half(x[ib].dm.y);
+    const dfloat d_float = x[ib].dm.x;
+    const dfloat m_float = x[ib].dm.y;
 
     const uint8_t vui = x[ib].qs[iqs];
 
     const int8_t vi0 = vui & 0xF;
     const int8_t vi1 = vui >> 4;
 
-    v0 = __float2half(vi0*__half2float(d) + __half2float(m));
-    v1 = __float2half(vi1*__half2float(d) + __half2float(m));
+    v0 = __float2half(vi0  * d_float + m_float);
+    v1 = __float2half(vi1  * d_float + m_float);
+}
+
+static __device__ void dequantize_q4_1_f8e4(const void * __restrict__ vx, const int ib, const int iqs, __fp8e4 & v0, __fp8e4 & v1){
+    const block_q4_1 * x = (const block_q4_1 *) vx;
+
+    const __fp8e4 d = __FLOAT2FP8E4(x[ib].dm.x);
+    const __fp8e4 m = __FLOAT2FP8E4(x[ib].dm.y);
+    const dfloat d_float = x[ib].dm.x;
+    const dfloat m_float = x[ib].dm.y;
+
+    const uint8_t vui = x[ib].qs[iqs];
+
+    const int8_t vi0 = vui & 0xF;
+    const int8_t vi1 = vui >> 4;
+
+    v0 = __FLOAT2FP8E4(vi0*d_float + m_float);
+    v1 = __FLOAT2FP8E4(vi1*d_float + m_float);
 }
 
 static __device__ void dequantize_q5_0_f16(const void * __restrict__ vx, const int ib, const int iqs, half & v0, half & v1){
     const block_q5_0 * x = (const block_q5_0 *) vx;
 
     const half d = __float2half(x[ib].d);
+    const dfloat d_float = x[ib].d;
 
     uint32_t qh;
     memcpy(&qh, x[ib].qh, sizeof(qh));
@@ -772,8 +852,26 @@ static __device__ void dequantize_q5_0_f16(const void * __restrict__ vx, const i
     const int32_t x0 = ((x[ib].qs[iqs] & 0xf) | xh_0) - 16;
     const int32_t x1 = ((x[ib].qs[iqs] >>  4) | xh_1) - 16;
 
-    v0 = __float2half(x0*__half2float(d));
-    v1 = __float2half(x1*__half2float(d));
+    v0 = __float2half(x0*d_float);
+    v1 = __float2half(x1*d_float);
+}
+static __device__ void dequantize_q5_0_f8e4(const void * __restrict__ vx, const int ib, const int iqs, __fp8e4 & v0, __fp8e4 & v1){
+    const block_q5_0 * x = (const block_q5_0 *) vx;
+
+    const __fp8e4 d = __FLOAT2FP8E4(x[ib].d);
+    const dfloat d_float = x[ib].d;
+
+    uint32_t qh;
+    memcpy(&qh, x[ib].qh, sizeof(qh));
+
+    const uint8_t xh_0 = ((qh >> (iqs +  0)) << 4) & 0x10;
+    const uint8_t xh_1 = ((qh >> (iqs + 12))     ) & 0x10;
+
+    const int32_t x0 = ((x[ib].qs[iqs] & 0xf) | xh_0) - 16;
+    const int32_t x1 = ((x[ib].qs[iqs] >>  4) | xh_1) - 16;
+
+    v0 = __FLOAT2FP8E4(x0*d_float);
+    v1 = __FLOAT2FP8E4(x1*d_float);
 }
 
 static __device__ void dequantize_q5_1_f16(const void * __restrict__ vx, const int ib, const int iqs, half & v0, half & v1){
@@ -781,6 +879,8 @@ static __device__ void dequantize_q5_1_f16(const void * __restrict__ vx, const i
 
     const half d = __float2half(x[ib].dm.x);
     const half m = __float2half(x[ib].dm.y);
+    const dfloat d_float = x[ib].dm.x;
+    const dfloat m_float = x[ib].dm.y;
 
     uint32_t qh;
     memcpy(&qh, x[ib].qh, sizeof(qh));
@@ -791,31 +891,65 @@ static __device__ void dequantize_q5_1_f16(const void * __restrict__ vx, const i
     const int32_t x0 = ((x[ib].qs[iqs] & 0xf) | xh_0);
     const int32_t x1 = ((x[ib].qs[iqs] >>  4) | xh_1);
 
-    v0 = __float2half(x0*__half2float(d) + __half2float(m));
-    v1 = __float2half(x1*__half2float(d) + __half2float(m));
+    v0 = __float2half(x0*d_float + m_float);
+    v1 = __float2half(x1*d_float + m_float);
+}
+static __device__ void dequantize_q5_1_f8e4(const void * __restrict__ vx, const int ib, const int iqs, __fp8e4 & v0, __fp8e4 & v1){
+    const block_q5_1 * x = (const block_q5_1 *) vx;
+
+    const __fp8e4 d = __FLOAT2FP8E4(x[ib].dm.x);
+    const __fp8e4 m = __FLOAT2FP8E4(x[ib].dm.y);
+    const dfloat d_float = x[ib].dm.x;
+    const dfloat m_float = x[ib].dm.y;
+
+    uint32_t qh;
+    memcpy(&qh, x[ib].qh, sizeof(qh));
+
+    const uint8_t xh_0 = ((qh >> (iqs +  0)) << 4) & 0x10;
+    const uint8_t xh_1 = ((qh >> (iqs + 12))     ) & 0x10;
+
+    const int32_t x0 = ((x[ib].qs[iqs] & 0xf) | xh_0);
+    const int32_t x1 = ((x[ib].qs[iqs] >>  4) | xh_1);
+
+    v0 = __FLOAT2FP8E4(x0*d_float + m_float);
+    v1 = __FLOAT2FP8E4(x1*d_float + m_float);
 }
 
 static __device__ void dequantize_q8_0_f16(const void *  __restrict__ vx, const int ib, const int iqs, half & v0, half & v1){
     const block_q8_0 * x = (const block_q8_0 *) vx;
 
     const half d = __float2half(x[ib].d);
+    const dfloat d_float = x[ib].d;
 
     const int8_t vi0 = x[ib].qs[iqs + 0];
     const int8_t vi1 = x[ib].qs[iqs + 1];
 
-    v0 = __float2half(vi0*__half2float(d));
-    v1 = __float2half(vi1*__half2float(d));
+    v0 = __float2half(vi0*d_float);
+    v1 = __float2half(vi1*d_float);
+}
+static __device__ void dequantize_q8_0_f8e4(const void *  __restrict__ vx, const int ib, const int iqs, __fp8e4 & v0, __fp8e4 & v1){
+    const block_q8_0 * x = (const block_q8_0 *) vx;
+
+    const __fp8e4 d = __FLOAT2FP8E4(x[ib].d);
+    const dfloat d_float = x[ib].d;
+
+    const int8_t vi0 = x[ib].qs[iqs + 0];
+    const int8_t vi1 = x[ib].qs[iqs + 1];
+
+    v0 = __FLOAT2FP8E4(vi0*d_float);
+    v1 = __FLOAT2FP8E4(vi1*d_float);
 }
 
 static __global__ void dequantize_block_q2_K_f16(const void * __restrict__ vx, half * __restrict__ yy) {
 
     const int i   = blockIdx.x;
+    const block_q2_K * x = (const block_q2_K *) vx;
+
     const int tid = threadIdx.x;
+#if QK_K == 256
     const int n   = tid/32;
     const int l   = tid - 32*n;
     const int is  = 8*n + l/16;
-
-    const block_q2_K * x = (const block_q2_K *) vx;
 
     const uint8_t q = x[i].qs[32*n + l];
     half * y = yy + i*QK_K + 128*n;
@@ -826,19 +960,60 @@ static __global__ void dequantize_block_q2_K_f16(const void * __restrict__ vx, h
     y[l+32] = __float2half(dall * (x[i].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[i].scales[is+2] >> 4));
     y[l+64] = __float2half(dall * (x[i].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+4] >> 4));
     y[l+96] = __float2half(dall * (x[i].scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (x[i].scales[is+6] >> 4));
+#else
+    const int is = tid/16;  // 0 or 1
+    const int il = tid%16;  // 0...15
+    const uint8_t q = x[i].qs[il] >> (2*is);
+    half * y = yy + i*QK_K + 16*is + il;
+    float dall = x[i].d;
+    float dmin = x[i].dmin;
+    y[ 0] = __float2half(dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4));
+    y[32] = __float2half(dall * (x[i].scales[is+2] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+2] >> 4));
+#endif
 }
 
-static __global__ void dequantize_block_q3_K_f16(const void * vx, half * yy) {
+static __global__ void dequantize_block_q2_K_f8e4(const void * __restrict__ vx, __fp8e4 * __restrict__ yy) {
 
+    const int i   = blockIdx.x;
+    const block_q2_K * x = (const block_q2_K *) vx;
+
+    const int tid = threadIdx.x;
+#if QK_K == 256
+    const int n   = tid/32;
+    const int l   = tid - 32*n;
+    const int is  = 8*n + l/16;
+
+    const uint8_t q = x[i].qs[32*n + l];
+    __fp8e4 * y = yy + i*QK_K + 128*n;
+
+    float dall = x[i].d;
+    float dmin = x[i].dmin;
+    y[l+ 0] = __FLOAT2FP8E4(dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4));
+    y[l+32] = __FLOAT2FP8E4(dall * (x[i].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[i].scales[is+2] >> 4));
+    y[l+64] = __FLOAT2FP8E4(dall * (x[i].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+4] >> 4));
+    y[l+96] = __FLOAT2FP8E4(dall * (x[i].scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (x[i].scales[is+6] >> 4));
+#else
+    const int is = tid/16;  // 0 or 1
+    const int il = tid%16;  // 0...15
+    const uint8_t q = x[i].qs[il] >> (2*is);
+    half * y = yy + i*QK_K + 16*is + il;
+    float dall = x[i].d;
+    float dmin = x[i].dmin;
+    y[ 0] = __FLOAT2FP8E4(dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4));
+    y[32] = __FLOAT2FP8E4(dall * (x[i].scales[is+2] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+2] >> 4));
+#endif
+}
+static __global__ void dequantize_block_q3_K_f16(const void * vx, half * yy) {
+    const int i = blockIdx.x;
+    const block_q3_K * x = (const block_q3_K *) vx;
+
+#if QK_K == 256
     int r = threadIdx.x/4;
-    int i = blockIdx.x;
     int tid = r/2;
     int is0 = r%2;
     int l0 = 16*is0 + 4*(threadIdx.x%4);
     int n = tid / 4;
     int j = tid - 4*n;
-
-    const block_q3_K * x = (const block_q3_K *) vx;
 
     uint8_t m = 1 << (4*n + j);
     int is = 8*n + 2*j + is0;
@@ -856,14 +1031,81 @@ static __global__ void dequantize_block_q3_K_f16(const void * vx, half * yy) {
     const uint8_t * hm = x[i].hmask;
 
     for (int l = l0; l < l0+4; ++l) y[l] = __float2half(dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+#else
+    const int tid = threadIdx.x;
+    const int is  = tid/16;  // 0 or 1
+    const int il  = tid%16;  // 0...15
+    const int im  = il/8;    // 0...1
+    const int in  = il%8;    // 0...7
 
+    half * y = yy + i*QK_K + 16*is + il;
+
+    const uint8_t q = x[i].qs[il] >> (2*is);
+    const uint8_t h = x[i].hmask[in] >> (2*is + im);
+    const float   d = (float)x[i].d;
+
+    int8_t us = is == 0 ? (x[i].scales[0] & 0xF) | (((x[i].scales[1] >> 0) & 3) << 4) :
+                          (x[i].scales[0] >>  4) | (((x[i].scales[1] >> 4) & 3) << 4);
+    float dl = d * (us - 32);
+
+    y[ 0] = __float2half(dl * ((int8_t)((q >> 0) & 3) - ((h >> 0) & 1 ? 0 : 4)));
+    y[32] = __float2half(dl * ((int8_t)((q >> 4) & 3) - ((h >> 4) & 1 ? 0 : 4)));  
+#endif
 }
+static __global__ void dequantize_block_q3_K_f8e4(const void * vx, __fp8e4 * yy) {
+    const int i = blockIdx.x;
+    const block_q3_K * x = (const block_q3_K *) vx;
 
+#if QK_K == 256
+    int r = threadIdx.x/4;
+    int tid = r/2;
+    int is0 = r%2;
+    int l0 = 16*is0 + 4*(threadIdx.x%4);
+    int n = tid / 4;
+    int j = tid - 4*n;
+
+    uint8_t m = 1 << (4*n + j);
+    int is = 8*n + 2*j + is0;
+    int shift = 2*j;
+
+    int8_t us = is <  4 ? (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+8] >> 0) & 3) << 4) :
+                is <  8 ? (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+4] >> 2) & 3) << 4) :
+                is < 12 ? (x[i].scales[is-8] >>  4) | (((x[i].scales[is+0] >> 4) & 3) << 4) :
+                          (x[i].scales[is-8] >>  4) | (((x[i].scales[is-4] >> 6) & 3) << 4);
+    float d_all = x[i].d;
+    float dl = d_all * (us - 32);
+
+    __fp8e4 * y = yy + i*QK_K + 128*n + 32*j;
+    const uint8_t * q = x[i].qs + 32*n;
+    const uint8_t * hm = x[i].hmask;
+
+    for (int l = l0; l < l0+4; ++l) y[l] = __FLOAT2FP8E4(dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+#else
+    const int tid = threadIdx.x;
+    const int is  = tid/16;  // 0 or 1
+    const int il  = tid%16;  // 0...15
+    const int im  = il/8;    // 0...1
+    const int in  = il%8;    // 0...7
+
+    half * y = yy + i*QK_K + 16*is + il;
+
+    const uint8_t q = x[i].qs[il] >> (2*is);
+    const uint8_t h = x[i].hmask[in] >> (2*is + im);
+    const float   d = (float)x[i].d;
+
+    int8_t us = is == 0 ? (x[i].scales[0] & 0xF) | (((x[i].scales[1] >> 0) & 3) << 4) :
+                          (x[i].scales[0] >>  4) | (((x[i].scales[1] >> 4) & 3) << 4);
+    float dl = d * (us - 32);
+
+    y[ 0] = __FLOAT2FP8E4(dl * ((int8_t)((q >> 0) & 3) - ((h >> 0) & 1 ? 0 : 4)));
+    y[32] = __FLOAT2FP8E4(dl * ((int8_t)((q >> 4) & 3) - ((h >> 4) & 1 ? 0 : 4)));  
+#endif
+}
 static __global__ void dequantize_block_q4_K_f16(const void * __restrict__ vx, half * __restrict__ yy) {
     const block_q4_K * x = (const block_q4_K *) vx;
 
     const int i = blockIdx.x;
-
+#if QK_K == 256
     // assume 32 threads
     const int tid = threadIdx.x;
     const int il  = tid/8;
@@ -887,65 +1129,247 @@ static __global__ void dequantize_block_q4_K_f16(const void * __restrict__ vx, h
         y[l + 0] = __float2half(d1 * (q[l] & 0xF) - m1);
         y[l +32] = __float2half(d2 * (q[l] >>  4) - m2);
     }
+#else
+    const int tid = threadIdx.x;
+    const uint8_t * q = x[i].qs;
+    half * y = yy + i*QK_K;
+    const float d = (float)x[i].d[0];
+    const float m = (float)x[i].d[1];
+    y[tid+ 0] = __float2half(d * (x[i].scales[0] & 0xF) * (q[tid] & 0xF) - m * (x[i].scales[0] >> 4));
+    y[tid+32] = __float2half(d * (x[i].scales[1] & 0xF) * (q[tid] >>  4) - m * (x[i].scales[1] >> 4));
+#endif
 }
-
-static __global__ void dequantize_block_q5_K_f16(const void * __restrict__ vx, half * __restrict__ yy) {
-    const block_q5_K * x = (const block_q5_K *) vx;
+static __global__ void dequantize_block_q4_K_f8e4(const void * __restrict__ vx, __fp8e4 * __restrict__ yy) {
+    const block_q4_K * x = (const block_q4_K *) vx;
 
     const int i = blockIdx.x;
-
-    // assume 64 threads - this is very slightly better than the one below
+#if QK_K == 256
+    // assume 32 threads
     const int tid = threadIdx.x;
-    const int il  = tid/16;   // il is in 0...3
-    const int ir  = tid%16;   // ir is in 0...15
-    const int is  = 2*il;     // is is in 0...6
+    const int il  = tid/8;
+    const int ir  = tid%8;
+    const int is  = 2*il;
+    const int n   = 4;
 
-    half * y = yy + i*QK_K + 64*il + 2*ir;
+    __fp8e4 * y = yy + i*QK_K + 64*il + n*ir;
 
     const float dall = x[i].d;
     const float dmin = x[i].dmin;
 
-    const uint8_t * ql = x[i].qs + 32*il + 2*ir;
-    const uint8_t * qh = x[i].qh + 2*ir;
+    const uint8_t * q = x[i].qs + 32*il + n*ir;
 
     uint8_t sc, m;
     get_scale_min_k4(is + 0, x[i].scales, sc, m);
     const float d1 = dall * sc; const float m1 = dmin * m;
     get_scale_min_k4(is + 1, x[i].scales, sc, m);
     const float d2 = dall * sc; const float m2 = dmin * m;
-
-    uint8_t   hm  = 1 << (2*il);
-    y[ 0] = __float2half(d1 * ((ql[ 0] & 0xF) + (qh[ 0] & hm ? 16 : 0)) - m1);
-    y[ 1] = __float2half(d1 * ((ql[ 1] & 0xF) + (qh[ 1] & hm ? 16 : 0)) - m1);
-    hm <<= 1;
-    y[32] = __float2half(d2 * ((ql[ 0] >>  4) + (qh[ 0] & hm ? 16 : 0)) - m2);
-    y[33] = __float2half(d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2);
-}
-
-static __global__ void dequantize_block_q6_K_f16(const void * vx, half * yy) {
-    const block_q6_K * x = (const block_q6_K *) vx;
-
-    const int i = blockIdx.x;
-
-    // assume 64 threads - this is very slightly better than the one below
+    for (int l = 0; l < n; ++l) {
+        y[l + 0] = __FLOAT2FP8E4(d1 * (q[l] & 0xF) - m1);
+        y[l +32] = __FLOAT2FP8E4(d2 * (q[l] >>  4) - m2);
+    }
+#else
     const int tid = threadIdx.x;
-    const int ip  = tid/32;   // ip is 0 or 1
-    const int il  = tid - 32*ip; // 0...32
-    const int is  = 8*ip + il/16;
-
-    half * y = yy + i*QK_K + 128*ip + il;
-
-    const float d = x[i].d;
-
-    const uint8_t * ql = x[i].ql + 64*ip + il;
-    const uint8_t   qh = x[i].qh[32*ip + il];
-    const int8_t  * sc = x[i].scales + is;
-
-    y[ 0] = __float2half(d * sc[0] * ((int8_t)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
-    y[32] = __float2half(d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
-    y[64] = __float2half(d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
-    y[96] = __float2half(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+    const uint8_t * q = x[i].qs;
+    __fp8e4 * y = yy + i*QK_K;
+    const float d = (float)x[i].d[0];
+    const float m = (float)x[i].d[1];
+    y[tid+ 0] = __FLOAT2FP8E4(d * (x[i].scales[0] & 0xF) * (q[tid] & 0xF) - m * (x[i].scales[0] >> 4));
+    y[tid+32] = __FLOAT2FP8E4(d * (x[i].scales[1] & 0xF) * (q[tid] >>  4) - m * (x[i].scales[1] >> 4));
+#endif
 }
+
+
+// static __global__ void dequantize_block_q2_K_f16(const void * __restrict__ vx, half * __restrict__ yy) {
+
+//     const int i   = blockIdx.x;
+//     const int tid = threadIdx.x;
+//     const int n   = tid/32;
+//     const int l   = tid - 32*n;
+//     const int is  = 8*n + l/16;
+
+//     const block_q2_K * x = (const block_q2_K *) vx;
+
+//     const uint8_t q = x[i].qs[32*n + l];
+//     half * y = yy + i*QK_K + 128*n;
+
+//     float dall = x[i].d;
+//     float dmin = x[i].dmin;
+//     y[l+ 0] = __float2half(dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4));
+//     y[l+32] = __float2half(dall * (x[i].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[i].scales[is+2] >> 4));
+//     y[l+64] = __float2half(dall * (x[i].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+4] >> 4));
+//     y[l+96] = __float2half(dall * (x[i].scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (x[i].scales[is+6] >> 4));
+// }
+// static __global__ void dequantize_block_q2_K_f8e4(const void * __restrict__ vx, __fp8e4 * __restrict__ yy) {
+
+//     const int i   = blockIdx.x;
+//     const int tid = threadIdx.x;
+//     const int n   = tid/32;
+//     const int l   = tid - 32*n;
+//     const int is  = 8*n + l/16;
+
+//     const block_q2_K * x = (const block_q2_K *) vx;
+
+//     const uint8_t q = x[i].qs[32*n + l];
+//     __fp8e4 * y = yy + i*QK_K + 128*n;
+
+//     const __fp8e4 dall = __FLOAT2FP8E4(x[i].d);
+//     const __fp8e4 dmin = __FLOAT2FP8E4(x[i].dmin);
+//     y[l+ 0] = dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4);
+//     y[l+32] = dall * (x[i].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[i].scales[is+2] >> 4);
+//     y[l+64] = dall * (x[i].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+4] >> 4);
+//     y[l+96] = dall * (x[i].scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (x[i].scales[is+6] >> 4);
+// }
+
+
+// static __global__ void dequantize_block_q3_K_f16(const void * vx, half * yy) {
+
+//     int r = threadIdx.x/4;
+//     int i = blockIdx.x;
+//     int tid = r/2;
+//     int is0 = r%2;
+//     int l0 = 16*is0 + 4*(threadIdx.x%4);
+//     int n = tid / 4;
+//     int j = tid - 4*n;
+
+//     const block_q3_K * x = (const block_q3_K *) vx;
+
+//     uint8_t m = 1 << (4*n + j);
+//     int is = 8*n + 2*j + is0;
+//     int shift = 2*j;
+
+//     int8_t us = is <  4 ? (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+8] >> 0) & 3) << 4) :
+//                 is <  8 ? (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+4] >> 2) & 3) << 4) :
+//                 is < 12 ? (x[i].scales[is-8] >>  4) | (((x[i].scales[is+0] >> 4) & 3) << 4) :
+//                           (x[i].scales[is-8] >>  4) | (((x[i].scales[is-4] >> 6) & 3) << 4);
+//     float d_all = x[i].d;
+//     float dl = d_all * (us - 32);
+
+//     half * y = yy + i*QK_K + 128*n + 32*j;
+//     const uint8_t * q = x[i].qs + 32*n;
+//     const uint8_t * hm = x[i].hmask;
+
+//     for (int l = l0; l < l0+4; ++l) y[l] = __float2half(dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+
+// }
+// static __global__ void dequantize_block_q3_K_f8e4(const void * vx, __fp8e4 * yy) {
+
+//     int r = threadIdx.x/4;
+//     int i = blockIdx.x;
+//     int tid = r/2;
+//     int is0 = r%2;
+//     int l0 = 16*is0 + 4*(threadIdx.x%4);
+//     int n = tid / 4;
+//     int j = tid - 4*n;
+
+//     const block_q3_K * x = (const block_q3_K *) vx;
+
+//     uint8_t m = 1 << (4*n + j);
+//     int is = 8*n + 2*j + is0;
+//     int shift = 2*j;
+
+//     int8_t us = is <  4 ? (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+8] >> 0) & 3) << 4) :
+//                 is <  8 ? (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+4] >> 2) & 3) << 4) :
+//                 is < 12 ? (x[i].scales[is-8] >>  4) | (((x[i].scales[is+0] >> 4) & 3) << 4) :
+//                           (x[i].scales[is-8] >>  4) | (((x[i].scales[is-4] >> 6) & 3) << 4);
+//     float d_all = x[i].d;
+//     float dl = d_all * (us - 32);
+
+//     __fp8e4 * y = yy + i*QK_K + 128*n + 32*j;
+//     const uint8_t * q = x[i].qs + 32*n;
+//     const uint8_t * hm = x[i].hmask;
+
+//     for (int l = l0; l < l0+4; ++l) y[l] = __FLOAT2FP8E4(dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+
+// }
+
+// static __global__ void dequantize_block_q4_K_f16(const void * __restrict__ vx, half * __restrict__ yy) {
+//     const block_q4_K * x = (const block_q4_K *) vx;
+
+//     const int i = blockIdx.x;
+
+//     // assume 32 threads
+//     const int tid = threadIdx.x;
+//     const int il  = tid/8;
+//     const int ir  = tid%8;
+//     const int is  = 2*il;
+//     const int n   = 4;
+
+//     half * y = yy + i*QK_K + 64*il + n*ir;
+
+//     const float dall = x[i].d;
+//     const float dmin = x[i].dmin;
+
+//     const uint8_t * q = x[i].qs + 32*il + n*ir;
+
+//     uint8_t sc, m;
+//     get_scale_min_k4(is + 0, x[i].scales, sc, m);
+//     const float d1 = dall * sc; const float m1 = dmin * m;
+//     get_scale_min_k4(is + 1, x[i].scales, sc, m);
+//     const float d2 = dall * sc; const float m2 = dmin * m;
+//     for (int l = 0; l < n; ++l) {
+//         y[l + 0] = __float2half(d1 * (q[l] & 0xF) - m1);
+//         y[l +32] = __float2half(d2 * (q[l] >>  4) - m2);
+//     }
+// }
+
+
+// static __global__ void dequantize_block_q5_K_f16(const void * __restrict__ vx, half * __restrict__ yy) {
+//     const block_q5_K * x = (const block_q5_K *) vx;
+
+//     const int i = blockIdx.x;
+
+//     // assume 64 threads - this is very slightly better than the one below
+//     const int tid = threadIdx.x;
+//     const int il  = tid/16;   // il is in 0...3
+//     const int ir  = tid%16;   // ir is in 0...15
+//     const int is  = 2*il;     // is is in 0...6
+
+//     half * y = yy + i*QK_K + 64*il + 2*ir;
+
+//     const float dall = x[i].d;
+//     const float dmin = x[i].dmin;
+
+//     const uint8_t * ql = x[i].qs + 32*il + 2*ir;
+//     const uint8_t * qh = x[i].qh + 2*ir;
+
+//     uint8_t sc, m;
+//     get_scale_min_k4(is + 0, x[i].scales, sc, m);
+//     const float d1 = dall * sc; const float m1 = dmin * m;
+//     get_scale_min_k4(is + 1, x[i].scales, sc, m);
+//     const float d2 = dall * sc; const float m2 = dmin * m;
+
+//     uint8_t   hm  = 1 << (2*il);
+//     y[ 0] = __float2half(d1 * ((ql[ 0] & 0xF) + (qh[ 0] & hm ? 16 : 0)) - m1);
+//     y[ 1] = __float2half(d1 * ((ql[ 1] & 0xF) + (qh[ 1] & hm ? 16 : 0)) - m1);
+//     hm <<= 1;
+//     y[32] = __float2half(d2 * ((ql[ 0] >>  4) + (qh[ 0] & hm ? 16 : 0)) - m2);
+//     y[33] = __float2half(d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2);
+// }
+
+// static __global__ void dequantize_block_q6_K_f16(const void * vx, half * yy) {
+//     const block_q6_K * x = (const block_q6_K *) vx;
+
+//     const int i = blockIdx.x;
+
+//     // assume 64 threads - this is very slightly better than the one below
+//     const int tid = threadIdx.x;
+//     const int ip  = tid/32;   // ip is 0 or 1
+//     const int il  = tid - 32*ip; // 0...32
+//     const int is  = 8*ip + il/16;
+
+//     half * y = yy + i*QK_K + 128*ip + il;
+
+//     const float d = x[i].d;
+
+//     const uint8_t * ql = x[i].ql + 64*ip + il;
+//     const uint8_t   qh = x[i].qh[32*ip + il];
+//     const int8_t  * sc = x[i].scales + is;
+
+//     y[ 0] = __float2half(d * sc[0] * ((int8_t)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+//     y[32] = __float2half(d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+//     y[64] = __float2half(d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+//     y[96] = __float2half(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+// }
 
 // expect f16, return f16
 static __global__ void noconvert_return_f16(const void * __restrict__ vx, half * __restrict__ y){
@@ -1569,6 +1993,24 @@ static __global__ void dequantize_block_f16(const void * __restrict__ vx, half *
     half & v0 = y[iybs + iqs + 0];
     half & v1 = y[iybs + iqs + y_offset];
     dequantize_kernel_f16(vx, ib, iqs, v0, v1);
+}
+template <int qk, int qr, void (*dequantize_kernel_f8e4)(const void *, const int, const int, __fp8e4 &, __fp8e4 &)>
+static __global__ void dequantize_block_f8e4(const void * __restrict__ vx, __fp8e4 * __restrict__ y, const int k) {
+    const int i = blockDim.x*blockIdx.x + 2*threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int ib = i/qk; // block index
+    const int iqs = (i%qk)/qr; // quant index
+    const int iybs = i - i%qk; // y block start index
+    const int y_offset = qr == 1 ? 1 : qk/2;
+
+    // dequantize
+    __fp8e4 & v0 = y[iybs + iqs + 0];
+    __fp8e4 & v1 = y[iybs + iqs + y_offset];
+    dequantize_kernel_f8e4(vx, ib, iqs, v0, v1);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
@@ -2458,12 +2900,7 @@ static __global__ void cpy_f32_f16(const char * cx, char * cdst, const int ne,
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
-static __global__ void float_to_half(const float* src, __half* dst, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        dst[idx] = __float2half(src[idx]);
-    }
-}
+
 
 
 // rope == RoPE == rotary positional embedding
@@ -2696,29 +3133,69 @@ static void dequantize_row_q6_K_cuda(const void * vx, float * y, const int k, cu
     dequantize_block_q6_K<<<nb, 32, 0, stream>>>(vx, y);
 #endif
 }
+
+
+template<typename T>
+__global__ void dequantize_kernel(const void* vx, T* y, const int k) {
+    // Kernel computes either on float or half datatype depending on template parameter T
+}
+template<typename T>
+void dequantize_wrapper(const void * vx, T * y, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+    dequantize_kernel<T><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+}
+template<typename T>
+void call_kernel(const void* vx, T* y, const int k, cudaStream_t stream) {
+    dequantize_wrapper<T>(vx, y, k, stream);
+}
+
+
+
+
+
 static void dequantize_row_q4_0_cuda_f16(const void * vx, half * y, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
     dequantize_block_f16<QK4_0, QR4_0, dequantize_q4_0_f16><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+}
+static void dequantize_row_q4_0_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+    dequantize_block_f8e4<QK4_0, QR4_0, dequantize_q4_0_f8e4><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
 }
 
 static void dequantize_row_q4_1_cuda_f16(const void * vx, half * y, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
     dequantize_block_f16<QK4_1, QR4_1, dequantize_q4_1_f16><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
 }
+static void dequantize_row_q4_1_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+    dequantize_block_f8e4<QK4_1, QR4_1, dequantize_q4_1_f8e4><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+}
 
 static void dequantize_row_q5_0_cuda_f16(const void * vx, half * y, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
     dequantize_block_f16<QK5_0, QR5_0, dequantize_q5_0_f16><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+}
+static void dequantize_row_q5_0_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+    dequantize_block_f8e4<QK5_0, QR5_0, dequantize_q5_0_f8e4><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
 }
 
 static void dequantize_row_q5_1_cuda_f16(const void * vx, half * y, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
     dequantize_block_f16<QK5_1, QR5_1, dequantize_q5_1_f16><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
 }
+static void dequantize_row_q5_1_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+    dequantize_block_f8e4<QK5_1, QR5_1, dequantize_q5_1_f8e4><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+}
 
 static void dequantize_row_q8_0_cuda_f16(const void * vx, half * y, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
     dequantize_block_f16<QK8_0, QR8_0, dequantize_q8_0_f16><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+}
+static void dequantize_row_q8_0_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+    dequantize_block_f8e4<QK8_0, QR8_0, dequantize_q8_0_f8e4><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
 }
 
 static void dequantize_row_q2_K_cuda_f16(const void * vx, half * y, const int k, cudaStream_t stream) {
@@ -2727,6 +3204,14 @@ static void dequantize_row_q2_K_cuda_f16(const void * vx, half * y, const int k,
     dequantize_block_q2_K_f16<<<nb, 64, 0, stream>>>(vx, y);
 #else
     dequantize_block_q2_K_f16<<<nb, 32, 0, stream>>>(vx, y);
+#endif
+}
+static void dequantize_row_q2_K_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+#if QK_K == 256
+    dequantize_block_q2_K_f8e4<<<nb, 64, 0, stream>>>(vx, y);
+#else
+    dequantize_block_q2_K_f8e4<<<nb, 32, 0, stream>>>(vx, y);
 #endif
 }
 
@@ -2738,6 +3223,14 @@ static void dequantize_row_q3_K_cuda_f16(const void * vx, half * y, const int k,
     dequantize_block_q3_K_f16<<<nb, 32, 0, stream>>>(vx, y);
 #endif
 }
+static void dequantize_row_q3_K_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+#if QK_K == 256
+    dequantize_block_q3_K_f8e4<<<nb, 64, 0, stream>>>(vx, y);
+#else
+    dequantize_block_q3_K_f8e4<<<nb, 32, 0, stream>>>(vx, y);
+#endif
+}
 
 static void dequantize_row_q4_K_cuda_f16(const void * vx, half * y, const int k, cudaStream_t stream) {
     const int nb = k / QK_K;
@@ -2747,13 +3240,29 @@ static void dequantize_row_q4_K_cuda_f16(const void * vx, half * y, const int k,
     dequantize_block_q4_K_f16<<<nb, 32, 0, stream>>>(vx, y);
 #endif
 }
-
+static void dequantize_row_q4_K_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+#if QK_K == 256
+    dequantize_block_q4_K_f8e4<<<nb, 64, 0, stream>>>(vx, y);
+#else
+    dequantize_block_q4_K_f8e4<<<nb, 32, 0, stream>>>(vx, y);
+#endif
+}
+/*
 static void dequantize_row_q5_K_cuda_f16(const void * vx, half * y, const int k, cudaStream_t stream) {
     const int nb = k / QK_K;
 #if QK_K == 256
     dequantize_block_q5_K_f16<<<nb, 64, 0, stream>>>(vx, y);
 #else
     dequantize_block_q5_K_f16<<<nb, 32, 0, stream>>>(vx, y);
+#endif
+}
+static void dequantize_row_q5_K_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+#if QK_K == 256
+    dequantize_block_q5_K_f8e4<<<nb, 64, 0, stream>>>(vx, y);
+#else
+    dequantize_block_q5_K_f8e4<<<nb, 32, 0, stream>>>(vx, y);
 #endif
 }
 
@@ -2765,6 +3274,15 @@ static void dequantize_row_q6_K_cuda_f16(const void * vx, half * y, const int k,
     dequantize_block_q6_K_f16<<<nb, 32, 0, stream>>>(vx, y);
 #endif
 }
+static void dequantize_row_q6_K_cuda_f8e4(const void * vx, __fp8e4 * y, const int k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+#if QK_K == 256
+    dequantize_block_q6_K_f8e4<<<nb, 64, 0, stream>>>(vx, y);
+#else
+    dequantize_block_q6_K_f8e4<<<nb, 32, 0, stream>>>(vx, y);
+#endif
+}
+*/
 static void dequantize_mul_mat_vec_q4_0_cuda(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows, cudaStream_t stream) {
     GGML_ASSERT(ncols % GGML_CUDA_DMMV_X == 0);
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
@@ -3007,12 +3525,41 @@ static to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q3_K_cuda_f16;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda_f16;
-        case GGML_TYPE_Q5_K:
-            return dequantize_row_q5_K_cuda_f16;
-        case GGML_TYPE_Q6_K:
-            return dequantize_row_q6_K_cuda_f16;
+        // case GGML_TYPE_Q5_K:
+        //     return dequantize_row_q5_K_cuda_f16;
+        // case GGML_TYPE_Q6_K:
+        //     return dequantize_row_q6_K_cuda_f16;
         case GGML_TYPE_F16:
             return noconvert_return_f16_cuda;
+        default:
+            return nullptr;
+    }
+}
+// warning: no support for 64 blocks yet
+static to_fp8e4_cuda_t ggml_get_to_fp8e4_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+             return dequantize_row_q4_0_cuda_f8e4;
+        case GGML_TYPE_Q4_1:
+           return dequantize_row_q4_1_cuda_f8e4;
+        case GGML_TYPE_Q5_0:
+            return dequantize_row_q5_0_cuda_f8e4;
+        case GGML_TYPE_Q5_1:
+            return dequantize_row_q5_1_cuda_f8e4;
+        case GGML_TYPE_Q8_0:
+            return dequantize_row_q8_0_cuda_f8e4;
+        case GGML_TYPE_Q2_K:
+            return dequantize_row_q2_K_cuda_f8e4;
+        case GGML_TYPE_Q3_K:
+            return dequantize_row_q3_K_cuda_f8e4;
+        case GGML_TYPE_Q4_K:
+            return dequantize_row_q4_K_cuda_f8e4;
+        // case GGML_TYPE_Q5_K:
+        //    return dequantize_row_q5_K_cuda_f8e4;
+        // case GGML_TYPE_Q6_K:
+        //     return dequantize_row_q6_K_cuda_f8e4;
+        // case GGML_TYPE_f8e4:
+        //     return noconvert_return_f8e4_cuda;
         default:
             return nullptr;
     }
@@ -3175,7 +3722,8 @@ static void * ggml_cuda_pool_malloc(size_t size, size_t * actual_size) {
         }
     }
     if (best_fit != nullptr) {
-        *actual_size = best_fit->size;
+        if (actual_size != nullptr)
+            *actual_size = best_fit->size;
         void * ptr = best_fit->ptr;
         best_fit->ptr = nullptr;
         // best_fit->size = 0;
@@ -3185,10 +3733,12 @@ static void * ggml_cuda_pool_malloc(size_t size, size_t * actual_size) {
     //printf("CUDA MALLOC: Allocated MB: %.2f\n", (float)size/1024/1024);
     void * ptr;
     CUDA_CHECK(cudaMalloc((void **) &ptr, size));
+    if (actual_size != nullptr)
     *actual_size = size;    
     return ptr;
 }
 
+// set buffer to available for next use
 static void ggml_cuda_pool_free(void * ptr, size_t size) {
     scoped_spin_lock lock(g_cuda_pool_lock);
     int id;
@@ -3204,6 +3754,24 @@ static void ggml_cuda_pool_free(void * ptr, size_t size) {
         }
     }
     fprintf(stderr, "WARNING: cuda buffer pool full, increase MAX_CUDA_BUFFERS\n");
+    CUDA_CHECK(cudaFree(ptr));
+}
+
+// unallocates a buffer that was allocated with ggml_cuda_pool_malloc
+static void ggml_cuda_pool_unallocate(void * ptr) {
+    scoped_spin_lock lock(g_cuda_pool_lock);
+    int id;
+    CUDA_CHECK(cudaGetDevice(&id));
+    // remove it
+    for (int i = 0; i < MAX_CUDA_BUFFERS; ++i) {
+        cuda_buffer& b = g_cuda_buffer_pool[id][i];
+        if (b.ptr == ptr) {
+            b.ptr = nullptr;
+            b.size = 0;
+            b.access_count = 0;
+            break;
+        }
+    }
     CUDA_CHECK(cudaFree(ptr));
 }
 
@@ -3248,7 +3816,7 @@ void ggml_cuda_pool_reset_all_counters(int device_id) {
 
 
 static void * g_scratch_buffer = nullptr;
-static size_t g_scratch_size = 1024*1024*1024; // 1 GB by default
+static size_t g_scratch_size = (size_t)1024*1024*1024; // 1 GB by default
 static size_t g_scratch_offset = 0;
 
 static int g_compute_capabilities[GGML_CUDA_MAX_DEVICES];
@@ -3262,8 +3830,8 @@ static cublasHandle_t g_cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
 static cudaStream_t g_cudaStreams_main[GGML_CUDA_MAX_DEVICES] = { nullptr };
 
-static cudaStream_t g_cudaStreams_memcpy_src1[GGML_CUDA_MAX_DEVICES] = { nullptr }; 
-static cudaEvent_t g_cudaEvents_memcpy_src1[GGML_CUDA_MAX_DEVICES]= { nullptr };
+// static cudaStream_t g_cudaStreams_memcpy_src1[GGML_CUDA_MAX_DEVICES] = { nullptr }; 
+// static cudaEvent_t g_cudaEvents_memcpy_src1[GGML_CUDA_MAX_DEVICES]= { nullptr };
 
 
 // Todo verify: free and total memory reported by cudaMemGetInfo differs from gpu_z which also differs from hwinfo64.
@@ -3343,24 +3911,24 @@ void ggml_cuda_print_gpu_status(const GPUStatus *status, bool print_summary) {
         return;
     }
 
-    const char *divider = "+----+------------------------------------+------------+-----------+-----------+-----------+-----------+";
+    const char *divider = "+----+------------------------------------+------------+-----------+-----------+-----------+-----------+------+";
     fprintf(stderr,"%s\n", divider);
-    fprintf(stderr,"| ID | %-25s %2d found | %10s | %9s | %9s | %9s | %9s |\n", "Device", status->num_devices, "VRAM Total", "VRAM Free", "VRAM Used","Split at ", "Device");
+    fprintf(stderr,"| ID | %-25s %2d found | %10s | %9s | %9s | %9s | %9s | %4s |\n", "Device", status->num_devices, "VRAM Total", "VRAM Free", "VRAM Used","Split at ", "Device","CUDA");
     fprintf(stderr,"%s\n", divider);
 
     for (int i = 0; i < status->num_devices; ++i) {
         const struct cudaDeviceProp *prop = &status->device_props[i];
         size_t vram_used = status->device_vram_total[i] - status->device_vram_free[i];
         float split_at_percentage = g_tensor_split[i] * 100;
-        fprintf(stderr,"| %2d | %-34s | %7zu MB | %6zu MB | %6zu MB | %8.1f%% | %9s |\n", 
-                i,prop->name, status->device_vram_total[i] / (1024 * 1024), status->device_vram_free[i] / (1024 * 1024), vram_used / (1024 * 1024),split_at_percentage, (i == status->main_device_id) ? "Primary" : "Secondary");
+        fprintf(stderr,"| %2d | %-34s | %7zu MB | %6zu MB | %6zu MB | %8.1f%% | %9s | %2d%2d |\n", 
+                i,prop->name, status->device_vram_total[i] / (1024 * 1024), status->device_vram_free[i] / (1024 * 1024), vram_used / (1024 * 1024),split_at_percentage, (i == status->main_device_id) ? "Primary" : "Secondary", status->device_props[i].major, status->device_props[i].minor);
         // printf("%s\n", divider);
     }
     if (print_summary && status->num_devices > 1)
     {
         fprintf(stderr,"%s\n", divider);
-        fprintf(stderr,"|    | %-34s | %7zu MB | %6zu MB | %6zu MB | %9s | %9s |\n", 
-            "Device summary", status->total_vram / (1024 * 1024), status->total_free_vram / (1024 * 1024), (status->total_vram - status->total_free_vram) / (1024 * 1024), "N/A", "All");
+        fprintf(stderr,"|    | %-34s | %7zu MB | %6zu MB | %6zu MB | %9s | %9s | %4s |\n", 
+            "Device summary", status->total_vram / (1024 * 1024), status->total_free_vram / (1024 * 1024), (status->total_vram - status->total_free_vram) / (1024 * 1024), "N/A", "All","");
     }
     fprintf(stderr,"%s\n", divider);
     
@@ -3372,11 +3940,11 @@ const GPUStatus* ggml_cuda_get_system_gpu_status(void) {
 void ggml_cuda_set_max_gpus(int max_gpus) {
     g_system_gpu_status.max_gpus = max_gpus;
 }
-
 // can be called multithreaded to prevent 1-2 seconds delay on handle creation
 bool ggml_init_cublas(bool check_only) {
     static volatile bool initialized = false;
     if (check_only || initialized) return initialized;
+
         
     int currentDevice = 0;
     CUDA_CHECK(cudaGetDevice(&currentDevice));
@@ -3425,16 +3993,12 @@ bool ggml_init_cublas(bool check_only) {
 
             // create cublas handle
             CUBLAS_CHECK(cublasCreate(&g_cublas_handles[id]));
-            CUBLAS_CHECK(cublasSetMathMode(g_cublas_handles[id], CUBLAS_TF32_TENSOR_OP_MATH));
-            // create cublas handle
-            CUBLAS_CHECK(cublasCreate(&g_cublas_handles[id]));
-            CUBLAS_CHECK(cublasSetMathMode(g_cublas_handles[id], CUBLAS_TF32_TENSOR_OP_MATH));
+            // CUBLAS_CHECK(cublasSetMathMode(g_cublas_handles[id], CUBLAS_TF32_TENSOR_OP_MATH));
         }
         CUDA_CHECK(cudaSetDevice(currentDevice));
 
         // configure logging to stdout
         // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
-
         initialized = true;
         
     }
@@ -3705,8 +4269,7 @@ inline void ggml_cuda_op_mul_mat_q(
     const int64_t ne0 = dst->ne[0];
 
     const int64_t i01_diff = i01_high - i01_low;
-    dst->meta.cuda_perf_mal_mul_type=8;
-
+    
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
 
@@ -3975,6 +4538,7 @@ inline void ggml_cuda_op_mul_mat_cublas_f16_f32(
     dst->meta.cuda_perf_mal_mul_type=16;
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
+    // printf("ggml_cuda_op_mul_mat_cublas_f16_f32; device_id=%d, ne00=%lld, ne10=%lld, ne11=%lld, i01_diff=%lld, ne0=%lld, i01_low=%lld, i01_high=%lld\n",id,ne00,ne10,ne11,i01_diff,ne0,i01_low,i01_high);
 
     // we need to convert src1_ddf_i to half precision
     __half* src1_ddf_i_half;
@@ -3989,6 +4553,7 @@ inline void ggml_cuda_op_mul_mat_cublas_f16_f32(
     int ldc = dst->backend == GGML_BACKEND_GPU && id == g_system_gpu_status.main_device_id ? ne0 : i01_diff;
 
     CUBLAS_CHECK(cublasSetStream(g_cublas_handles[id], cudaStream_main));
+    //todo: cublasHgemm
     CUBLAS_CHECK(
         cublasGemmEx(g_cublas_handles[id], CUBLAS_OP_T, CUBLAS_OP_N,
                 i01_diff, ne11, ne10,
@@ -4002,7 +4567,7 @@ inline void ggml_cuda_op_mul_mat_cublas_f16_f32(
     (void) src0_ddq_i;
     (void) i02;
     (void) i1;
-    ggml_cuda_pool_free(src1_ddf_i_half,actual_size);
+    ggml_cuda_pool_unallocate(src1_ddf_i_half);
 }
 // src0 is actually fp16, everything else is same as normal
 inline void ggml_cuda_op_mul_mat_cublas_f16_f32_wrapper(
@@ -4017,6 +4582,139 @@ inline void ggml_cuda_op_mul_mat_cublas_f16_f32_wrapper(
 
     // Call the modified function with the casted pointers
     ggml_cuda_op_mul_mat_cublas_f16_f32(src0, src1, dst, src0_ddq_i, src0_ddf_i_half, src1_ddf_i, dst_ddf_i, i02, i01_low, i01_high, i1, cudaStream_main);
+}
+
+void ggllm_lggemm(cublasHandle_t handle, 
+                       cublasOperation_t transa,  cublasOperation_t transb, 
+                       int m, int n, int k,
+                       const void *alpha, 
+                       const void *A, cudaDataType_t Atype, int lda,
+                       const void *B, cudaDataType_t Btype, int ldb,
+                       const void *beta, 
+                       void *D, cudaDataType_t Dtype, int ldc,
+                       cublasComputeType_t computeType, cublasGemmAlgo_t algo,cudaStream_t stream) {
+//    cublasLtHandle_t ltHandle;
+//    CUBLAS_CHECK(cublasLtCreate(&ltHandle));
+    
+    cublasLtMatmulDesc_t operationDesc;
+    // for non fp8 use CUBLAS_COMPUTE_32F_FAST_TF32
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&operationDesc, computeType,CUDA_R_32F)); // CUBLAS_COMPUTE_32F
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+
+    int8_t fastAccuMode = 1;
+    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fastAccuMode, sizeof(fastAccuMode));
+
+
+    cublasLtMatrixLayout_t Adesc = NULL, Bdesc = NULL, Cdesc = NULL, Ddesc = NULL;
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, Atype, transa == CUBLAS_OP_N ? m : k, transa == CUBLAS_OP_N ? k : m, lda));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, Btype, transb == CUBLAS_OP_N ? k : n, transb == CUBLAS_OP_N ? n : k, ldb));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, Dtype, m, n, ldc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Ddesc, Dtype, m, n, ldc));
+
+    //https://docs.nvidia.com/cuda/cublas/#cublaslthandle-t
+
+
+    // C == D -> in-place
+    cublasLtMatmulHeuristicResult_t heuristicResult = {};
+    int returnedResults                             = 0;
+    cublasLtMatmulPreference_t preference = NULL;
+
+    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
+    //if (g_scratch_size && g_scratch_offset > g_scratch_size)
+    //     CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &g_scratch_buffer+g_scratch_offset, g_scratch_size-g_scratch_offset));
+    cublasLtMatmulAlgoGetHeuristic((cublasLtHandle_t)handle, operationDesc, Adesc, Bdesc, Cdesc, Ddesc, preference, 1, &heuristicResult, &returnedResults);
+    if (returnedResults == 0) {
+        int id;
+        CUDA_CHECK(cudaGetDevice(&id));
+        printf("cuBLAS problem at device %d with shape M=%d, N=%d, K=%d, lda=%d, ldb=%d, ldc=%d\n",id,m,n,k,lda,ldb,ldc);
+        CUBLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
+    }
+    CUBLAS_CHECK(
+    cublasLtMatmul(
+        (cublasLtHandle_t)handle, operationDesc, 
+        alpha, 
+        A, Adesc, 
+        B, Bdesc, 
+        beta, nullptr, Cdesc,  D, Cdesc, 
+        &heuristicResult.algo, 
+        &g_scratch_buffer+g_scratch_offset, g_scratch_size-g_scratch_offset, // todo: scratch buffer ?
+        stream));
+
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
+    CUBLAS_CHECK(cublasLtMatmulDescDestroy(operationDesc));
+//   CUBLAS_CHECK(cublasLtDestroy(ltHandle));
+}
+// takes 16,32 bit returns 32 bit - internally converts src1 to 16 bit
+inline void ggml_cuda_op_mul_mat_cublas_f8e4_f32(
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, char * src0_ddq_i,
+    __fp8e4 * src0_ddf_i, float * src1_ddf_i, float * dst_ddf_i, int64_t i02, int64_t i01_low, int64_t i01_high, int i1,
+    cudaStream_t & cudaStream_main){
+
+    GGML_ASSERT(src0_ddf_i != nullptr);
+    GGML_ASSERT(src1_ddf_i != nullptr);
+    GGML_ASSERT(dst_ddf_i != nullptr);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    const int64_t ne00 = src0->ne[0];
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t i01_diff = i01_high - i01_low;
+    dst->meta.cuda_perf_mal_mul_type=84;
+    int id;
+    CUDA_CHECK(cudaGetDevice(&id));
+    // printf("ggml_cuda_op_mul_mat_cublas_f8e4_f32; device_id=%d, ne00=%lld, ne10=%lld, ne11=%lld, i01_diff=%lld, ne0=%lld, i01_low=%lld, i01_high=%lld\n",id,ne00,ne10,ne11,i01_diff,ne0,i01_low,i01_high);
+
+    // we need to convert src1_ddf_i down
+    __fp8e4* src1_ddf_i_fp8e4;
+    size_t src1_size = ne10 * ne11 * sizeof(__fp8e4);
+    size_t actual_size = 0;
+    src1_ddf_i_fp8e4 = (__fp8e4 *)ggml_cuda_pool_malloc(src1_size,&actual_size); // 16 bit alignment is required (malloc guarantees it)
+    // if (reinterpret_cast<uintptr_t>(src1_ddf_i_fp8e4) % 16 != 0)
+    // src1_ddf_i_fp8e4 += (16 - (reinterpret_cast<uintptr_t>(src1_ddf_i_fp8e4) % 16));
+    float_to_fp8e4<<<(ne10 * ne11 + 255) / 256, 256, 0, cudaStream_main>>>(src1_ddf_i, src1_ddf_i_fp8e4, ne10 * ne11);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStream_main));
+
+    // ldc == nrows of the matrix that cuBLAS writes into
+    int ldc = dst->backend == GGML_BACKEND_GPU && id == g_system_gpu_status.main_device_id ? ne0 : i01_diff;
+
+    CUBLAS_CHECK(cublasSetStream(g_cublas_handles[id], cudaStream_main));
+    
+    ggllm_lggemm(g_cublas_handles[id], CUBLAS_OP_T, CUBLAS_OP_N, // transposed a, transposed b
+            i01_diff, ne11, ne10, // m, n, k
+            &alpha, 
+            src0_ddf_i, CUDA_R_8F_E4M3, ne00, // alpha, A, Atype, lda
+            src1_ddf_i_fp8e4, CUDA_R_8F_E4M3, ne10, // B, Btype, ldb
+            &beta,  
+            dst_ddf_i,  CUDA_R_32F, ldc, // beta, C, Ctype
+            CUBLAS_COMPUTE_32F, // computeType
+            CUBLAS_GEMM_DEFAULT,cudaStream_main); 
+    (void) dst;
+    (void) src0_ddq_i;
+    (void) i02;
+    (void) i1;
+    ggml_cuda_pool_unallocate(src1_ddf_i_fp8e4);
+}
+// src0 is actually fp16, everything else is same as normal
+inline void ggml_cuda_op_mul_mat_cublas_f8e4_f32_wrapper(
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, char * src0_ddq_i, float * src0_ddf_i,
+    float * src1_ddf_i, float * dst_ddf_i, int64_t i02, int64_t i01_low, int64_t i01_high, int i1,
+    cudaStream_t & cudaStream_main) {
+
+    // Cast float pointers to half-precision pointers
+    __fp8e4 * src0_ddf_i_half = reinterpret_cast<__fp8e4 *>(src0_ddf_i);
+    // __half * src1_ddf_i_half = reinterpret_cast<__half *>(src1_ddf_i);
+    // __half * dst_ddf_i_half = reinterpret_cast<__half *>(dst_ddf_i);
+
+    // Call the modified function with the casted pointers
+    ggml_cuda_op_mul_mat_cublas_f8e4_f32(src0, src1, dst, src0_ddq_i, src0_ddf_i_half, src1_ddf_i, dst_ddf_i, i02, i01_low, i01_high, i1, cudaStream_main);
 }
 
 
@@ -4130,7 +4828,7 @@ inline void ggml_cuda_op_scale(
 }
 
 static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-                         ggml_cuda_op_t op, bool src0_needs_f32, bool flatten_rows, bool src0_needs_f16) {
+                         ggml_cuda_op_t op, bool src0_needs_f32, bool flatten_rows, bool src0_needs_f16, bool src0_needs_f8e4) {
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
     const int64_t ne02 = src0->ne[2];
@@ -4148,6 +4846,30 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
 
     const int nb2  = dst->nb[2];
     const int nb3  = dst->nb[3];
+    int min_capability_major = 0;
+    int min_capability_minor = 0;
+
+    // force-adapt flags as needed for special operations
+    if (op == ggml_cuda_op_mul_mat_cublas)
+    {
+        src0_needs_f32=true; flatten_rows=false; src0_needs_f16=false; src0_needs_f8e4=false;
+    } else
+    if (op == ggml_cuda_op_mul_mat_cublas_f16_f32_wrapper)
+    {
+        min_capability_major = 6; min_capability_minor = 1;
+        src0_needs_f32=false; flatten_rows=false; src0_needs_f16=true; src0_needs_f8e4=false;
+    } else
+    if (op == ggml_cuda_op_mul_mat_cublas_f8e4_f32_wrapper)
+    {
+        min_capability_major = 8; min_capability_minor = 9;
+        src0_needs_f32=false; flatten_rows=false; src0_needs_f16=false; src0_needs_f8e4=true;
+    } else
+    if (op == ggml_cuda_op_mul_mat_q)
+    {
+        min_capability_major = 6; min_capability_minor = 1;
+        src0_needs_f32=false; flatten_rows=false; src0_needs_f16=false; src0_needs_f8e4=false;
+    } 
+
     GGML_ASSERT((src0_needs_f32 != src0_needs_f16) || (src0_needs_f32 == false && src0_needs_f16 == false));
     GGML_ASSERT(dst->backend != GGML_BACKEND_GPU_SPLIT);
     GGML_ASSERT(!use_src1 || src1->backend != GGML_BACKEND_GPU_SPLIT);
@@ -4171,20 +4893,23 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     const bool src0_is_contiguous = ggml_is_contiguous(src0);
     const bool src0_is_f32 = src0->type == GGML_TYPE_F32;
     const bool src0_is_f16 = src0->type == GGML_TYPE_F16;
+    const bool src0_is_f8e4 = src0->type == GGML_TYPE_I8; // not actually I8 but same size
 
     const bool src1_is_contiguous = use_src1 && ggml_is_contiguous(src1);
     const bool src1_stays_on_host = use_src1 && (
         dst->op == GGML_OP_SCALE || dst->op == GGML_OP_DIAG_MASK_INF || dst->op == GGML_OP_ROPE);
     
 
+    // precision dequantizers
     const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
     const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0->type);
+    const to_fp8e4_cuda_t to_fp8e4_cuda = ggml_get_to_fp8e4_cuda(src0->type);
 
-    // dd = data device
-    char  * src0_ddq[GGML_CUDA_MAX_DEVICES] = {nullptr}; // quantized
-    float * src0_ddf[GGML_CUDA_MAX_DEVICES] = {nullptr}; // float
-    float * src1_ddf[GGML_CUDA_MAX_DEVICES] = {nullptr};
-    float *  dst_ddf[GGML_CUDA_MAX_DEVICES] = {nullptr};
+    // dd = device data
+    char  * src0_ddq[GGML_CUDA_MAX_DEVICES] = {nullptr}; // quantized src0
+    float * src0_ddf[GGML_CUDA_MAX_DEVICES] = {nullptr}; // float src0
+    float * src1_ddf[GGML_CUDA_MAX_DEVICES] = {nullptr}; // float src1
+    float *  dst_ddf[GGML_CUDA_MAX_DEVICES] = {nullptr}; // float dst
 
     // asq = actual size quantized, asf = actual size float
     size_t src0_asq[GGML_CUDA_MAX_DEVICES] = {0};
@@ -4198,19 +4923,46 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
         CUDA_CHECK(cudaSetDevice(g_main_device));
         CUDA_CHECK(cudaEventRecord(src0_extra->events[g_main_device], g_cudaStreams_main[g_main_device]));
     }
-
+    
     for (int id = 0; id < g_device_count; ++id) {
         if (!split && id != g_main_device) {
             continue;
         }
+        // check if special compute capability is required
+        if (split && min_capability_major && !(g_system_gpu_status.device_props[id].major > min_capability_major || (g_system_gpu_status.device_props[id].major == min_capability_major && g_system_gpu_status.device_props[id].minor >= min_capability_minor)))
+        {
+            // split & device does not support the required compute capability, transfer the data to main device
+            // only relevant for fp8 cublas at the moment
+            GGML_ASSERT(id != g_main_device);
+            if (op == ggml_cuda_op_mul_mat_cublas_f8e4_f32_wrapper)
+            {
+                op = ggml_cuda_op_mul_mat_cublas_f16_f32_wrapper;
+                src0_needs_f16 = true;
+                src0_needs_f8e4 = false;
+            } else
+            GGML_ASSERT(false);
+        }
 
         const bool src1_on_device = use_src1 && src1->backend == GGML_BACKEND_GPU && id == g_main_device;
         const bool dst_on_device = dst->backend == GGML_BACKEND_GPU && id == g_main_device;
-
+        // careful: this is duplicate as in transform_tensor
         int64_t row_low, row_high;
         if (split) {
-            row_low = id == 0 ? 0 : nrows0*g_tensor_split[id];
-            row_high = id == g_device_count - 1 ? nrows0 : nrows0*g_tensor_split[id + 1];
+            row_low = (id == 0) ? 0 : nrows0*g_tensor_split[id];
+            // row_high = (id == g_device_count - 1) ? nrows0 : nrows0*g_tensor_split[id + 1];
+            if(id == g_device_count - 1)
+                row_high = nrows0; 
+            else 
+            {
+                // make sure the row count is divisible by MATRIX_SPLIT_DIVISIBLE if possible
+                int64_t nnext_row_up = nrows0*g_tensor_split[id + 1];
+                while((nnext_row_up - row_low) % MATRIX_SPLIT_DIVISIBLE != 0) 
+                {
+                    nnext_row_up++;
+                    if(nnext_row_up >= nrows0) break;
+                }
+                row_high = nnext_row_up;
+            }
         } else {
             row_low = 0;
             row_high = nrows0;
@@ -4220,8 +4972,9 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
         }
 
         int64_t row_diff = row_high - row_low;
-
+        
         cudaSetDevice(id);
+        
         cudaStream_t cudaStream_main = g_cudaStreams_main[id];
 
         // wait for main GPU data if necessary
@@ -4229,13 +4982,15 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
             CUDA_CHECK(cudaStreamWaitEvent(cudaStream_main, src0_extra->events[g_main_device]));
         }
 
-        if (src0_on_device && src0_is_contiguous) {
+        if (src0_on_device && src0_is_contiguous) 
+        {
             if (src0_is_f32) {
                 src0_ddf[id] = (float *) src0_extra->data_device[id];
             } else {
                 src0_ddq[id] = (char *) src0_extra->data_device[id];
             }
-        } else {
+        } else 
+        {
             if (src0_is_f32) {
                 src0_ddf[id] = (float *) ggml_cuda_pool_malloc(row_diff*ne00 * sizeof(float), &src0_asf[id]);
             } else {
@@ -4245,6 +5000,12 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
 
         if (src0_needs_f32 && !src0_is_f32) {
             src0_ddf[id] = (float *) ggml_cuda_pool_malloc(row_diff*ne00 * sizeof(float), &src0_asf[id]);
+        } else
+        if (src0_needs_f16 && !src0_is_f16) {
+            src0_ddf[id] = (float *) ggml_cuda_pool_malloc(row_diff*ne00 * sizeof(half), &src0_asf[id]);
+        } else
+        if (src0_needs_f8e4 && !src0_is_f8e4) {
+            src0_ddf[id] = (float *) ggml_cuda_pool_malloc(row_diff*ne00 * sizeof(__fp8e4), &src0_asf[id]);
         }
 
         if (use_src1 && !src1_stays_on_host) {
@@ -4323,45 +5084,121 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
                 if (dst->backend == GGML_BACKEND_GPU && id == g_main_device) {
                     dst_ddf_i += i01_low; // offset is 0 if no tensor split
                 }
-
-                // copy src0, src1 to device if necessary
-                if (use_src1 && !src1_stays_on_host) {
-                    if (src1->backend == GGML_BACKEND_CPU) {
-                        GGML_ASSERT(!flatten_rows || nrows0 == ggml_nrows(src1));
-                        int64_t nrows1 = flatten_rows ? nrows0 : ne11;
-                        CUDA_CHECK(ggml_cuda_cpy_tensor_2d(src1_ddf_i, src1, i03, i02, 0, nrows1, cudaStream_main));
-                    } else if (src1->backend == GGML_BACKEND_GPU && src1_is_contiguous) {
-                        if (id != g_main_device) {
-                            GGML_ASSERT(!flatten_rows);
-                            float * src1_ddf_i_source = (float *) src1_extra->data_device[g_main_device];
-                            src1_ddf_i_source += i11*src1_stride;
-                            CUDA_CHECK(cudaMemcpyAsync(src1_ddf_i, src1_ddf_i_source, src1_stride*sizeof(float),
-                                                    cudaMemcpyDeviceToDevice, cudaStream_main));
+                {
+                    // copy src0, src1 to device if necessary
+                    if (use_src1 && !src1_stays_on_host) 
+                    {
+                        if (src1->backend == GGML_BACKEND_CPU) 
+                        {
+                            GGML_ASSERT(!flatten_rows || nrows0 == ggml_nrows(src1));
+                            int64_t nrows1 = flatten_rows ? nrows0 : ne11;
+                            CUDA_CHECK(ggml_cuda_cpy_tensor_2d(src1_ddf_i, src1, i03, i02, 0, nrows1, cudaStream_main));
+                        } else if (src1->backend == GGML_BACKEND_GPU && src1_is_contiguous) 
+                        {
+                            if (id != g_main_device) 
+                            {
+                                GGML_ASSERT(!flatten_rows);
+                                float * src1_ddf_i_source = (float *) src1_extra->data_device[g_main_device];
+                                src1_ddf_i_source += i11*src1_stride;
+                                CUDA_CHECK(cudaMemcpyAsync(src1_ddf_i, src1_ddf_i_source, src1_stride*sizeof(float),
+                                                        cudaMemcpyDeviceToDevice, cudaStream_main));
+                            }
+                        } else if (src1_on_device && !src1_is_contiguous) 
+                        {
+                            GGML_ASSERT(!split);
+                            CUDA_CHECK(ggml_cuda_cpy_tensor_2d(src1_ddf_i, src1, i03, i02, 0, ne11, cudaStream_main));
+                        } else 
+                        {
+                            GGML_ASSERT(false);
                         }
-                    } else if (src1_on_device && !src1_is_contiguous) {
-                        GGML_ASSERT(!split);
-                        CUDA_CHECK(ggml_cuda_cpy_tensor_2d(src1_ddf_i, src1, i03, i02, 0, ne11, cudaStream_main));
-                    } else {
-                        GGML_ASSERT(false);
                     }
-                }
 
-                if (!src0_on_device || !src0_is_contiguous) {
-                    if (src0_is_f32) {
-                        CUDA_CHECK(ggml_cuda_cpy_tensor_2d(src0_ddf_i, src0, i03, i02, i01_low, i01_high, cudaStream_main));
-                    } else {
-                        CUDA_CHECK(ggml_cuda_cpy_tensor_2d(src0_ddq_i, src0, i03, i02, i01_low, i01_high, cudaStream_main));
+                    if (!src0_on_device || !src0_is_contiguous) 
+                    {
+                        if (src0_is_f32) {
+                            CUDA_CHECK(ggml_cuda_cpy_tensor_2d(src0_ddf_i, src0, i03, i02, i01_low, i01_high, cudaStream_main));
+                        } else {
+                            CUDA_CHECK(ggml_cuda_cpy_tensor_2d(src0_ddq_i, src0, i03, i02, i01_low, i01_high, cudaStream_main));
+                        }
                     }
-                }
 
-                // convert src0 to f32 if it is necessary for the ggml_cuda_op
-                if (src0_needs_f32 && !src0_is_f32) {
-                    to_fp32_cuda(src0_ddq_i, src0_ddf_i, i01_diff*ne00, cudaStream_main);
-                    CUDA_CHECK(cudaGetLastError());
+                    // convert src0 to f32 if it is necessary for the ggml_cuda_op
+                    if (src0_needs_f32 && !src0_is_f32) {
+                        to_fp32_cuda(src0_ddq_i, src0_ddf_i, i01_diff*ne00, cudaStream_main);
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                    if (src0_needs_f16 && !src0_is_f16) {
+                        to_fp16_cuda(src0_ddq_i, (half*)src0_ddf_i, i01_diff*ne00, cudaStream_main);
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                    if (src0_needs_f8e4 && !src0_is_f8e4) {
+                        to_fp8e4_cuda(src0_ddq_i, (__fp8e4*)src0_ddf_i, i01_diff*ne00, cudaStream_main);
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                    // todo: src1 precision handling instead of inside the operator
                 }
+                
 
                 // do the computation
-                op(src0, src1, dst, src0_ddq_i, src0_ddf_i, src1_ddf_i, dst_ddf_i, i02, i01_low, i01_high, i11, cudaStream_main);
+                /*if (!device_eligible)
+                {
+                    // 1. we need to copy the data from id device to main device temporary buffers
+                    // 2. run operation, synchronize it
+                    // 3. copy the data back to id device (ugh)
+                    float * src0_ddf_i_main_tmp = nullptr;
+                    float * src1_ddf_i_main_tmp = nullptr;
+                    float * dst_ddf_i_main_tmp = nullptr;
+                    size_t src1_ddf_i_size = sizeof(float) * src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3];
+                    GGML_ASSERT(src0_needs_f8e4);
+                    size_t src0_ddf_i_size = src0->ne[0] * (i01_high-i01_low) * sizeof(__fp8e4);
+                    size_t dst_ddf_i_size = src1->ne[1] * (i01_high-i01_low) * sizeof(float);
+                    size_t src0_ddf_i_size_alloc = src0_ddf_i_size;
+                    size_t src1_ddf_i_size_alloc = src1_ddf_i_size;
+                    size_t dst_ddf_i_size_alloc = dst_ddf_i_size;
+                    // allocate
+                    {
+                        // device main
+                        CUDA_CHECK(cudaSetDevice(g_main_device));
+                        src0_ddf_i_main_tmp = (float *) ggml_cuda_pool_malloc(src0_ddf_i_size, &src0_ddf_i_size_alloc);
+                        src1_ddf_i_main_tmp = (float *) ggml_cuda_pool_malloc(src1_ddf_i_size, &src1_ddf_i_size_alloc);
+                        dst_ddf_i_main_tmp = (float *) ggml_cuda_pool_malloc(dst_ddf_i_size, &dst_ddf_i_size_alloc);
+                    }
+                    // copy
+                    {
+                        // device id
+                        CUDA_CHECK(cudaSetDevice(id));
+                        CUDA_CHECK(cudaMemcpyAsync(src0_ddf_i_main_tmp, src0_ddf_i, src0_ddf_i_size, cudaMemcpyDeviceToDevice, g_cudaStreams_main[g_main_device]));
+                        CUDA_CHECK(cudaMemcpyAsync(src1_ddf_i_main_tmp, src1_ddf_i, src1_ddf_i_size, cudaMemcpyDeviceToDevice, g_cudaStreams_main[g_main_device]));
+                        // sync
+                        CUDA_CHECK(cudaStreamSynchronize(g_cudaStreams_main[g_main_device]));
+                        CUDA_CHECK(cudaSetDevice(g_main_device));
+                    }
+                    op(src0, src1, dst, src0_ddq_i, src0_ddf_i_main_tmp, src1_ddf_i_main_tmp, dst_ddf_i_main_tmp, i02, i01_low, i01_high, i11, g_cudaStreams_main[g_main_device]);
+                    // ggml_cuda_update_gpu_status(-1);
+                    // ggml_cuda_print_gpu_status(&g_system_gpu_status,true);
+                    // sync
+                    {
+                        CUDA_CHECK(cudaStreamSynchronize(cudaStream_main));
+                    }
+                    // copy back
+                    {
+                        CUDA_CHECK(cudaMemcpyAsync(dst_ddf_i, dst_ddf_i_main_tmp, dst_ddf_i_size, cudaMemcpyDeviceToDevice, g_cudaStreams_main[g_main_device]));
+                        // sync
+                        CUDA_CHECK(cudaStreamSynchronize(g_cudaStreams_main[g_main_device]));
+                        // free
+                        ggml_cuda_pool_unallocate(src0_ddf_i_main_tmp);
+                        ggml_cuda_pool_unallocate(src1_ddf_i_main_tmp);
+                        ggml_cuda_pool_unallocate(dst_ddf_i_main_tmp);
+                        // use cudaMemcpyPeer instead:
+                        //CUDA_CHECK(cudaMemcpyPeerAsync(dst_ddf_i, id, dst_ddf_i_main_tmp, g_main_device, dst_ddf_i_size, cudaStream_main));
+                        CUDA_CHECK(cudaSetDevice(id));
+                    }
+                } else*/
+                {
+
+                    op(src0, src1, dst, src0_ddq_i, src0_ddf_i, src1_ddf_i, dst_ddf_i, i02, i01_low, i01_high, i11, cudaStream_main);
+                }
+
                 CUDA_CHECK(cudaGetLastError());
 
                 // copy dst to host or other device if necessary
@@ -4447,32 +5284,32 @@ void ggml_cuda_add(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tens
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
         src1->type == GGML_TYPE_F32 &&
         (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16));
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_add, false, true,false);
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_add, false, true,false,false);
 }
 
 void ggml_cuda_mul(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul, true, false,false); // TODO ggml_cuda_op needs modification for flatten
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul, true, false,false,false); // TODO ggml_cuda_op needs modification for flatten
 }
 
 void ggml_cuda_gelu(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_gelu, true, true,false);
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_gelu, true, true,false,false),false;
 }
 
 void ggml_cuda_silu(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_silu, true, true,false);
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_silu, true, true,false,false);
 }
 
 void ggml_cuda_norm(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_norm, true, true,false);
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_norm, true, true,false,false);
 }
 
 void ggml_cuda_rms_norm(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_rms_norm, true, true,false);
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_rms_norm, true, true,false,false);
 }
 
 bool ggml_cuda_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst) {
@@ -4565,49 +5402,81 @@ void ggml_cuda_mul_mat_vec_nc(const ggml_tensor * src0, const ggml_tensor * src1
 void ggml_cuda_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     bool all_on_device = (src0->backend == GGML_BACKEND_GPU || src0->backend == GGML_BACKEND_GPU_SPLIT) &&
         src1->backend == GGML_BACKEND_GPU && dst->backend == GGML_BACKEND_GPU;
-    dst->meta.cuda_perf_mal_mul_type=1;
-    if((dst->meta.cuda_op_force == CUDA_OPT_OP_FORCE_CUBLAS))
-    {
-        ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, true, false,false);
-        return;
-    } else
-    if((dst->meta.cuda_op_force == CUDA_OPT_OP_FORCE_CUBLAS_16))
-    {
-        ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas_f16_f32_wrapper, false, false, true);
-        return;
-    } else
-    if((dst->meta.cuda_op_force == CUDA_OPT_OP_FORCE_CUBLAS_8))
-    {
-        ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, true, false,false);
-        return;
-    }
+    dst->meta.cuda_perf_mal_mul_type=0;
 
+    ggml_cuda_op_t mm_kernel_choice = ggml_cuda_op_mul_mat_cublas;
+    switch (dst->meta.cuda_choice_blas)
+    {
+        case CUDA_CHOICE_BLAS_CUBLAS_F32:
+            mm_kernel_choice = ggml_cuda_op_mul_mat_cublas;
+            break;
+        case CUDA_CHOICE_BLAS_CUBLAS_F16:
+            mm_kernel_choice = ggml_cuda_op_mul_mat_cublas_f16_f32_wrapper;
+            break;
+        case CUDA_CHOICE_BLAS_CUBLAS_8E4:
+            mm_kernel_choice = ggml_cuda_op_mul_mat_cublas_f8e4_f32_wrapper;
+            break;
+        case CUDA_CHOICE_BLAS_QMM:
+            if ( (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q5_0 ||
+                src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_0) )
+                mm_kernel_choice = ggml_cuda_op_mul_mat_q;
+            break;
+        default:
+            mm_kernel_choice = ggml_cuda_op_mul_mat_cublas;
+            break;
+    }
+    if((dst->meta.cuda_op_force == CUDA_OPT_OP_FORCE_BLAS))
+    { 
+       ggml_cuda_op(src0, src1, dst, mm_kernel_choice, true, true,true,true);
+    } else
+    {
+        if (all_on_device && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) 
+            ggml_cuda_mul_mat_vec_p021(src0, src1, dst);
+        else if (all_on_device && !ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && src1->ne[1] == 1) 
+            ggml_cuda_mul_mat_vec_nc(src0, src1, dst);
+        else if (src0->type == GGML_TYPE_F32) 
+            ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, true, false,false,false);
+        else if (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16)
+        {
+            if (src1->ne[1] == 1 && src0->ne[0] % GGML_CUDA_DMMV_X == 0)
+                ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_vec, false, false,false,false);
+            else
+                ggml_cuda_op(src0, src1, dst, mm_kernel_choice, true, true,true,true);
+        } else 
+            GGML_ASSERT(false);
+    }
+    
+   /*
     if (all_on_device && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         ggml_cuda_mul_mat_vec_p021(src0, src1, dst);
     } else if (all_on_device && !ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && src1->ne[1] == 1) {
         ggml_cuda_mul_mat_vec_nc(src0, src1, dst);
     }else if (src0->type == GGML_TYPE_F32) {
-        ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, true, false,false);
+        ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, true, false,false,false);
     } else if (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16) {
         if (src1->ne[1] == 1 && src0->ne[0] % GGML_CUDA_DMMV_X == 0) {
-            ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_vec, false, false,false);
+            ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_vec, false, false,false,false);
         } else {
-            if (dst->meta.cuda_op_force == CUDA_OPT_OP_PERMIT_USE_MAT_Q && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q5_0 ||
+            if ( (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q5_0 ||
                 src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_0) ) {
-                 ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_q, false, false,false);
+                 ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_q, false, false,false,false);
                 //  ggml_tensor_printf(dst, "DST QQ",0,true,true);
             } else {
-                ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, true, false,false);
+                // ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, true, false,false);
+                //ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas_f16_f32_wrapper, false, false, true,false);
+                 ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas_f8e4_f32_wrapper, false, false,false,true);
+
             }
         }
     } else {
         GGML_ASSERT(false);
     }
+    */
 }
 
 void ggml_cuda_scale(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_scale, true, true,false);
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_scale, true, true,false,false);
 }
 
 void ggml_cuda_cpy(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4664,17 +5533,17 @@ void ggml_cuda_dup(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tens
 
 void ggml_cuda_diag_mask_inf(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_diag_mask_inf, true, true,false);
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_diag_mask_inf, true, true,false,false);
 }
 
 void ggml_cuda_soft_max(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_soft_max, true, true,false);
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_soft_max, true, true,false,false);
 }
 
 void ggml_cuda_rope(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_rope, true, false,false); // FIXME flatten changes results
+    ggml_cuda_op(src0, src1, dst, ggml_cuda_op_rope, true, false,false,false); // FIXME flatten changes results
 }
 
 void ggml_cuda_nop(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4682,6 +5551,7 @@ void ggml_cuda_nop(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tens
     (void) src1;
     (void) dst;
 }
+
 
 void ggml_cuda_transform_tensor(void * data, struct ggml_tensor * tensor) {
     int nrows = ggml_nrows(tensor);
@@ -4705,9 +5575,27 @@ void ggml_cuda_transform_tensor(void * data, struct ggml_tensor * tensor) {
         if (backend == GGML_BACKEND_GPU) {
             row_low = 0;
             row_high = nrows;
+            extra->row_low = row_low;
+            extra->row_high = row_high;
         } else if (backend == GGML_BACKEND_GPU_SPLIT) {
             row_low = id == 0 ? 0 : nrows*g_tensor_split[id];
-            row_high = id == g_device_count - 1 ? nrows : nrows*g_tensor_split[id + 1];
+            extra->row_low = row_low;
+            // row_high = id == g_device_count - 1 ? nrows : nrows*g_tensor_split[id + 1];
+            if(id == g_device_count - 1)
+                row_high = nrows; 
+                // here is the place to add additional zero padding if needed
+            else 
+            {
+                // make sure the row count is divisible by MATRIX_SPLIT_DIVISIBLE if possible
+                int64_t nnext_row_up = nrows*g_tensor_split[id + 1];
+                while((nnext_row_up - row_low) % MATRIX_SPLIT_DIVISIBLE != 0) 
+                {
+                    nnext_row_up++;
+                    if(nnext_row_up >= nrows) break;
+                }
+                row_high = nnext_row_up;
+            }
+            extra->row_high = row_high;
         } else {
             GGML_ASSERT(false);
         }
@@ -4789,7 +5677,7 @@ static struct ggml_tensor_extra_gpu * ggml_cuda_alloc_temp_tensor_extra() {
 
 void ggml_cuda_assign_buffers_impl(struct ggml_tensor * tensor, bool scratch, bool force_inplace) {
     if (scratch && g_scratch_size == 0) {
-        tensor->meta.cuda_op_force = CUDA_OPT_OP_FORCE_DEFAULT; // depending on op buffers are dynamically created
+        tensor->meta.cuda_op_force = CUDA_OPT_OP_FORCE_DEFAULT; // depending on op, buffers are dynamically created at time of operation
         return;
     }
 
@@ -4842,6 +5730,7 @@ void ggml_cuda_assign_buffers_impl(struct ggml_tensor * tensor, bool scratch, bo
         extra->data_device[g_main_device] = data + g_scratch_offset;
 
         g_scratch_offset += size;
+        g_scratch_offset += (16 - g_scratch_offset % 16) % 16;
 
         GGML_ASSERT(g_scratch_offset <= g_scratch_size);
     } else { // allocate new buffers outside of scratch

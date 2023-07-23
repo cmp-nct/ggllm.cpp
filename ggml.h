@@ -425,18 +425,21 @@ extern "C" {
 
     static const size_t GGML_OBJECT_SIZE = sizeof(struct ggml_object);
     enum ggml_cuda_opt_op_force {
-        CUDA_OPT_OP_FORCE_DEFAULT = -1,
-        CUDA_OPT_OP_FORCE_CPU = 0,
-        CUDA_OPT_OP_FORCE_CUDA = 1,
-        CUDA_OPT_OP_FORCE_CUBLAS= 2,
-        CUDA_OPT_OP_FORCE_CUBLAS_16= 3,
-        CUDA_OPT_OP_FORCE_CUBLAS_8= 4,
-        CUDA_OPT_OP_PERMIT_USE_MAT_Q= 100,  // permit the use of quantized full matmul kernel
+        CUDA_OPT_OP_FORCE_DEFAULT = -1,    // default behavior (CUDA if possible)
+        CUDA_OPT_OP_FORCE_CPU = 0,         // CPU only
+        CUDA_OPT_OP_FORCE_CUDA = 1,        // CUDA only
+        CUDA_OPT_OP_FORCE_BLAS = 2,        // CUDA only, use cuBLAS even for vector ops
     };
     enum ggml_info_compute_device {
         GGML_INFO_COMPUTE_DEVICE_UNDEFINED = -2,
         GGML_INFO_COMPUTE_DEVICE_CPU = -1,
         GGML_INFO_COMPUTE_DEVICE_GPU = 0,
+    };
+    enum ggml_cuda_choice_blas {
+        CUDA_CHOICE_BLAS_CUBLAS_F32 = 0,     // full fp precision
+        CUDA_CHOICE_BLAS_CUBLAS_F16 = 1,     // half fp precision (no loss in quality)
+        CUDA_CHOICE_BLAS_CUBLAS_8E4 = 2,     // quarter fp precision (experimental, Ada+ (RTX 3080 or later), CUBLAS 12.1+)
+        CUDA_CHOICE_BLAS_QMM = 3,         // quantized matmul kernel (buggy/wip)
     };
     
 
@@ -447,6 +450,7 @@ extern "C" {
             char short_name[GGML_MAX_NAME];   // shorter parameter weight name without layer name - used for debugging visualization only
 
             enum ggml_cuda_opt_op_force cuda_op_force;       // -1 = default, 0 = no CUDA operation permitted, 1 = CUDA operation enforced (if possible) - allows to skip or force CUDA (needs more implementations)
+            enum ggml_cuda_choice_blas cuda_choice_blas;     // 0 = full fp precision, 1 = half fp precision, 2 = quarter fp precision (experimental, Ada+ (RTX 3080 or later), CUBLAS 12.1+)
 
             enum ggml_info_compute_device ggml_info_compute_op_device;         // informs where a ggml operation took place
             uint8_t cuda_perf_mal_mul_type;   // perf info flag for dst tensors: 0 = no matmul, 1-8 = quantized kernel, 16/32 cuBLAS 16 or 32 bit processing
@@ -457,13 +461,14 @@ extern "C" {
 
             uint8_t debug_flag;
 
-            char padding[3];
+            char padding[15];
     } tensor_meta;
     const static tensor_meta GGML_DEFAULT_TENSOR_META = {
             /*.layer_id =*/ -1,
             /*.short_name =*/ "",
 
             /*.cuda_op_force =*/ CUDA_OPT_OP_FORCE_DEFAULT,
+            /*.cuda_choice_blas =*/ CUDA_CHOICE_BLAS_CUBLAS_F32,
 
             /*.ggml_info_compute_op_device =*/ GGML_INFO_COMPUTE_DEVICE_UNDEFINED,
             /*.cuda_perf_mal_mul_type =*/ 0,
@@ -473,7 +478,7 @@ extern "C" {
             /*.debug_flag =*/ 0,
 
 
-            /*.padding =*/ {0,0,0},
+            /*.padding =*/ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
     };
     static tensor_meta GGML_CURRENT_DEFAULT_TENSOR_META;
     tensor_meta* ggml_tensor_default_meta_change();
@@ -509,7 +514,7 @@ extern "C" {
 
         char name[GGML_MAX_NAME];
 
-        void * extra; // extra things (populated in ggml-cuda.cu, so it's cuBLAS only)
+        void * extra; // cuda-ggml extra things (populated in ggml-cuda.cu, so it's cuBLAS only)
         tensor_meta meta; // structured generic meta data - increase in chunks of 16 bytes only
 
         char padding[4];
