@@ -265,7 +265,7 @@ if (LLAMA_CUBLAS)
         if (FALCON_NO_FP8)
             set(CMAKE_CUDA_ARCHITECTURES "60;61")
         else()
-            set(CMAKE_CUDA_ARCHITECTURES "61;86;89") # 86 = rtx30 ; 89 = rtx 40 fp8
+            set(CMAKE_CUDA_ARCHITECTURES "61;89") # 86 = rtx30 ; 89 = rtx 40 fp8
         endif()
 
     else()

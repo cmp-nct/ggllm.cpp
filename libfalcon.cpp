@@ -176,7 +176,7 @@ static size_t MEM_REQ_KV_SELF(
     const int n_layer = hparams.n_layer;
 
     const int64_t ne = n_head_kv * head_dim * n_layer * n_ctx;
-    #ifdef FALCON_NO_KV_UPGRADE
+    #ifdef FALCON_KV_CYCLE_DISABLE
     return ggml_tensor_overhead()*3 + 2u * (ggml_tensor_overhead() + ne * ggml_type_size(wtype));
     #else
     return ggml_tensor_overhead()*3 + 3u * (ggml_tensor_overhead() + ne * ggml_type_size(wtype));
@@ -217,7 +217,7 @@ struct falcon_layer {
 
 struct falcon_kv_cache {
     struct ggml_tensor * k;
-    struct ggml_tensor * v; // only used with FALCON_NO_KV_UPGRADE
+    struct ggml_tensor * v; // only used with FALCON_KV_CYCLE_DISABLE
     struct ggml_tensor * v_a;
     struct ggml_tensor * v_b;
     
@@ -587,6 +587,7 @@ struct falcon_context {
     int32_t n_eval   = 0; // number of eval calls
     int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
 
+    falcon_loader_config loader_config = FALCON_LOADER_CONFIG_DEFAULT;
     falcon_model &model;
     falcon_vocab &vocab;
 
@@ -1252,6 +1253,9 @@ struct llama_model_loader {
                         lock_size += lt.size;
                         lmlock->grow_to(lock_size);
                     }
+#if defined(GGML_USE_CUBLAS)
+                    ggml_cuda_assign_extra_to_tensor(lt.ggml_tensor);
+#endif
                     break;
 #if defined(GGML_USE_CUBLAS)
                 case GGML_BACKEND_GPU:
@@ -1368,7 +1372,7 @@ static bool kv_cache_init(
     }
 
     cache.k = ggml_new_tensor_1d(cache.ctx, wtype, n_elements);
-    #ifdef FALCON_NO_KV_UPGRADE
+    #ifdef FALCON_KV_CYCLE_DISABLE
     cache.v = ggml_new_tensor_1d(cache.ctx, wtype, n_elements); // only used as reference now
     cache.v_a = ggml_new_tensor_1d(cache.ctx, wtype, 0);
     cache.v_b = ggml_new_tensor_1d(cache.ctx, wtype, 0);
@@ -1399,28 +1403,6 @@ static bool kv_cache_init(
     return true;
 }
 
-struct falcon_context_params falcon_context_default_params() {
-    struct falcon_context_params result = {
-        /*.n_ctx                       =*/ 512,
-        /*.n_batch                     =*/ 512,
-        /*.n_gpu_layers                  =*/ 0,
-        /*.i_gpu_start                 =*/ -1,
-        /*.i_gpu_last                   =*/ -1,
-        /*.main_gpu                    =*/ 0,
-        /*.tensor_split                =*/ {0},
-        /*.seed                        =*/ -1,
-        /*.f16_kv                      =*/ false,
-        /*.logits_all                  =*/ false,
-        /*.vocab_only                  =*/ false,
-        /*.use_mmap                    =*/ true,
-        /*.use_mlock                   =*/ false,
-        /*.embedding                   =*/ false,
-        /*.progress_callback           =*/ nullptr,
-        /*.progress_callback_user_data =*/ nullptr,
-    };
-
-    return result;
-}
 
 struct llama_model_quantize_params llama_model_quantize_default_params() {
     struct llama_model_quantize_params result = {
@@ -1564,20 +1546,39 @@ size_t calculate_layer_vram_bytes(const falcon_layer& layer) {
     return size;
 }
 
-static falcon_model * falcon_model_load_internal(
-        const std::string & fname,
-        int n_ctx,
-        int n_batch,
-        int n_gpu_layers,
-        int main_gpu,
-        ggml_type memory_type,
-        bool use_mmap,
-        bool use_mlock,
-        bool vocab_only,
-        falcon_progress_callback progress_callback,
-        void * progress_callback_user_data) {
+static falcon_model * falcon_model_load_internal(falcon_loader_config &config) {
     falcon_model * model_ = new falcon_model();
     falcon_model & model = *model_;
+
+    // const std::string & fname,
+    //     int n_ctx,
+    //     int n_batch,
+    //     int n_gpu_layers,
+    //     int main_gpu,
+    //     ggml_type memory_type,
+    //     bool use_mmap,
+    //     bool use_mlock,
+    //     bool vocab_only,
+    const std::string & fname = config.fname;
+    int n_ctx = config.n_ctx;
+    int n_batch = config.n_batch;
+    int n_gpu_layers = config.n_gpu_layers;
+    #if defined(GGML_USE_CUBLAS)
+    int main_gpu = ggml_cuda_get_system_gpu_status()->main_device_id;
+    bool cuda_secondary_offload = config.secondary_cuda_offload;
+    bool use_cuda = config.use_cuda;
+    #else
+    int main_gpu = 0;
+    bool cuda_secondary_offload = false;
+    bool use_cuda = false; 
+    #endif
+    ggml_type memory_type = config.memory_type;
+    bool use_mmap = config.use_mmap;
+    bool use_mlock = config.use_mlock;
+    bool vocab_only = config.vocab_only;
+    falcon_progress_callback &progress_callback = config.progress_callback;
+    void * progress_callback_user_data = config.progress_callback_user_data;
+
    
 
     std::unique_ptr<llama_model_loader> ml(new llama_model_loader(fname, use_mmap, vocab_only));
@@ -1662,8 +1663,7 @@ static falcon_model * falcon_model_load_internal(
 
     (void) main_gpu;
 #if defined(GGML_USE_CUBLAS)
-    if (n_gpu_layers > 0)
-        fprintf(stderr, "%s: using CUDA for GPU acceleration\n", __func__);
+    fprintf(stderr, "%s: using CUDA for GPU acceleration\n", __func__);
     ggml_cuda_set_main_device(main_gpu);
 #define LLAMA_BACKEND_OFFLOAD       GGML_BACKEND_GPU
 #define LLAMA_BACKEND_OFFLOAD_SPLIT GGML_BACKEND_GPU_SPLIT
@@ -1684,12 +1684,22 @@ static falcon_model * falcon_model_load_internal(
 #if defined(GGML_USE_CUBLAS)
     ggml_cuda_update_gpu_status(-1);
     const GPUStatus *system_gpu_status = ggml_cuda_get_system_gpu_status();
+
     vram_free = system_gpu_status->total_free_vram;
 
-    if (system_gpu_status->device_vram_reserved[main_gpu] != 0)
+    // populate default vram reserve if unset
+    for (int i = 0; i < system_gpu_status->num_devices; i++)
     {
-        vram_reserved = system_gpu_status->device_vram_reserved[main_gpu];
+        if (system_gpu_status->device_vram_reserved[i] == 0)
+        {
+            ggml_cuda_set_vram_reserved(i, vram_reserved);
+            break;
+        }
     }
+
+    vram_reserved = system_gpu_status->device_vram_reserved[main_gpu];
+
+
     // cublas is used in 16 bit mode, temporary cuda storage/conversion buffers are needed for batch ingestion ( could be run in 16 bit mode without performance downgrade and save half the VRAM)
 
     if (system_gpu_status->num_devices > 0)
@@ -1703,13 +1713,19 @@ static falcon_model * falcon_model_load_internal(
             { 
                 if (n_batch > 1)
                 {
-                    vram_overhead += (1016+512+144+50)*MB; 
+                    if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
+                        vram_overhead += (1016+512+144+50)/2*MB; 
+                    else
+                        vram_overhead += (1016+512+144+50)*MB; 
                     fprintf(stderr, "%s: INFO: using n_batch larger than 1 requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
                 } else
                 {
                     if (hparams.n_vocab%2)
                     {
-                        vram_overhead += (1016+512+144+50)*MB;
+                        if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
+                            vram_overhead += (1016+512+144+50)/2*MB;
+                        else
+                            vram_overhead += (1016+512+144+50)*MB;
                         fprintf(stderr, "%s: INFO: unoptimized fine-tune weights requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
                     }
                 }
@@ -1723,14 +1739,20 @@ static falcon_model * falcon_model_load_internal(
             { 
                 if (n_batch > 1)
                 {
-                    vram_overhead += (157+563+41)*MB; 
+                    if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
+                        vram_overhead += (157+563+41)/2*MB; 
+                    else
+                        vram_overhead += (157+563+41)*MB; 
                     fprintf(stderr, "%s: INFO: using n_batch larger than 1 will require additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
                 } else
                 {
                     if (hparams.n_vocab%2)
                     {
+                        if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
+                            vram_overhead += (157+563+41)/2*MB; 
+                        else
                             vram_overhead += (157+563+41)*MB; 
-                            fprintf(stderr, "%s: INFO: unoptimized fine-tune weights requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
+                        fprintf(stderr, "%s: INFO: unoptimized fine-tune weights requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
                     }
                 }
             }
@@ -1782,8 +1804,14 @@ static falcon_model * falcon_model_load_internal(
         // output layer offloading is on by default now, it's one of the biggest CPU consumers
         bool offload_output = true;
         if (n_gpu_layers == 0) offload_output = false;
+        bool backend_use_split=false;
         #ifdef GGML_USE_CUBLAS
-        if (system_gpu_status->num_devices == 0) offload_output = false;
+        if (system_gpu_status->num_devices_active == 0) offload_output = false;
+        
+        if (system_gpu_status->num_devices_active > 1)
+        {
+            backend_use_split = true;
+        }
         #endif
 
         if (offload_output) { // NOLINT
@@ -1793,6 +1821,10 @@ static falcon_model * falcon_model_load_internal(
             if (model.type == FALCON_7B && n_batch > 1)
             {
                 backend_output = LLAMA_BACKEND_OFFLOAD; // only one n_head_kv 
+            } else
+            if (!backend_use_split)
+            {
+                backend_output = LLAMA_BACKEND_OFFLOAD; 
             }
         } else {
             backend_norm = GGML_BACKEND_CPU;
@@ -1830,7 +1862,6 @@ static falcon_model * falcon_model_load_internal(
 
 
         int i_gpu_last = n_layer; // allows to terminate the offloading earlier. TODO: instead do a proper calculation run and determine the start before the loop
-
         #ifdef GGML_USE_CUBLAS
         if (system_gpu_status->num_devices == 0)
         {
@@ -1844,12 +1875,15 @@ static falcon_model * falcon_model_load_internal(
         model.i_gpu_start = i_gpu_start;
         model.i_gpu_last = i_gpu_last; // if VRAM doesn't run out i_gpu_last is always the last layer
 
-
         model.layers.resize(n_layer);
         for (uint32_t i = 0; i < n_layer; ++i) {
             ggml_set_current_layer_id(i);
             const ggml_backend backend = (int(i) < i_gpu_start || int(i) > i_gpu_last) ? GGML_BACKEND_CPU : LLAMA_BACKEND_OFFLOAD; // NOLINT
-            const ggml_backend backend_split = (int(i) < i_gpu_start || int(i) > i_gpu_last) ? GGML_BACKEND_CPU : LLAMA_BACKEND_OFFLOAD_SPLIT; // NOLINT
+            ggml_backend backend_split = ((int(i) < i_gpu_start || int(i) > i_gpu_last)) ? GGML_BACKEND_CPU : LLAMA_BACKEND_OFFLOAD_SPLIT; // NOLINT
+            if (!backend_use_split)
+            {
+                backend_split = backend;
+            }
 
             auto & layer = model.layers[i];
 
@@ -1884,6 +1918,8 @@ static falcon_model * falcon_model_load_internal(
                 
                 if (i < n_layer && (int64_t)vram_free <= (int64_t)(vram_overhead+vram_scratch+vram_reserved+vram_layer))
                 {
+                    // printf all details:
+                    printf("Mem details: layer=%d, vram_layer=%zd, vram_free=%zd, vram_overhead=%zd, vram_scratch=%zd, vram_reserved=%zd\n", i, vram_layer, vram_free, vram_overhead, vram_scratch, vram_reserved);
                     int64_t missing_vram_mb =
                         (vram_layer * n_layer + vram_scratch + vram_reserved + vram_overhead + vram_output) > system_gpu_status->total_free_vram ?
                         ((vram_layer * n_layer + vram_scratch + vram_reserved + vram_overhead + vram_output) - system_gpu_status->total_free_vram) / MB + 1 :
@@ -1963,6 +1999,48 @@ static falcon_model * falcon_model_load_internal(
     #else
     progress_callback(1.0f, progress_callback_user_data,"Tensors populated");
     #endif
+    #if defined(GGML_USE_CUBLAS)
+    if (cuda_secondary_offload)
+    {
+        if (n_batch > 1)
+        {
+            // vram_reserve is used to prevent offloading secondary buffers beyond the amount needed for temporary buffers
+            // todo: calculation needed, also vram_overhead is similar defined 
+            if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
+            {
+                // todo: nbsize instead of hardcode
+                if (model.type == FALCON_40B)
+                {
+                    vram_reserved += (512)*MB; // 268mb fp8 buffers + vram-free result uncertainty
+                } else
+                {
+                    vram_reserved += (256)*MB; 
+                }
+            } else
+            if (system_gpu_status->device_props->major > 6 || (system_gpu_status->device_props->major == 6 && system_gpu_status->device_props->minor >= 1))
+            {
+                if (model.type == FALCON_40B)
+                {
+                    vram_reserved += (750)*MB; // 530mb fp16 buffers + vram-free result uncertainty
+                } else
+                {
+                    vram_reserved += (350)*MB; 
+                }
+            } else
+            {
+                if (model.type == FALCON_40B)
+                {
+                    vram_reserved += (1400)*MB;  // fp32
+                } else
+                {
+                    vram_reserved += (700)*MB; 
+                }
+            }
+            if (config.verbose)
+                fprintf(stderr, "%s: INFO: adjusting vram reserve for multi-batch secondary offloading to: %7.2f MB\n", __func__, vram_reserved/MB*1.0);
+        }
+    }
+    #endif
 
     model.mapping = std::move(ml->mapping);
 
@@ -1973,20 +2051,9 @@ static falcon_model * falcon_model_load_internal(
 }
 
 static falcon_model * falcon_model_load(
-        const std::string & fname,
-        int n_ctx,
-        int n_batch,
-        int n_gpu_layers,
-        int main_gpu,
-        ggml_type memory_type,
-        bool use_mmap,
-        bool use_mlock,
-        bool vocab_only,
-        falcon_progress_callback progress_callback,
-        void *progress_callback_user_data) {
+        falcon_loader_config &config) {
     try {
-        falcon_model *model = falcon_model_load_internal(fname, n_ctx, n_batch, n_gpu_layers, main_gpu, memory_type,
-                                  use_mmap, use_mlock, vocab_only, progress_callback, progress_callback_user_data);
+        falcon_model *model = falcon_model_load_internal(config);
         return model;
     } catch (const std::exception & err) {
         fprintf(stderr, "error loading model: %s\n", err.what());
@@ -2029,7 +2096,7 @@ static bool falcon_eval_internal(
 
     const int64_t t_start_us = ggml_time_us();
     bool use_broadcasting = true;   //(n_tokens == 1); // switched from interleaving repeat to broadcasting
-    
+
     const int N = configuration.n_tokens;
     //const int N = embd_inp.size();
 
@@ -2070,19 +2137,18 @@ static bool falcon_eval_internal(
     struct ggml_context * ctx0 = ggml_init(params);
     ggml_tensor_default_meta_change()->cuda_op_force = CUDA_OPT_OP_FORCE_CPU; // we default to CPU for all operations
     #ifdef GGML_USE_CUBLAS
-
+    ggml_tensor_default_meta_change()->ggml_cuda_no_secondary_offload = !configuration.secondary_cuda_offload;
     if (ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major >8 || ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major ==8 && ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].minor >=9)
         ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_8E4;
     else if (ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major >6 || ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major ==6 && ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].minor >=1)
         ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_F16;
-
     #endif
-    ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_8E4;
+    //  ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_8E4;
     //  ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_F16;
+    //  ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_F32;
 
 
-    // for big prompts, if BLAS is enabled, it is better to use only one thread
-    // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance
+
     ggml_cgraph gf = {};
 
             
@@ -2217,10 +2283,8 @@ static bool falcon_eval_internal(
             cur = ggml_mul_mat(ctx0, model.layers[il].query_key_value, cur);
             /// offload_func(cur);
             ggml_set_name(cur, "qkv = W_qkv * cur");
-             cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
-            //  cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CUBLAS;
-            //  cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
-// TODO: garbage output on dequantizer kernel
+            cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+            //   cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_BLAS;
 
             // Note that the strides for Kcur, Vcur are set up so that the
             // resulting views are misaligned with the tensor's storage
@@ -2272,7 +2336,7 @@ static bool falcon_eval_internal(
                     (il * n_ctx + n_past));  
             ggml_set_name(k, "k");
             ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Kcur, k));
-        #ifdef FALCON_NO_KV_UPGRADE
+        #ifdef FALCON_KV_CYCLE_DISABLE
             struct ggml_tensor* v = ggml_view_1d(
                 ctx0, kv_self.v, 
                 N * n_head_kv * head_dim,
@@ -2282,7 +2346,7 @@ static bool falcon_eval_internal(
             ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Vcur, v));
         #endif
                 
-        #ifndef FALCON_NO_KV_UPGRADE
+        #ifndef FALCON_KV_CYCLE_DISABLE
             struct ggml_tensor* V_prev = ggml_view_3d(
                 ctx0,
                 (kv_self.v_current == kv_self.V_A)?kv_self.v_a:kv_self.v_b,
@@ -2336,6 +2400,7 @@ static bool falcon_eval_internal(
             struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
             ggml_set_name(Q, "Q");
             struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+            KQ->meta.cuda_op_force = CUDA_OPT_OP_FORCE_DEFAULT;
             if (use_broadcasting) 
                 KQ->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU; // disable cuda for KQ when broadcasting (todo)
     // TODO
@@ -2357,10 +2422,9 @@ static bool falcon_eval_internal(
             // KQ = soft_max(KQ_masked)
             struct ggml_tensor * KQ_soft_max = ggml_soft_max_inplace(ctx0, KQ_masked);
             ggml_set_name(KQ_soft_max, "KQ_soft_max");
-            //   KQ_soft_max->meta.cuda_op_force = CUDA_OPT_OP_FORCE_DEFAULT;
 
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
-            #ifdef FALCON_NO_KV_UPGRADE
+            #ifdef FALCON_KV_CYCLE_DISABLE
             struct ggml_tensor* V = ggml_permute(
                 ctx0,
                 ggml_view_3d(
@@ -2387,9 +2451,11 @@ static bool falcon_eval_internal(
 
             // KQV = transpose(V) * KQ_soft_max
             struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
-            if (use_broadcasting) KQV->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
-            ggml_set_name(KQV, "KQV");
             KQV->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+            if (use_broadcasting) 
+                KQV->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
+            ggml_set_name(KQV, "KQV");
+            
 
             // KQV_merged = KQV.permute(0, 2, 1, 3)
             struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
@@ -2407,6 +2473,7 @@ static bool falcon_eval_internal(
                         cur);
                 /// offload_func(cur);
                 cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+                // cur->meta.cuda_op_force = CUDA_OPT_OP_FORCE_BLAS;
                 ggml_set_name(cur, "result_wo");
             } 
         } // end of attention
@@ -2424,6 +2491,7 @@ static bool falcon_eval_internal(
             cur = ggml_mul_mat(ctx0, model.layers[il].ffn_up, inpFF);
             // cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
             cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+            // cur->meta.cuda_op_force = CUDA_OPT_OP_FORCE_BLAS;
             // cur->meta.cuda_op_force=CUDA_OPT_OP_PERMIT_USE_MAT_Q;
             ///offload_func(cur);
             ggml_set_name(cur, "inpFF*ff_up"); 
@@ -2432,6 +2500,7 @@ static bool falcon_eval_internal(
             cur = ggml_mul_mat(ctx0, model.layers[il].ffn_down, cur);
             // cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
             cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+            // cur->meta.cuda_op_force = CUDA_OPT_OP_FORCE_BLAS;
             // cur->meta.cuda_op_force=CUDA_OPT_OP_PERMIT_USE_MAT_Q;
             // offload_func(cur);
             ggml_set_name(cur, "gelu_cur*ff_down");
@@ -2482,6 +2551,7 @@ static bool falcon_eval_internal(
     // language modelling head
     cur = ggml_mul_mat(ctx0, model.lm_head, cur); 
     cur->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+    //  cur->meta.cuda_op_force = CUDA_OPT_OP_FORCE_BLAS;
     // cur->meta.cuda_op_force=CUDA_OPT_OP_PERMIT_USE_MAT_Q;
     /// offload_func(cur);
     
@@ -2549,7 +2619,7 @@ static bool falcon_eval_internal(
             if ((first && configuration.debug_timings <=2) || configuration.debug_timings > 2)
             {
                 first = false;
-                // ggml_graph_print_impl(&gf,true,false,GGML_OP_MUL_MAT); // GGML_OP_MUL_MAT / GGML_OP_NONE
+                //ggml_graph_print_impl(&gf,true,false,GGML_OP_MUL_MAT,-1); // GGML_OP_MUL_MAT / GGML_OP_NONE
                 ggml_graph_print_impl(&gf,true,false,GGML_OP_NONE,0); // GGML_OP_MUL_MAT / GGML_OP_NONE
             }
         }
@@ -3790,24 +3860,25 @@ void falcon_context_set_buffers(falcon_context *ctx, int n_batch, int n_ctx)
     // fprintf(stderr, "Buffers: compute %.2f MB, scratch0 %.2f MB, scratch1 %.2f MB\n", MEM_REQ_EVAL().at(ctx->model.type)/1024.0/1024.0, (MEM_REQ_SCRATCH0().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).first)/1024.0/1024.0, (MEM_REQ_SCRATCH1().at(ctx->model.type)+MEM_REQ_EVAL_BATCH(ctx->model.type,n_batch,n_ctx).second)/1024.0/1024.0);
 }
 // create a new context with KV cache - if model type is set falcon_context_set_buffers() is called as well
-struct falcon_context * falcon_context_prepare(falcon_context_params params, falcon_model *model, std::string context_name, bool verbose)
+struct falcon_context * falcon_context_prepare(falcon_loader_config &configuration, falcon_model *model, std::string context_name, bool verbose)
 {
     falcon_context * ctx = new falcon_context(*model, model->vocab); // ctx model/vocab only references to the globals
     ctx->context_name=context_name;
-    if (params.seed < 0) {
-        params.seed = time(NULL);
+    if (configuration.seed < 0) {
+        configuration.seed = time(NULL);
     }
 
-    ctx->rng = std::mt19937(params.seed);
-    ctx->logits_all = params.logits_all;
+    ctx->rng = std::mt19937(configuration.seed);
+    ctx->logits_all = configuration.logits_all;
+    ctx->loader_config = configuration;
 
-    ggml_type memory_type = params.f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    ggml_type memory_type = configuration.memory_type;
     ctx->t_start_us = ggml_time_us(); 
 
-    if (!params.vocab_only)
+    if (!configuration.vocab_only)
     {
         // reserve memory for context buffers
-        if (!kv_cache_init(ctx->model.hparams, ctx->model.kv_self, memory_type, ctx->model.hparams.n_ctx, params.n_gpu_layers)) {
+        if (!kv_cache_init(ctx->model.hparams, ctx->model.kv_self, memory_type, ctx->model.hparams.n_ctx, configuration.n_gpu_layers)) {
             fprintf(stderr, "%s: kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;
@@ -3817,20 +3888,20 @@ struct falcon_context * falcon_context_prepare(falcon_context_params params, fal
         const auto & hparams = ctx->model.hparams;
 
         // resized during inference
-        if (params.logits_all) {
+        if (configuration.logits_all) {
             ctx->logits.reserve(hparams.n_ctx*hparams.n_vocab);
         } else {
             ctx->logits.reserve(hparams.n_vocab);
         }
 
-        if (params.embedding){
+        if (configuration.embedding){
             ctx->embedding.resize(hparams.n_embd);
         }
         
         if (verbose && model->type != FALCON_UNKNOWN)
         {
             const size_t memory_size = ggml_nbytes(ctx->model.kv_self.k) + ggml_nbytes(ctx->model.kv_self.v);
-            falcon_context_set_buffers(ctx, params.n_batch, params.n_ctx);
+            falcon_context_set_buffers(ctx, configuration.n_batch, configuration.n_ctx);
             fprintf(stderr, "%s: Context %s RAM buffers - key_val = %7.2f MB, Compute = %7.2f MB, Scratch 0 = %7.2f MB, Scratch 1 = %7.2f MB \n", __func__, context_name.c_str(), memory_size / 1024.0 / 1024.0, ctx->buf_compute.size /1024.0/1024.0, (ctx->buf_scratch[0].size)/1024.0/1024.0, (ctx->buf_scratch[1].size)/1024.0/1024.0);
         }
 
@@ -3875,21 +3946,17 @@ struct falcon_model * falcon_get_falcon_model(falcon_context * ctx)
     return &ctx->model;
 }
 
-struct falcon_context * falcon_init_from_file(
-                             const char * path_model,
-            struct falcon_context_params   params) {
+struct falcon_context * falcon_init_from_file( struct falcon_loader_config &loader_config) {
+    const char * path_model = loader_config.fname.c_str();
     ggml_time_init();
 
-    
- 
-
     unsigned cur_percentage = 0;
-    if (params.progress_callback == NULL) {
-        params.progress_callback_user_data = &cur_percentage; // not sure why this is so complicated ? I left it for now
-        params.progress_callback = [](float progress, void * ctx, const char *status) {
+    if (loader_config.progress_callback == NULL) {
+        loader_config.progress_callback_user_data = &cur_percentage; // not sure why this is so complicated ? I left it for now
+        loader_config.progress_callback = [](float progress, void * ctx, const char *status) {
             unsigned percentage = (unsigned) (100 * progress);
             unsigned * cur_percentage_p = (unsigned *) ctx;
-            static const int bar_width = 50;
+            static const int bar_width = 60;
             bool completed = false;
             if (percentage >= 100) {
                 completed = true;
@@ -3922,20 +3989,20 @@ struct falcon_context * falcon_init_from_file(
         };
     }
     int64_t t_start_us = ggml_time_us();
-    ggml_type memory_type = params.f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
-    falcon_model *model = falcon_model_load(path_model, params.n_ctx, params.n_batch, params.n_gpu_layers,
-                params.main_gpu, memory_type, params.use_mmap, params.use_mlock,
-                params.vocab_only, params.progress_callback, params.progress_callback_user_data);
+    ggml_type memory_type = loader_config.memory_type;
+
+
+    falcon_model *model = falcon_model_load(loader_config);
     if (model == nullptr) {
         fprintf(stderr, "%s: failed to load model\n", __func__);
         // llama_free(f_ctx);
         return nullptr;
     }
     // model_load_internal() may change this if VRAM runs out
-    params.n_gpu_layers = model->n_gpu_layers; 
-    params.i_gpu_start = model->i_gpu_start; // first layer that's GPU accelerated
-    params.i_gpu_last = model->i_gpu_last; // last layer that's GPU accelerated
-    falcon_context * f_ctx = falcon_context_prepare(params, model, "falcon_main",true);
+    loader_config.n_gpu_layers = model->n_gpu_layers; 
+    loader_config.i_gpu_start = model->i_gpu_start; // first layer that's GPU accelerated
+    loader_config.i_gpu_last = model->i_gpu_last; // last layer that's GPU accelerated
+    falcon_context * f_ctx = falcon_context_prepare(loader_config, model, "falcon_main",true);
     f_ctx->t_load_us = ggml_time_us() - t_start_us;
     f_ctx->t_start_us = t_start_us;
     //falcon_context_set_buffers(f_ctx,params.n_batch,params.n_ctx);
@@ -3961,7 +4028,7 @@ int falcon_model_quantize(
         return 1;
     }
 }
-
+#if 0
 int llama_apply_lora_from_file_internal(struct falcon_context * ctx, const char * path_lora, const char * path_base_model, int n_threads) {
     fprintf(stderr, "%s: applying lora adapter from '%s' - please wait ...\n", __func__, path_lora);
 
@@ -4216,6 +4283,7 @@ int llama_apply_lora_from_file(struct falcon_context * ctx, const char * path_lo
         return 1;
     }
 }
+#endif
 
 int llama_get_kv_cache_token_count(const struct falcon_context * ctx) {
     return ctx->model.kv_self.n;
@@ -4262,9 +4330,9 @@ size_t llama_get_state_size(const struct falcon_context * ctx) {
 }
 
 // Copies the state to the specified destination address
-size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
+size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) 
+{
     uint8_t * out = dst;
-
     // copy rng
     {
         std::stringstream rng_ss;
@@ -4335,7 +4403,7 @@ size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
             out += ggml_nbytes(kout3d);
 
             // ggml_tensor * vout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_embd, n_layer);
-            #ifdef FALCON_NO_KV_UPGRADE
+            #ifdef FALCON_KV_CYCLE_DISABLE
             ggml_tensor * vout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, n_head_kv*head_dim, kv_ntok, n_layer);
             #else
             ggml_tensor * vout3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_head_kv*head_dim, n_layer);
@@ -4353,7 +4421,7 @@ size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
             ggml_tensor * k3d = ggml_view_3d(cpy_ctx, kv_self.k,
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
-            #ifdef FALCON_NO_KV_UPGRADE
+            #ifdef FALCON_KV_CYCLE_DISABLE
             ggml_tensor * v3d = ggml_view_3d(cpy_ctx, kv_self.v,
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
@@ -4383,7 +4451,8 @@ size_t falcon_copy_state_data(struct falcon_context * ctx, uint8_t * dst) {
 }
 
 // Sets (restores) the state reading from the specified source address
-size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
+size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) 
+{
     uint8_t * inp = src;
 
     // set rng
@@ -4462,7 +4531,7 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
             inp += ggml_nbytes(kin3d);
 
             // ggml_tensor * vin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_embd, n_layer);
-            #ifdef FALCON_NO_KV_UPGRADE
+            #ifdef FALCON_KV_CYCLE_DISABLE
             ggml_tensor * vin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, n_head_kv*head_dim, kv_ntok, n_layer);
             #else
             ggml_tensor * vin3d = ggml_new_tensor_3d(cpy_ctx, kv_self.v->type, kv_ntok, n_head_kv*head_dim, n_layer);
@@ -4481,7 +4550,7 @@ size_t falcon_set_state_data(struct falcon_context * ctx, uint8_t * src) {
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
 
-            #ifdef FALCON_NO_KV_UPGRADE
+            #ifdef FALCON_KV_CYCLE_DISABLE
             ggml_tensor * v3d_cur = ggml_view_3d(cpy_ctx, kv_self.v,
                 n_head_kv*head_dim, kv_ntok, n_layer,
                 elt_size*n_head_kv*head_dim, elt_size*n_head_kv*head_dim*n_ctx, 0);
@@ -4527,7 +4596,7 @@ bool falcon_kv_shave(struct falcon_context * ctx, int n_maxkv)
     FALCON_ASSERT(kv_ntok > n_maxkv);
 
     const size_t elt_size = ggml_element_size(kv_self.k);
-    #ifndef FALCON_NO_KV_UPGRADE    
+    #ifndef FALCON_KV_CYCLE_DISABLE    
     ggml_context * cpy_ctx = ggml_init({ 1024*1024, NULL, /* no_alloc */ true });
     ggml_cgraph gf{};
     for (int il = 0; il < n_layer; il++)
@@ -4655,7 +4724,7 @@ int falcon_eval(
     // fprintf(stderr, "n_ctx=%d, n_embd=%d, n_head=%d, n_layer=%d, n_vocab=%d\n", ctx->model.hparams.n_ctx, ctx->model.hparams.n_embd, ctx->model.hparams.n_head, ctx->model.hparams.n_layer, ctx->model.hparams.n_vocab);
     FALCON_ASSERT(ctx->model.hparams.n_ctx >= (configuration.n_past+configuration.n_tokens)); // kv buffer overflow
     #if defined(GGML_USE_CUBLAS)
-    static int no_purge_counter=0; // once the system is stable for 3 iterations, we stop testing
+    static int no_purge_counter=0; // once the system is stable, we stop testing
     if (no_purge_counter < 3 || configuration.n_past%50==0) {
         int purges=0;
         const GPUStatus *status = ggml_cuda_get_system_gpu_status();

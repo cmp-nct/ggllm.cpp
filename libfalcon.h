@@ -76,11 +76,73 @@ extern "C" {
 
     typedef void (*falcon_progress_callback)(float progress, void *ctx, const char *status);
 
+    struct falcon_loader_config {
+        std::string fname;      // path to the model file or empty
+
+        int n_ctx = 0;          // context size
+        int n_batch = 0;        // batch size
+        int n_max_real_ctx = 0; // the actual max achievable context given all parameters (-c, -n, -enc, -sys)
+        int seed;                              // RNG seed, -1 for random
+        // cpu related
+        int n_threads = 1;      // number of threads available
+
+        // memory related
+        bool use_mmap = true;   // use mmap if possible (using false is experimental)
+        bool use_mlock = false; // force system to keep model in RAM
+        ggml_type memory_type;  // memory type to use for the kv cache
+
+        // cuda related
+        bool secondary_cuda_offload = false; // enable dynamic offloading of fp16/fp8 tensors for cuBLAS during batch processing phase
+        bool use_cuda = false;  // use cuda
+        int n_gpu_layers = 0;   // number of layers to store in VRAM
+        int i_gpu_start;        // first gpu layer
+        int i_gpu_last;         // last gpu layer
+        // float tensor_split[LLAMA_MAX_DEVICES]; // split position for layers across multiple GPUs
+
+        // debug/special related
+        bool embedding;  // embedding mode only
+        bool logits_all; // eval() computes all logits, not just the last one
+        bool vocab_only = false; // only load the vocabulary for tokenization
+        bool verbose = false;  
+
+        // called with a progress value between 0 and 1, pass NULL to disable
+        falcon_progress_callback progress_callback;
+        // context pointer passed to the progress callback
+        void * progress_callback_user_data;
+    };
+
+    const static falcon_loader_config FALCON_LOADER_CONFIG_DEFAULT = {
+        /* fname = */ "",
+        /* n_ctx = */ 2048,
+        /* n_batch = */ 512,
+        /* n_max_real_ctx = */ 2048,
+        /* seed = */ -1,
+        /* n_threads = */ 1,
+        /* use_mmap = */ true,
+        /* use_mlock = */ false,
+        /* memory_type = */ ggml_type::GGML_TYPE_F32,
+        /* secondary_cuda_offload = */ false,
+        /* use_cuda = */ false,
+        /* n_gpu_layers = */ 0,
+        /* i_gpu_start = */ -1,
+        /* i_gpu_last = */ -1,
+        // /* tensor_split = */ {0},
+        /* embedding = */ false,
+        /* logits_all = */ false,
+        /* vocab_only = */ false,
+        /* verbose = */ false,
+        /* progress_callback = */ nullptr,
+        /* progress_callback_user_data = */ nullptr
+    };
+
     struct falcon_evaluation_config {
         // mandatory configuration
         int n_tokens = 1;       // number of tokens to process
         int n_past = 0;         // number of tokens in kv cache past
         int n_threads = 1;      // number of threads available
+
+        // cuda related
+        bool secondary_cuda_offload = false; // enable dynamic offloading of fp16/fp8 tensors for cuBLAS during batch processing phase
 
         // optional
         const char *cgraph_fname = nullptr; // path to the cgraph export file
@@ -88,30 +150,31 @@ extern "C" {
 
         // debug related
         int debug_timings = 0;  // 0 (none), 1(first token), 2(first,last), 3(every token)
+        bool verbose = false;  
     };
 
-    struct falcon_context_params {
-        int n_ctx;                             // text context
-        int n_batch;                           // prompt processing batch size
-        int n_gpu_layers;                      // number of layers to store in VRAM
-        int i_gpu_start;                       // first gpu layer
-        int i_gpu_last;                         // last gpu layer
-        int main_gpu;                          // the GPU that is used for scratch and small tensors
-        float tensor_split[LLAMA_MAX_DEVICES]; // how to split layers across multiple GPUs
-        int seed;                              // RNG seed, -1 for random
+    // struct falcon_context_params {
+    //     int n_ctx;                             // text context
+    //     int n_batch;                           // prompt processing batch size
+    //     int n_gpu_layers;                      // number of layers to store in VRAM
+    //     int i_gpu_start;                       // first gpu layer
+    //     int i_gpu_last;                         // last gpu layer
+    //     int main_gpu;                          // the GPU that is used for scratch and small tensors
+    //     float tensor_split[LLAMA_MAX_DEVICES]; // how to split layers across multiple GPUs
+    //     int seed;                              // RNG seed, -1 for random
 
-        bool f16_kv;     // use fp16 for KV cache
-        bool logits_all; // the llama_eval() call computes all logits, not just the last one
-        bool vocab_only; // only load the vocabulary, no weights
-        bool use_mmap;   // use mmap if possible
-        bool use_mlock;  // force system to keep model in RAM
-        bool embedding;  // embedding mode only
+    //     bool f16_kv;     // use fp16 for KV cache
+    //     bool logits_all; // the llama_eval() call computes all logits, not just the last one
+    //     bool vocab_only; // only load the vocabulary, no weights
+    //     bool use_mmap;   // use mmap if possible
+    //     bool use_mlock;  // force system to keep model in RAM
+    //     bool embedding;  // embedding mode only
 
-        // called with a progress value between 0 and 1, pass NULL to disable
-        falcon_progress_callback progress_callback;
-        // context pointer passed to the progress callback
-        void * progress_callback_user_data;
-    };
+    //     // called with a progress value between 0 and 1, pass NULL to disable
+    //     falcon_progress_callback progress_callback;
+    //     // context pointer passed to the progress callback
+    //     void * progress_callback_user_data;
+    // };
 
     // model file types
     enum llama_ftype {
@@ -146,7 +209,7 @@ extern "C" {
 
 
 
-    LLAMA_API struct falcon_context_params falcon_context_default_params();
+    LLAMA_API struct falcon_loader_config;
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params();
 
     LLAMA_API bool llama_mmap_supported();
@@ -162,10 +225,8 @@ extern "C" {
     // Various functions for loading a ggml llama model.
     // Allocate (almost) all memory needed for the model.
     // Return NULL on failure
-    LLAMA_API struct falcon_context * falcon_init_from_file(
-                             const char * path_model,
-            struct falcon_context_params   params
-            );
+    LLAMA_API struct falcon_context * falcon_init_from_file(falcon_loader_config &config);
+
     // prepare scratch and computation buffers
     LLAMA_API void falcon_context_set_buffers(falcon_context *ctx, int n_batch, int n_ctx);
     LLAMA_API struct falcon_model * falcon_get_falcon_model(falcon_context * ctx);
@@ -255,7 +316,7 @@ extern "C" {
                                    int   capacity);
 
     // prepares a falcon_context based on a model, also allocates scratch buffers based on parameters
-    LLAMA_API struct falcon_context * falcon_context_prepare(falcon_context_params params, falcon_model *model, std::string context_name, bool verbose);
+    LLAMA_API struct falcon_context * falcon_context_prepare(falcon_loader_config &config, falcon_model *model, std::string context_name, bool verbose);
 
     // Token logits obtained from the last call to llama_eval()
     // The logits for the last token are stored in the last row

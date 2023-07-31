@@ -203,7 +203,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.top_k = std::stoi(argv[i]);
-            params.sampling_not_default=true;
+            params._sampling_not_default=true;
         } else if (arg == "-c" || arg == "--ctx-size") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -212,24 +212,24 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             params.n_ctx = std::stoi(argv[i]);
         } else if (arg == "--memory-f16") {
             params.memory_f16 = true;
-            params.kvmem_not_default=true;
+            params._kvmem_not_default=true;
         } else if (arg == "--memory-f32") {
             params.memory_f16 = false;
-            params.kvmem_not_default=true;
+            params._kvmem_not_default=true;
         } else if (arg == "--top-p") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
             }
             params.top_p = std::stof(argv[i]);
-            params.sampling_not_default=true;
+            params._sampling_not_default=true;
         } else if (arg == "--temp") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
             }
             params.temp = std::stof(argv[i]);
-            params.sampling_not_default=true;
+            params._sampling_not_default=true;
         } else if (arg == "--tfs") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -242,7 +242,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.typical_p = std::stof(argv[i]);
-            params.sampling_not_default=true;
+            params._sampling_not_default=true;
         } else if (arg == "--repeat-last-n") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -273,7 +273,7 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.mirostat = std::stoi(argv[i]);
-            params.sampling_not_default=true;
+            params._sampling_not_default=true;
         } else if (arg == "--mirostat-lr") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -409,14 +409,18 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
             #else
             fprintf(stderr, "warning: falcon.cpp was compiled without cuBLAS. It is not possible limit GPU devices.\n");
             #endif
-        } else if (arg == "--gpu-reserve-mb-main") {
+        } else if (arg == "-NSO" || arg == "--no-secondary-offload")
+        {
+            params._cuda_offload_secondary = false;
+        } else        
+        if (arg == "--gpu-reserve-mb-main") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
             }
             #ifdef GGML_USE_CUBLAS
             params.mb_reserve_gpu_main = std::stoi(argv[i]);
-            ggml_cuda_set_vram_reserved(((int64_t)params.mb_reserve_gpu_main)*1024*1024);
+            ggml_cuda_set_vram_reserved(-1,((int64_t)params.mb_reserve_gpu_main)*1024*1024);
             #else
             fprintf(stderr, "warning: falcon.cpp was compiled without cuBLAS. VRAM not available.\n");
             #endif
@@ -475,6 +479,8 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 params.debug_timings = std::stoi(argv[i]);
         } else if (arg == "--verbose-prompt") {
             params.verbose_prompt = true;
+        } else if (arg == "--verbose" || arg == "-v") {
+            params.verbose = true;
         } else if (arg == "-r" || arg == "--reverse-prompt") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -729,11 +735,13 @@ These options allow to control and fine-tune the text generation process
     }
 #ifdef LLAMA_SUPPORTS_GPU_OFFLOAD
     fprintf(stdout, "-ngl,       --n-gpu-layers N\n");
-    fprintf(stdout, "                            number of layers to store in VRAM, default is to fill VRAM \n");
+    fprintf(stdout, "                            number of layers to store in VRAM, default is to fill VRAM\n");
     fprintf(stdout, "-ts,        --tensor-split SPLIT\n");
     fprintf(stdout, "                            how to split tensors across multiple GPUs, comma-separated list of proportions, e.g. 3,1\n");
+    fprintf(stdout, "                            default is to split evenly by free VRAM\n");
     fprintf(stdout, "-mg,        --main-gpu N    the GPU to use for scratch and small tensors (0 = first)\n" );
     fprintf(stdout, "    --override-max-gpu N    limits the number of GPUs visible (allows to disable multi/single GPU processing)\n");
+    fprintf(stdout, "-NSO --no-secondary-offload Disables dynamic secondary offloading\n");
     fprintf(stdout, "    --gpu-reserve-mb-main N override reserved total VRAM MB (can be negative if driver supports swapping into RAM) \n\n\n");
     //fprintf(stdout, "  --gpu_reserve_mb_other override reserved VRAM MB for other GPUs (for multi GPU systems)\n");
 #endif
@@ -741,10 +749,11 @@ These options allow to control and fine-tune the text generation process
     fprintf(stdout, "-------------------\n");
     fprintf(stdout, "Options for monitoring, control, debugging\n\n");
     fprintf(stdout, "        --mtest             compute maximum memory usage\n");
-    fprintf(stdout, "        --export            export the computation graph to 'llama.ggml'\n");
+    fprintf(stdout, "        --export            export the computation graph to 'falcon.ggml'\n");
+    fprintf(stdout, "        --verbose           print additional verbose and debugging information\n");
     fprintf(stdout, "        --verbose-prompt    print prompt before generation\n");
-    fprintf(stdout, "-dt,    --debug-timings N   print GGML_PERF debug output (requires GGML_PERF=1 for timings)\n");
-    fprintf(stdout, "                            1 = print first layer, 2 = print first and last layer, 3+ = all layers\n");
+    fprintf(stdout, "-dt,    --debug-timings N   print GGML_PERF debug output (requires GGML_PERF=1 (default) for timings)\n");
+    fprintf(stdout, "                            1 = print first evaluation, 2 = print first and last eval, 3+ = all evaluations\n");
     fprintf(stdout, "\n");
 }
 
@@ -778,29 +787,60 @@ std::vector<falcon_token> falcon_tokenize(struct falcon_context * ctx, const std
 
     return res;
 }
-struct falcon_context_params falcon_context_params_create(const gpt_params &params)
+// struct falcon_context_params falcon_context_params_create(const gpt_params &params)
+// {
+//     auto lparams = falcon_context_default_params();
+
+//     lparams.n_ctx        = params.n_ctx;
+//     lparams.n_batch      = params.n_batch;
+//     lparams.n_gpu_layers = params.n_gpu_layers;
+//     lparams.main_gpu     = params.main_gpu;
+//     memcpy(lparams.tensor_split, params.tensor_split, LLAMA_MAX_DEVICES*sizeof(float));
+//     lparams.seed         = params.seed;
+//     lparams.f16_kv       = params.memory_f16;
+//     lparams.use_mmap     = params.use_mmap;
+//     lparams.use_mlock    = params.use_mlock;
+//     lparams.logits_all   = params.perplexity;
+//     lparams.embedding    = params.embedding;
+
+//     return lparams;
+// }
+// todo: move context_params in here
+
+falcon_loader_config falcon_loader_config_create(const gpt_params &params)
 {
-    auto lparams = falcon_context_default_params();
+    falcon_loader_config config;
+    config = FALCON_LOADER_CONFIG_DEFAULT;
 
-    lparams.n_ctx        = params.n_ctx;
-    lparams.n_batch      = params.n_batch;
-    lparams.n_gpu_layers = params.n_gpu_layers;
-    lparams.main_gpu     = params.main_gpu;
-    memcpy(lparams.tensor_split, params.tensor_split, LLAMA_MAX_DEVICES*sizeof(float));
-    lparams.seed         = params.seed;
-    lparams.f16_kv       = params.memory_f16;
-    lparams.use_mmap     = params.use_mmap;
-    lparams.use_mlock    = params.use_mlock;
-    lparams.logits_all   = params.perplexity;
-    lparams.embedding    = params.embedding;
+    config.fname = params.model.c_str();
+    config.n_ctx = params.n_ctx;
+    config.n_batch = params.n_batch;
+    config.n_max_real_ctx = params.n_ctx; // should be n_predict + combined prompt size
+    config.seed = params.seed;
+    config.n_threads = params.n_threads;
+    config.use_mmap = params.use_mmap;
+    config.use_mlock = params.use_mlock;
+    config.memory_type = params.memory_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    config.secondary_cuda_offload = params._cuda_offload_secondary;
+    config.use_cuda = params.n_gpu_layers > 0 && params.n_max_gpu > 0;
+    config.n_gpu_layers = params.n_gpu_layers;
+    config.i_gpu_start = params.main_gpu;
+    // std::memcpy(config.tensor_split, params.tensor_split, LLAMA_MAX_DEVICES * sizeof(float));
+    config.embedding = params.embedding;
+    config.vocab_only = false;
+    config.verbose = params.verbose;
+    config.progress_callback = nullptr;
+    config.progress_callback_user_data = nullptr;
 
-    return lparams;
+    return config;
 }
+
 
 struct falcon_context * falcon_init_from_gpt_params(const gpt_params & params) {
     
-    struct falcon_context_params lparams = falcon_context_params_create(params);
-    falcon_context * lctx = falcon_init_from_file(params.model.c_str(), lparams);
+    struct falcon_loader_config loader_config = falcon_loader_config_create(params);
+
+    falcon_context * lctx = falcon_init_from_file(loader_config);
 
     if (lctx == NULL) {
         fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());

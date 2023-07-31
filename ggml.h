@@ -438,7 +438,7 @@ extern "C" {
     enum ggml_cuda_choice_blas {
         CUDA_CHOICE_BLAS_CUBLAS_F32 = 0,     // full fp precision
         CUDA_CHOICE_BLAS_CUBLAS_F16 = 1,     // half fp precision (no loss in quality)
-        CUDA_CHOICE_BLAS_CUBLAS_8E4 = 2,     // quarter fp precision (experimental, Ada+ (RTX 3080 or later), CUBLAS 12.1+)
+        CUDA_CHOICE_BLAS_CUBLAS_8E4 = 2,     // quarter fp precision (experimental, Ada+ (RTX 40xx, H100 or later), CUBLAS 12.1+)
         CUDA_CHOICE_BLAS_QMM = 3,         // quantized matmul kernel (buggy/wip)
     };
     
@@ -451,9 +451,10 @@ extern "C" {
 
             enum ggml_cuda_opt_op_force cuda_op_force;       // -1 = default, 0 = no CUDA operation permitted, 1 = CUDA operation enforced (if possible) - allows to skip or force CUDA (needs more implementations)
             enum ggml_cuda_choice_blas cuda_choice_blas;     // 0 = full fp precision, 1 = half fp precision, 2 = quarter fp precision (experimental, Ada+ (RTX 3080 or later), CUBLAS 12.1+)
+            bool ggml_cuda_no_secondary_offload;             // if true - disallow secondary data offloads
 
             enum ggml_info_compute_device ggml_info_compute_op_device;         // informs where a ggml operation took place
-            uint8_t cuda_perf_mal_mul_type;   // perf info flag for dst tensors: 0 = no matmul, 1-8 = quantized kernel, 16/32 cuBLAS 16 or 32 bit processing
+            uint8_t cuda_perf_mal_mul_type;   // perf info flag for dst tensors: 0 = no matmul, 1-8 = quantized kernel, 16/32 cuBLAS 16 or 32 bit processing, 84 = cublas fp8
 
             // custom parameters for quick ggml function alteration (for example: rope)
             float f_custom[4];  
@@ -461,7 +462,7 @@ extern "C" {
 
             uint8_t debug_flag;
 
-            char padding[15];
+            char padding[11];
     } tensor_meta;
     const static tensor_meta GGML_DEFAULT_TENSOR_META = {
             /*.layer_id =*/ -1,
@@ -469,6 +470,7 @@ extern "C" {
 
             /*.cuda_op_force =*/ CUDA_OPT_OP_FORCE_DEFAULT,
             /*.cuda_choice_blas =*/ CUDA_CHOICE_BLAS_CUBLAS_F32,
+            /*.ggml_cuda_no_secondary_offload =*/ false,
 
             /*.ggml_info_compute_op_device =*/ GGML_INFO_COMPUTE_DEVICE_UNDEFINED,
             /*.cuda_perf_mal_mul_type =*/ 0,
@@ -478,7 +480,7 @@ extern "C" {
             /*.debug_flag =*/ 0,
 
 
-            /*.padding =*/ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+            /*.padding =*/ {0,0,0,0,0,0,0,0,0,0,0,},
     };
     static tensor_meta GGML_CURRENT_DEFAULT_TENSOR_META;
     tensor_meta* ggml_tensor_default_meta_change();

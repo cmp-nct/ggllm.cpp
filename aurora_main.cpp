@@ -109,7 +109,7 @@ int main(int argc, char ** argv) {
     }
 
     if (params.n_ctx > 2048) {
-        if (params.sampling_not_default)
+        if (params._sampling_not_default)
         {
             // a slightly lower temperature can help offset perplexity increases - those numbers need some tuning
             if (params.n_ctx >= 4096) {
@@ -161,19 +161,19 @@ int main(int argc, char ** argv) {
 
     if (params.system_prompt.size() && !params.sys_prompt_simple)
     {
-        auto sys_context_params = falcon_context_params_create(params);
-        // if (sys_context_params.n_batch > 1)
+        auto sys_loader_config = falcon_loader_config_create(params);
+        // if (sys_loader_config.n_batch > 1)
         // {
         //     if (params.system_prompt.size() < 128)
-        //         sys_context_params.n_batch = 1;
+        //         sys_loader_config.n_batch = 1;
         // }
-        ctx_system = falcon_context_prepare(sys_context_params,main_model,"system_ctx",true);
+        ctx_system = falcon_context_prepare(sys_loader_config,main_model,"system_ctx",true);
     }
 
 
     #if defined(GGML_USE_CUBLAS)
-    // wait for cublas and show device information
     {
+        // wait for cublas and show device information
         ggml_cuda_print_gpu_status(ggml_cuda_get_system_gpu_status(),true);
     }
     #endif
@@ -196,6 +196,7 @@ int main(int argc, char ** argv) {
                 configuration.debug_timings = params.debug_timings;
                 configuration.n_threads = params.n_threads;
                 configuration.n_tokens = (int)tmp.size();
+                configuration.verbose = params.verbose;
             falcon_eval(ctx, tmp.data(), configuration);
         }
 
@@ -206,6 +207,7 @@ int main(int argc, char ** argv) {
                 configuration.debug_timings = params.debug_timings;
                 configuration.n_threads = params.n_threads;
                 configuration.n_tokens = (int)tmp.size();
+                configuration.verbose = params.verbose;
             falcon_eval(ctx, tmp.data(), configuration);
         }
 
@@ -538,6 +540,26 @@ int main(int argc, char ** argv) {
     if (params.n_keep < 0 || params.n_keep > (int) embd_inp.size() || params.instruct) {
         params.n_keep = (int)embd_inp.size();
     }
+    #if defined(GGML_USE_CUBLAS)
+    {
+        if (params._cuda_offload_secondary)
+        {
+            // we only offload if it makes sense
+            if (params.n_batch > 1 && (embd_inp.size() - n_matching_session_tokens)/params.n_batch > 2)
+            {
+                params._cuda_offload_secondary = true;
+                if (params.verbose)
+                    fprintf(stderr, "%s: info: using secondary CUDA offload for batched multi-run prompt ingestion\n", __func__);
+            } else
+            {
+                params._cuda_offload_secondary = false;
+                if (params.verbose)
+                    fprintf(stderr, "%s: info: batched multi-run prompt ingestion - not using secondary CUDA offload\n", __func__);
+            }
+        }
+        
+    }
+    #endif
 
 
    
@@ -682,6 +704,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
                 configuration.debug_timings = 0;
                 configuration.n_threads = params.n_threads;
                 configuration.n_tokens = (int)tmp.size();
+                configuration.verbose = params.verbose;
         falcon_eval(ctx, tmp.data(), configuration);
         llama_reset_timings(ctx);
     }
@@ -846,6 +869,17 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
                 configuration.debug_timings = debug_timings;
                 configuration.n_threads = params.n_threads;
                 configuration.n_tokens = n_eval;
+                configuration.verbose = params.verbose;
+                #ifdef GGML_USE_CUBLAS
+                configuration.secondary_cuda_offload = (configuration.n_tokens > 1) && params._cuda_offload_secondary;
+                if (configuration.n_tokens == 1 && params._cuda_offload_secondary)
+                {
+                    // if (configuration.verbose)
+                    //     fprintf(stderr, "%s: INFO: Freeing up secondary offloads\n", __func__);
+                    ggml_cuda_pool_purge_secondary_offloads(true,true);
+                    params._cuda_offload_secondary = false; // disable it from here on
+                }
+                #endif
                 if (!params.interactive && params.n_predict > 0)
                     configuration.n_max_real_ctx = std::min((int)n_ctx, (int)(prompt_size+params.n_predict));
                 if (falcon_eval(ctx, &embd[i], configuration)) {

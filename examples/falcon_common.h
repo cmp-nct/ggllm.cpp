@@ -90,9 +90,11 @@ struct gpt_params {
     bool mem_test          = false; // compute maximum memory usage
     bool export_cgraph     = false; // export the computation graph
     bool verbose_prompt    = false; // print prompt tokens before generation
-    bool sampling_not_default = false; // readonly, true if any sampling change is requested
-    bool kvmem_not_default = false; // readonly
+    bool verbose           = false; // print additional verbose information
     int debug_timings      = 0;     // print timings (required for GGML_PERF=1)
+    bool _cuda_offload_secondary = true; // enable dynamic offloading of fp16/fp8 tensors for cuBLAS during batch processing phase
+    bool _sampling_not_default = false; // readonly, true if any sampling change is requested
+    bool _kvmem_not_default = false; // readonly
 };
 
 bool gpt_params_parse(int argc, char ** argv, gpt_params & params);
@@ -110,7 +112,7 @@ std::vector<falcon_token> falcon_tokenize(struct falcon_context * ctx, const std
 //
 // Model utils
 //
-struct falcon_context_params falcon_context_params_create(const gpt_params &params);
+struct falcon_loader_config falcon_loader_config_create(const gpt_params &params);
 struct falcon_context * falcon_init_from_gpt_params(const gpt_params & params);
 
 //

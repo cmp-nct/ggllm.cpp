@@ -16,6 +16,7 @@ extern "C" {
 typedef struct {
     int max_gpus; // the max number of devices that can be used
     int num_devices;
+    int num_devices_active;
     int main_device_id;
     size_t total_vram;
     size_t total_free_vram;
@@ -44,7 +45,7 @@ bool   ggml_init_cublas(bool check_only);
 void   ggml_cuda_update_gpu_status(int device_id);
 void   ggml_cuda_print_gpu_status(const GPUStatus *status, bool print_summary);
 void   ggml_cuda_set_max_gpus(int max_gpus);
-void   ggml_cuda_set_vram_reserved(int64_t vram_reserved);
+void   ggml_cuda_set_vram_reserved(int device_id, int64_t vram_reserved);
 void   ggml_cuda_set_tensor_split_prepare(const float * tensor_split, int num_devices);
 void   ggml_cuda_set_tensor_split(const float * tensor_split);
 
@@ -57,9 +58,13 @@ void   ggml_cuda_mul_mat(const struct ggml_tensor * src0, const struct ggml_tens
 void * ggml_cuda_host_malloc(size_t size);
 void   ggml_cuda_host_free(void * ptr);
 void   ggml_cuda_pool_reset_all_counters(int device_id);
-int   ggml_cuda_pool_purge_buffers_with_access_count(int min_access_count,int device_id);
+int    ggml_cuda_pool_purge_buffers_with_access_count(int min_access_count,int device_id);
+int    ggml_cuda_pool_purge_secondary_offloads(bool disable_secondary_offload, bool true_unallocate);
+
+static bool ggml_cuda_pool_associate_tensor(void * ptr, struct ggml_tensor *tensor);
 
 void   ggml_cuda_transform_tensor(void * data, struct ggml_tensor * tensor);
+void ggml_cuda_assign_extra_to_tensor(struct ggml_tensor * tensor);
 
 void   ggml_cuda_free_data(struct ggml_tensor * tensor);
 void   ggml_cuda_assign_buffers(struct ggml_tensor * tensor);

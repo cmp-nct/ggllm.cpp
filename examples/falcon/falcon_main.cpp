@@ -111,7 +111,7 @@ int main(int argc, char ** argv) {
     }
 
     if (params.n_ctx > 2048) {
-        if (params.sampling_not_default)
+        if (params._sampling_not_default)
         {
             // a slightly lower temperature can help offset perplexity increases - those numbers need some tuning
             if (params.n_ctx >= 4096) {
