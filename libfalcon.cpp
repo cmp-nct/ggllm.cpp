@@ -885,8 +885,15 @@ struct falcon_file_loader {
             fprintf(stderr, "falcon.cpp: fallback for old file format. Loading BPE merges from tokenizer.json\n");
             std::string fname_str(fname);
             size_t last_slash_idx = fname_str.find_last_of("\\/");
-            std::string parent_path = fname_str.substr(0, last_slash_idx);
-            std::string tokenizer_json_path = parent_path + "/tokenizer.json";
+            std::string parent_path;
+            if (last_slash_idx != std::string::npos) {
+                // slash was found, include original slash in path
+                parent_path = fname_str.substr(0, last_slash_idx +1);
+            } else {
+                // No slash found, the fname is the filename itself
+                parent_path = "";
+            }
+            std::string tokenizer_json_path = parent_path + "tokenizer.json";
             auto merges = vocab.parse_json_to_bpe_merges(tokenizer_json_path);
             if (merges.empty()) {
                 fprintf(stderr, "falcon.cpp: error: old file format. Place json data in directory: %s\n", tokenizer_json_path.c_str());
