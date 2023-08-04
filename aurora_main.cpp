@@ -705,6 +705,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
                 configuration.n_threads = params.n_threads;
                 configuration.n_tokens = (int)tmp.size();
                 configuration.verbose = params.verbose;
+                configuration.cublas_enabled = params.cublas_enabled;
         falcon_eval(ctx, tmp.data(), configuration);
         llama_reset_timings(ctx);
     }
@@ -872,6 +873,7 @@ fprintf(stderr, "+------------+-------+-------+-------+-------+---------------+-
                 configuration.verbose = params.verbose;
                 #ifdef GGML_USE_CUBLAS
                 configuration.secondary_cuda_offload = (configuration.n_tokens > 1) && params._cuda_offload_secondary;
+                configuration.cublas_enabled = params.cublas_enabled;
                 if (configuration.n_tokens == 1 && params._cuda_offload_secondary)
                 {
                     // if (configuration.verbose)

@@ -440,6 +440,7 @@ extern "C" {
         CUDA_CHOICE_BLAS_CUBLAS_F16 = 1,     // half fp precision (no loss in quality)
         CUDA_CHOICE_BLAS_CUBLAS_8E4 = 2,     // quarter fp precision (experimental, Ada+ (RTX 40xx, H100 or later), CUBLAS 12.1+)
         CUDA_CHOICE_BLAS_QMM = 3,         // quantized matmul kernel (buggy/wip)
+        CUDA_CHOICE_BLAS_ILBC = 4,         // interleaving broadcast kernel
     };
     
 

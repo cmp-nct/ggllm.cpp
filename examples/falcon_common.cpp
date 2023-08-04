@@ -412,6 +412,9 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
         } else if (arg == "-NSO" || arg == "--no-secondary-offload")
         {
             params._cuda_offload_secondary = false;
+        } else if (arg == "--cublas")
+        {
+            params.cublas_enabled = true;
         } else        
         if (arg == "--gpu-reserve-mb-main") {
             if (++i >= argc) {
@@ -741,7 +744,8 @@ These options allow to control and fine-tune the text generation process
     fprintf(stdout, "                            default is to split evenly by free VRAM\n");
     fprintf(stdout, "-mg,        --main-gpu N    the GPU to use for scratch and small tensors (0 = first)\n" );
     fprintf(stdout, "    --override-max-gpu N    limits the number of GPUs visible (allows to disable multi/single GPU processing)\n");
-    fprintf(stdout, "-NSO --no-secondary-offload Disables dynamic secondary offloading\n");
+    fprintf(stdout, "-NSO --no-secondary-offload Disables dynamic secondary offloading (cuBLAS only)\n");
+    fprintf(stdout, "--cublas                    Use cuBLAS (fp8/fp16) instead of custom kernels\n");
     fprintf(stdout, "    --gpu-reserve-mb-main N override reserved total VRAM MB (can be negative if driver supports swapping into RAM) \n\n\n");
     //fprintf(stdout, "  --gpu_reserve_mb_other override reserved VRAM MB for other GPUs (for multi GPU systems)\n");
 #endif

@@ -14,6 +14,7 @@
 
 #include "ggml-cuda.h"
 #include "ggml.h"
+//#define GGML_CUDA_F16 // not supported in fp16 and fp8e4 yet
 
 #define MIN_CC_DP4A 610 // minimum compute capability for __dp4a, an intrinsic for byte-wise dot products
 
@@ -23,6 +24,9 @@
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
+#ifdef _MSC_VER
+#define __builtin_assume(x) __assume(x)
+#endif
 #define CUDA_CHECK(err)                                                                 \
     do {                                                                                \
         cudaError_t err_ = (err);                                                       \
@@ -63,13 +67,13 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
     } while (0)
 #endif // CUDART_VERSION >= 11
 
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
 typedef half dfloat; // dequantize float
 typedef half2 dfloat2;
 #else
 typedef float dfloat; // dequantize float
 typedef float2 dfloat2;
-#endif //GGML_CUDA_DMMV_F16
+#endif //GGML_CUDA_F16
 
 static __device__ __forceinline__ int get_int_from_int8(const int8_t * x8, const int & i32) {
     const uint16_t * x16 = (uint16_t *) (x8 + sizeof(int) * i32); // assume at least 2 byte alignment
@@ -172,12 +176,12 @@ typedef struct {
 static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_fp16_t) + QK8_0, "wrong q8_1 block size/padding");
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs);
-typedef void (*allocate_tiles_cuda_t)(int ** x_ql, half2 ** x_dm, int ** x_qh, int8_t ** x_sc);
+typedef void (*allocate_tiles_cuda_t)(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc);
 typedef void (*load_tiles_cuda_t)(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int8_t * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row);
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row);
 typedef float (*vec_dot_q_mul_mat_cuda_t)(
-    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int8_t * __restrict__ x_sc,
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ms, const int & i, const int & j, const int & k);
 
 //================================= k-quants
@@ -195,8 +199,7 @@ typedef float (*vec_dot_q_mul_mat_cuda_t)(
 typedef struct {
     uint8_t scales[QK_K/16]; // scales and mins, quantized with 4 bits
     uint8_t qs[QK_K/4];      // quants
-    half d;                  // super-block scale for quantized scales
-    half dmin;               // super-block scale for quantized mins
+    half2 dm;                // super-block scale for quantized scales/mins
 } block_q2_K;
 static_assert(sizeof(block_q2_K) == 2*sizeof(ggml_fp16_t) + QK_K/16 + QK_K/4, "wrong q2_K block size/padding");
 
@@ -225,8 +228,7 @@ typedef struct {
 static_assert(sizeof(block_q4_K) == 2*sizeof(ggml_fp16_t) + QK_K/2 + 2, "wrong q4_K block size/padding");
 #else
 typedef struct {
-    half d;                    // super-block scale for quantized scales
-    half dmin;                 // super-block scale for quantized mins
+    half2 dm;                  // super-block scale for quantized scales/mins
     uint8_t scales[3*QK_K/64]; // scales, quantized with 6 bits
     uint8_t qs[QK_K/2];        // 4--bit quants
 } block_q4_K;
@@ -245,11 +247,10 @@ typedef struct {
 static_assert(sizeof(block_q5_K) == sizeof(ggml_fp16_t) + QK_K/2 + QK_K/8 + QK_K/16, "wrong q5_K block size/padding");
 #else
 typedef struct {
-    half d;               // super-block scale for quantized scales
-    half dmin;            // super-block scale for quantized mins
-    uint8_t scales[K_SCALE_SIZE];   // scales and mins, quantized with 6 bits
-    uint8_t qh[QK_K/8];          // quants, high bit
-    uint8_t qs[QK_K/2];          // quants, low 4 bits
+    half2 dm;                     // super-block scale for quantized scales/mins
+    uint8_t scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
+    uint8_t qh[QK_K/8];           // quants, high bit
+    uint8_t qs[QK_K/2];           // quants, low 4 bits
 } block_q5_K;
 static_assert(sizeof(block_q5_K) == 2*sizeof(ggml_fp16_t) + K_SCALE_SIZE + QK_K/2 + QK_K/8, "wrong q5_K block size/padding");
 #endif
@@ -265,8 +266,10 @@ typedef struct {
 static_assert(sizeof(block_q6_K) == sizeof(ggml_fp16_t) + 13*QK_K/16, "wrong q6_K block size/padding");
 
 #define WARP_SIZE 32
-#define MATRIX_ROW_PADDING 256 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
-#define MATRIX_SPLIT_DIVISIBLE 16 // tensor split row correction
+#define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
+// #define MATRIX_SPLIT_DIVISIBLE 16 // tensor split row correction - for cuBLAS
+// #define MATRIX_SPLIT_DIVISIBLE 64 // tensor split row correction - for MMQ support
+#define MATRIX_SPLIT_DIVISIBLE 512 // tensor split row correction - for MMQ support
 
 #define CUDA_ADD_BLOCK_SIZE 256
 #define CUDA_MUL_BLOCK_SIZE 256
@@ -278,6 +281,10 @@ static_assert(sizeof(block_q6_K) == sizeof(ggml_fp16_t) + 13*QK_K/16, "wrong q6_
 #define CUDA_DIAG_MASK_INF_BLOCK_SIZE 32
 #define CUDA_QUANTIZE_BLOCK_SIZE 256
 #define CUDA_DEQUANTIZE_BLOCK_SIZE 256
+
+#ifndef GGML_CUDA_MMQ_Y
+#define GGML_CUDA_MMQ_Y 64
+#endif // GGML_CUDA_MMQ_Y
 
 // dmmv = dequantize_mul_mat_vec
 #ifndef GGML_CUDA_DMMV_X
@@ -410,11 +417,9 @@ static __global__ void norm_f32(const float * x, float * dst, const int ncols) {
     }
 }
 
-static __global__ void rms_norm_f32(const float * x, float * dst, const int ncols) {
+static __global__ void rms_norm_f32(const float * x, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
-
-    const float eps = 1e-6f;
 
     float tmp = 0.0f; // partial sum for thread in warp
 
@@ -447,13 +452,13 @@ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const in
     v.x = vui & 0xF;
     v.y = vui >> 4;
 
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
     v = __hsub2(v, {8.0f, 8.0f});
     v = __hmul2(v, {d, d});
 #else
     v.x = (v.x - 8.0f) * d;
     v.y = (v.y - 8.0f) * d;
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
 }
 
 static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const int ib, const int iqs, dfloat2 & v){
@@ -467,13 +472,13 @@ static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const in
     v.x = vui & 0xF;
     v.y = vui >> 4;
 
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
     v = __hmul2(v, {d, d});
     v = __hadd2(v, {m, m});
 #else
     v.x = (v.x * d) + m;
     v.y = (v.y * d) + m;
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
 }
 
 static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const int ib, const int iqs, dfloat2 & v){
@@ -490,13 +495,13 @@ static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const in
     v.x = ((x[ib].qs[iqs] & 0xf) | xh_0);
     v.y = ((x[ib].qs[iqs] >>  4) | xh_1);
 
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
     v = __hsub2(v, {16.0f, 16.0f});
     v = __hmul2(v, {d, d});
 #else
     v.x = (v.x - 16.0f) * d;
     v.y = (v.y - 16.0f) * d;
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
 }
 
 static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const int ib, const int iqs, dfloat2 & v){
@@ -514,13 +519,13 @@ static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const in
     v.x = ((x[ib].qs[iqs] & 0xf) | xh_0);
     v.y = ((x[ib].qs[iqs] >>  4) | xh_1);
 
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
     v = __hmul2(v, {d, d});
     v = __hadd2(v, {m, m});
 #else
     v.x = (v.x * d) + m;
     v.y = (v.y * d) + m;
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
 }
 
 static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int ib, const int iqs, dfloat2 & v){
@@ -531,12 +536,12 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x = x[ib].qs[iqs + 0];
     v.y = x[ib].qs[iqs + 1];
 
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
     v = __hmul2(v, {d, d});
 #else
     v.x *= d;
     v.y *= d;
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
 }
 
 //================================== k-quants
@@ -555,8 +560,8 @@ static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, float
     const uint8_t q = x[i].qs[32*n + l];
     float * y = yy + i*QK_K + 128*n;
 
-    float dall = x[i].d;
-    float dmin = x[i].dmin;
+    float dall = x[i].dm.x;
+    float dmin = x[i].dm.y;
     y[l+ 0] = dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4);
     y[l+32] = dall * (x[i].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[i].scales[is+2] >> 4);
     y[l+64] = dall * (x[i].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+4] >> 4);
@@ -566,8 +571,8 @@ static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, float
     const int il = tid%16;  // 0...15
     const uint8_t q = x[i].qs[il] >> (2*is);
     float * y = yy + i*QK_K + 16*is + il;
-    float dall = x[i].d;
-    float dmin = x[i].dmin;
+    float dall = x[i].dm.x;
+    float dmin = x[i].dm.y;
     y[ 0] = dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4);
     y[32] = dall * (x[i].scales[is+2] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+2] >> 4);
 #endif
@@ -653,8 +658,8 @@ static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, float
 
     float * y = yy + i*QK_K + 64*il + n*ir;
 
-    const float dall = x[i].d;
-    const float dmin = x[i].dmin;
+    const float dall = x[i].dm.x;
+    const float dmin = x[i].dm.y;
 
     const uint8_t * q = x[i].qs + 32*il + n*ir;
 
@@ -692,8 +697,8 @@ static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, float
 
     float * y = yy + i*QK_K + 64*il + 2*ir;
 
-    const float dall = x[i].d;
-    const float dmin = x[i].dmin;
+    const float dall = x[i].dm.x;
+    const float dmin = x[i].dm.y;
 
     const uint8_t * ql = x[i].qs + 32*il + 2*ir;
     const uint8_t * qh = x[i].qh + 2*ir;
@@ -779,7 +784,6 @@ static __device__ void dequantize_q4_0_f16(const void * __restrict__ vx, const i
 
     const int8_t vi0 = vui & 0xF;
     const int8_t vi1 = vui >> 4;
-
     v0 = __float2half((vi0 - 8)*d_float);
     v1 = __float2half((vi1 - 8)*d_float);
 }
@@ -949,8 +953,8 @@ static __global__ void dequantize_block_q2_K_f16(const void * __restrict__ vx, h
     const uint8_t q = x[i].qs[32*n + l];
     half * y = yy + i*QK_K + 128*n;
 
-    float dall = x[i].d;
-    float dmin = x[i].dmin;
+    float dall = x[i].dm.x; // d
+    float dmin = x[i].dm.y; // d_min
     y[l+ 0] = __float2half(dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4));
     y[l+32] = __float2half(dall * (x[i].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[i].scales[is+2] >> 4));
     y[l+64] = __float2half(dall * (x[i].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+4] >> 4));
@@ -960,8 +964,8 @@ static __global__ void dequantize_block_q2_K_f16(const void * __restrict__ vx, h
     const int il = tid%16;  // 0...15
     const uint8_t q = x[i].qs[il] >> (2*is);
     half * y = yy + i*QK_K + 16*is + il;
-    float dall = x[i].d;
-    float dmin = x[i].dmin;
+    float dall = x[i].dm.x;
+    float dmin = x[i].dm.y;
     y[ 0] = __float2half(dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4));
     y[32] = __float2half(dall * (x[i].scales[is+2] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+2] >> 4));
 #endif
@@ -981,8 +985,8 @@ static __global__ void dequantize_block_q2_K_f8e4(const void * __restrict__ vx, 
     const uint8_t q = x[i].qs[32*n + l];
     __fp8e4 * y = yy + i*QK_K + 128*n;
 
-    float dall = x[i].d;
-    float dmin = x[i].dmin;
+    float dall = x[i].dm.x;
+    float dmin = x[i].dm.y;
     y[l+ 0] = __FLOAT2FP8E4(dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4));
     y[l+32] = __FLOAT2FP8E4(dall * (x[i].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[i].scales[is+2] >> 4));
     y[l+64] = __FLOAT2FP8E4(dall * (x[i].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+4] >> 4));
@@ -992,8 +996,8 @@ static __global__ void dequantize_block_q2_K_f8e4(const void * __restrict__ vx, 
     const int il = tid%16;  // 0...15
     const uint8_t q = x[i].qs[il] >> (2*is);
     half * y = yy + i*QK_K + 16*is + il;
-    float dall = x[i].d;
-    float dmin = x[i].dmin;
+    float dall = x[i].dm.x;
+    float dmin = x[i].dm.y;
     y[ 0] = __FLOAT2FP8E4(dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4));
     y[32] = __FLOAT2FP8E4(dall * (x[i].scales[is+2] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+2] >> 4));
 #endif
@@ -1112,8 +1116,8 @@ static __global__ void dequantize_block_q4_K_f16(const void * __restrict__ vx, h
 
     half * y = yy + i*QK_K + 64*il + n*ir;
 
-    const float dall = x[i].d;
-    const float dmin = x[i].dmin;
+    const float dall = x[i].dm.x;
+    const float dmin = x[i].dm.y;
 
     const uint8_t * q = x[i].qs + 32*il + n*ir;
 
@@ -1152,8 +1156,8 @@ static __global__ void dequantize_block_q4_K_f8e4(const void * __restrict__ vx, 
 
     __fp8e4 * y = yy + i*QK_K + 64*il + n*ir;
 
-    const float dall = x[i].d;
-    const float dmin = x[i].dmin;
+    const float dall = x[i].dm.x; // d
+    const float dmin = x[i].dm.y; // dmin
 
     const uint8_t * q = x[i].qs + 32*il + n*ir;
 
@@ -1190,8 +1194,8 @@ static __global__ void dequantize_block_q5_K_f16(const void * __restrict__ vx, h
 
     half * y = yy + i*QK_K + 64*il + 2*ir;
 
-    const float dall = x[i].d;
-    const float dmin = x[i].dmin;
+    const float dall = x[i].dm.x;
+    const float dmin = x[i].dm.y;
 
     const uint8_t * ql = x[i].qs + 32*il + 2*ir;
     const uint8_t * qh = x[i].qh + 2*ir;
@@ -1215,7 +1219,7 @@ static __global__ void dequantize_block_q5_K_f16(const void * __restrict__ vx, h
     const int in = tid%8;  // 0...7
     const int is = tid/16; // 0 or 1
     const uint8_t h = x[i].qh[in] >> im;
-    const float d = x[i].d;
+    const float d = x[i].dm.x;
     half * y = yy + i*QK_K + tid;
     y[ 0] = __float2half(d * x[i].scales[is+0] * ((q & 0xF) - ((h >> 0) & 1 ? 0 : 16)));
     y[32] = __float2half(d * x[i].scales[is+2] * ((q >>  4) - ((h >> 4) & 1 ? 0 : 16)));
@@ -1236,8 +1240,8 @@ static __global__ void dequantize_block_q5_K_f8e4(const void * __restrict__ vx, 
 
     __fp8e4 * y = yy + i*QK_K + 64*il + 2*ir;
 
-    const float dall = x[i].d;
-    const float dmin = x[i].dmin;
+    const float dall = x[i].dm.x; //d
+    const float dmin = x[i].dm.y; //dmin
 
     const uint8_t * ql = x[i].qs + 32*il + 2*ir;
     const uint8_t * qh = x[i].qh + 2*ir;
@@ -1261,7 +1265,7 @@ static __global__ void dequantize_block_q5_K_f8e4(const void * __restrict__ vx, 
     const int in = tid%8;  // 0...7
     const int is = tid/16; // 0 or 1
     const uint8_t h = x[i].qh[in] >> im;
-    const float d = x[i].d;
+    const float d = x[i].dm.x;
     __fp8e4 * y = yy + i*QK_K + tid;
     y[ 0] = __FLOAT2FP8E4(d * x[i].scales[is+0] * ((q & 0xF) - ((h >> 0) & 1 ? 0 : 16)));
     y[32] = __FLOAT2FP8E4(d * x[i].scales[is+2] * ((q >>  4) - ((h >> 4) & 1 ? 0 : 16)));
@@ -1597,8 +1601,8 @@ static __global__ void dequantize_mul_mat_vec_q2_k(const void * __restrict__ vx,
         const float   * y = yy + i * QK_K + y_offset;
         const uint8_t * q = x[i].qs + q_offset;
 
-        const float dall = x[i].d;
-        const float dmin = x[i].dmin;
+        const float dall = x[i].dm.x;
+        const float dmin = x[i].dm.y;
 
         const uint32_t * a = (const uint32_t *)(x[i].scales + s_offset);
         aux[0] = a[0] & 0x0f0f0f0f;
@@ -1640,9 +1644,7 @@ static __global__ void dequantize_mul_mat_vec_q2_k(const void * __restrict__ vx,
         uaux[0] = s[0] & 0x0f0f0f0f;
         uaux[1] = (s[0] >> 4) & 0x0f0f0f0f;
 
-        const half2 * dh = (const half2 *)&x[i].d;
-
-        const float2 dall = __half22float2(dh[0]);
+        const float2 dall = __half22float2(x[i].dm);
 
         float sum1 = 0, sum2 = 0;
         for (int l = 0; l < K_QUANTS_PER_ITERATION; ++l) {
@@ -1805,17 +1807,23 @@ static __global__ void dequantize_mul_mat_vec_q4_k(const void * __restrict__ vx,
     uint16_t aux[4];
     const uint8_t * sc = (const uint8_t *)aux;
 
+#if K_QUANTS_PER_ITERATION == 2
+    uint32_t q32[4];
+    const uint8_t * q4 = (const uint8_t *)q32;
+#else
+    uint16_t q16[4];
+    const uint8_t * q4 = (const uint8_t *)q16;
+#endif
+
     float tmp = 0; // partial sum for thread in warp
 
     for (int i = ix; i < num_blocks_per_row; i += K_QUANTS_PER_ITERATION) {
 
-        const uint8_t * q1 = x[i].qs + q_offset;
-        const uint8_t * q2 = q1 + 64;
         const float   * y1 = yy + i*QK_K + y_offset;
         const float   * y2 = y1 + 128;
 
-        const float dall = x[i].d;
-        const float dmin = x[i].dmin;
+        const float dall = x[i].dm.x;
+        const float dmin = x[i].dm.y;
 
         const uint16_t * a = (const uint16_t *)x[i].scales;
         aux[0] = a[im+0] & kmask1;
@@ -1823,14 +1831,41 @@ static __global__ void dequantize_mul_mat_vec_q4_k(const void * __restrict__ vx,
         aux[2] = ((a[im+4] >> 0) & kmask2) | ((a[im+0] & kmask3) >> 2);
         aux[3] = ((a[im+4] >> 4) & kmask2) | ((a[im+2] & kmask3) >> 2);
 
+#if K_QUANTS_PER_ITERATION == 2
+        const uint32_t * q1 = (const uint32_t *)(x[i].qs + q_offset);
+        const uint32_t * q2 = q1 + 16;
+
+        q32[0] = q1[0] & 0x0f0f0f0f;
+        q32[1] = q1[0] & 0xf0f0f0f0;
+        q32[2] = q2[0] & 0x0f0f0f0f;
+        q32[3] = q2[0] & 0xf0f0f0f0;
+
         float4 s = {0.f, 0.f, 0.f, 0.f};
         float smin = 0;
-        for (int l = 0; l < n; ++l) {
-            s.x += y1[l] * (q1[l] & 0xF); s.y += y1[l+32] * (q1[l] >> 4);
-            s.z += y2[l] * (q2[l] & 0xF); s.w += y2[l+32] * (q2[l] >> 4);
+        for (int l = 0; l < 4; ++l) {
+            s.x += y1[l] * q4[l+0]; s.y += y1[l+32] * q4[l+ 4];
+            s.z += y2[l] * q4[l+8]; s.w += y2[l+32] * q4[l+12];
             smin += y1[l] * sc[2] + y1[l+32] * sc[3] + y2[l] * sc[6] + y2[l+32] * sc[7];
         }
-        tmp += dall * (s.x * sc[0] + s.y * sc[1] + s.z * sc[4] + s.w * sc[5]) - dmin * smin;
+        tmp += dall * (s.x * sc[0] + s.y * sc[1] * 1.f/16.f + s.z * sc[4] + s.w * sc[5] * 1.f/16.f) - dmin * smin;
+#else
+        const uint16_t * q1 = (const uint16_t *)(x[i].qs + q_offset);
+        const uint16_t * q2 = q1 + 32;
+
+        q16[0] = q1[0] & 0x0f0f;
+        q16[1] = q1[0] & 0xf0f0;
+        q16[2] = q2[0] & 0x0f0f;
+        q16[3] = q2[0] & 0xf0f0;
+
+        float4 s = {0.f, 0.f, 0.f, 0.f};
+        float smin = 0;
+        for (int l = 0; l < 2; ++l) {
+            s.x += y1[l] * q4[l+0]; s.y += y1[l+32] * q4[l+2];
+            s.z += y2[l] * q4[l+4]; s.w += y2[l+32] * q4[l+6];
+            smin += y1[l] * sc[2] + y1[l+32] * sc[3] + y2[l] * sc[6] + y2[l+32] * sc[7];
+        }
+        tmp += dall * (s.x * sc[0] + s.y * sc[1] * 1.f/16.f + s.z * sc[4] + s.w * sc[5] * 1.f/16.f) - dmin * smin;
+#endif
 
     }
 #else
@@ -1910,16 +1945,18 @@ static __global__ void dequantize_mul_mat_vec_q5_k(const void * __restrict__ vx,
     uint16_t aux[4];
     const uint8_t * sc = (const uint8_t *)aux;
 
+    uint16_t q16[8];
+    const uint8_t * q4 = (const uint8_t *)q16;
+
     for (int i = ix; i < num_blocks_per_row; i += 2) {
 
         const uint8_t * ql1 = x[i].qs + q_offset;
-        const uint8_t * ql2 = ql1 + 64;
         const uint8_t * qh  = x[i].qh + l0;
         const float   * y1  = yy + i*QK_K + y_offset;
         const float   * y2  = y1 + 128;
 
-        const float dall = x[i].d;
-        const float dmin = x[i].dmin;
+        const float dall = x[i].dm.x;
+        const float dmin = x[i].dm.y;
 
         const uint16_t * a = (const uint16_t *)x[i].scales;
         aux[0] = a[im+0] & kmask1;
@@ -1929,15 +1966,25 @@ static __global__ void dequantize_mul_mat_vec_q5_k(const void * __restrict__ vx,
 
         float4 sum = {0.f, 0.f, 0.f, 0.f};
         float smin = 0;
+        const uint16_t * q1 = (const uint16_t *)ql1;
+        const uint16_t * q2 = q1 + 32;
+        q16[0] = q1[0] & 0x0f0f;
+        q16[1] = q1[8] & 0x0f0f;
+        q16[2] = (q1[0] >> 4) & 0x0f0f;
+        q16[3] = (q1[8] >> 4) & 0x0f0f;
+        q16[4] = q2[0] & 0x0f0f;
+        q16[5] = q2[8] & 0x0f0f;
+        q16[6] = (q2[0] >> 4) & 0x0f0f;
+        q16[7] = (q2[8] >> 4) & 0x0f0f;
         for (int l = 0; l < n; ++l) {
-            sum.x += y1[l+ 0] * ((ql1[l+ 0] & 0xF) + (qh[l+ 0] & (hm1 << 0) ? 16 : 0))
-                   + y1[l+16] * ((ql1[l+16] & 0xF) + (qh[l+16] & (hm1 << 0) ? 16 : 0));
-            sum.y += y1[l+32] * ((ql1[l+ 0] >>  4) + (qh[l+ 0] & (hm1 << 1) ? 16 : 0))
-                   + y1[l+48] * ((ql1[l+16] >>  4) + (qh[l+16] & (hm1 << 1) ? 16 : 0));
-            sum.z += y2[l+ 0] * ((ql2[l+ 0] & 0xF) + (qh[l+ 0] & (hm2 << 0) ? 16 : 0))
-                   + y2[l+16] * ((ql2[l+16] & 0xF) + (qh[l+16] & (hm2 << 0) ? 16 : 0));
-            sum.w += y2[l+32] * ((ql2[l+ 0] >>  4) + (qh[l+ 0] & (hm2 << 1) ? 16 : 0))
-                   + y2[l+48] * ((ql2[l+16] >>  4) + (qh[l+16] & (hm2 << 1) ? 16 : 0));
+            sum.x += y1[l+ 0] * (q4[l +0] + (qh[l+ 0] & (hm1 << 0) ? 16 : 0))
+                   + y1[l+16] * (q4[l +2] + (qh[l+16] & (hm1 << 0) ? 16 : 0));
+            sum.y += y1[l+32] * (q4[l +4] + (qh[l+ 0] & (hm1 << 1) ? 16 : 0))
+                   + y1[l+48] * (q4[l +6] + (qh[l+16] & (hm1 << 1) ? 16 : 0));
+            sum.z += y2[l+ 0] * (q4[l +8] + (qh[l+ 0] & (hm2 << 0) ? 16 : 0))
+                   + y2[l+16] * (q4[l+10] + (qh[l+16] & (hm2 << 0) ? 16 : 0));
+            sum.w += y2[l+32] * (q4[l+12] + (qh[l+ 0] & (hm2 << 1) ? 16 : 0))
+                   + y2[l+48] * (q4[l+14] + (qh[l+16] & (hm2 << 1) ? 16 : 0));
             smin += (y1[l] + y1[l+16]) * sc[2] + (y1[l+32] + y1[l+48]) * sc[3]
                   + (y2[l] + y2[l+16]) * sc[6] + (y2[l+32] + y2[l+48]) * sc[7];
         }
@@ -2113,7 +2160,7 @@ static __global__ void quantize_q8_1(const float * __restrict__ x, void * __rest
     const int ib = i_padded / QK8_1; // block index
     const int iqs = i_padded % QK8_1; // quant index
 
-    const float xi = ix < kx_padded ? x[iy*kx + ix] : 0.0f;
+    const float xi = ix < kx ? x[iy*kx + ix] : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -2136,6 +2183,82 @@ static __global__ void quantize_q8_1(const float * __restrict__ x, void * __rest
     y[ib].ds.y = sum;
 }
 
+static __global__ void quantize_q8_0(const float * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
+    const int ix = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (ix >= kx_padded) {
+        return;
+    }
+
+    const int iy = blockDim.y*blockIdx.y + threadIdx.y;
+
+    const int i_padded = iy*kx_padded + ix;
+
+    block_q8_0 * y = (block_q8_0 *) vy;
+
+    const int ib = i_padded / QK8_0; // block index
+    const int iqs = i_padded % QK8_0; // quant index
+
+    const float xi = ix < kx ? x[iy*kx + ix] : 0.0f;
+    float amax = fabsf(xi);
+
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask, 32));
+    }
+
+    const float d = amax / 127;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    y[ib].qs[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    y[ib].d = d;
+}
+
+__global__ void quantize_q8_1_f16(const __half * __restrict__ x, void * __restrict__ vy, const int kx, const int kx_padded) {
+    const int ix = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (ix >= kx_padded) {
+        return;
+    }
+
+    const int iy = blockDim.y * blockIdx.y + threadIdx.y;
+
+    const int i_padded = iy * kx_padded + ix;
+
+    block_q8_1 *y = (block_q8_1 *)vy;
+
+    const int ib = i_padded / QK8_1; // block index
+    const int iqs = i_padded % QK8_1; // quant index
+
+    const __half zero = __float2half(0.0f);
+    const __half xi = ix < kx ? x[iy * kx + ix] : zero;
+    __half amax = __habs(xi);
+    __half sum = xi;
+
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        amax = __hmax(amax, __shfl_xor_sync(0xffffffff, amax, mask, 32));
+        sum = __hadd(sum, __shfl_xor_sync(0xffffffff, sum, mask, 32));
+    }
+
+    const float d = __half2float(amax) / 127;
+    const int8_t q = __half2float(amax) == 0.0f ? 0 : roundf(__half2float(xi) / d);
+
+    y[ib].qs[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    y[ib].ds.x = d;
+    y[ib].ds.y = __half2float(sum);
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __global__ void dequantize_block(const void * __restrict__ vx, float * __restrict__ y, const int k) {
     const int i = blockDim.x*blockIdx.x + 2*threadIdx.x;
@@ -2156,6 +2279,11 @@ static __global__ void dequantize_block(const void * __restrict__ vx, float * __
     y[iybs + iqs + 0]        = v.x;
     y[iybs + iqs + y_offset] = v.y;
 }
+
+// VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
+
+#define VDR_q4_0_q8_1 1
+
 template <int qk, int qr, void (*dequantize_kernel_f16)(const void *, const int, const int, half &, half &)>
 static __global__ void dequantize_block_f16(const void * __restrict__ vx, half * __restrict__ y, const int k) {
     const int i = blockDim.x*blockIdx.x + 2*threadIdx.x;
@@ -2223,10 +2351,10 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     return vec_dot_q4_0_q8_1_impl(vi, ui0, ui1, bq4_0->d, bq8_1->ds);
 }
 
-static __device__ __forceinline__ void allocate_tiles_q4_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int8_t ** x_sc) {
+static __device__ __forceinline__ void allocate_tiles_q4_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
 
-    __shared__ int  tile_x_qs[(2*WARP_SIZE) * (WARP_SIZE + 1)];
-    __shared__ half2 tile_x_d[(2*WARP_SIZE) * (WARP_SIZE/QI4_0)];
+    __shared__ int  tile_x_qs[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ half2 tile_x_d[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI4_0)];
 
     *x_ql = tile_x_qs;
     *x_dm = tile_x_d;
@@ -2234,7 +2362,7 @@ static __device__ __forceinline__ void allocate_tiles_q4_0(int ** x_ql, half2 **
 
 static __device__ __forceinline__ void load_tiles_q4_0(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int8_t * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
 
     const int kbx  = k / QI4_0;
     const int kqsx = k % QI4_0;
@@ -2246,7 +2374,7 @@ static __device__ __forceinline__ void load_tiles_q4_0(
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1_mul_mat(
-    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int8_t * __restrict__ x_sc,
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
 
     const int kyqs = k % (QI8_1/2) + QI8_1 * (k / (QI8_1/2));
@@ -2255,6 +2383,8 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1_mul_mat(
         x_ql[i * (WARP_SIZE + 1) + k], y_qs[j * (2*WARP_SIZE) + kyqs], y_qs[j * (2*WARP_SIZE) + kyqs + (QI8_1/2)],
         x_dm[i * (WARP_SIZE/QI4_0) + k/QI4_0].x, y_ds[j * (2*WARP_SIZE/QI8_1) + 2*k/QI8_1]);
 }
+
+#define VDR_q4_1_q8_1 1
 
 static __device__ __forceinline__ float vec_dot_q4_1_q8_1_impl(
     const int & vi, const int & ui0, const int & ui1, const half2 & dm4, const half2 & ds8) {
@@ -2267,14 +2397,14 @@ static __device__ __forceinline__ float vec_dot_q4_1_q8_1_impl(
     int sumi = __dp4a(vi0, ui0, 0);
     sumi     = __dp4a(vi1, ui1, sumi);
 
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
     const half2 tmp = __hmul2(dm4, ds8);
     const float d4d8 = __half2float(tmp.x);
     const float m4s8 = __half2float(tmp.y);
 #else
     const float d4d8 = __half2float(dm4.x) * __half2float(ds8.x);
     const float m4s8 = __half2float(dm4.y) * __half2float(ds8.y);
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
 
     // scale second part of sum by QI8_1/QR4_1 to compensate for multiple threads adding it
     return sumi * d4d8 + m4s8 / (QI8_1 / QR4_1);
@@ -2295,10 +2425,10 @@ static __device__ __forceinline__ float vec_dot_q4_1_q8_1(
     return vec_dot_q4_1_q8_1_impl(vi, ui0, ui1, bq4_1->dm, bq8_1->ds);
 }
 
-static __device__ __forceinline__ void allocate_tiles_q4_1(int ** x_ql, half2 ** x_dm, int ** x_qh, int8_t ** x_sc) {
+static __device__ __forceinline__ void allocate_tiles_q4_1(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
 
-    __shared__ int   tile_x_qs[(2*WARP_SIZE) * (WARP_SIZE + 1)];
-    __shared__ half2 tile_x_dm[(2*WARP_SIZE) * (WARP_SIZE/QI4_1)];
+    __shared__ int   tile_x_qs[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ half2 tile_x_dm[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI4_1)];
 
     *x_ql = tile_x_qs;
     *x_dm = tile_x_dm;
@@ -2306,7 +2436,7 @@ static __device__ __forceinline__ void allocate_tiles_q4_1(int ** x_ql, half2 **
 
 static __device__ __forceinline__ void load_tiles_q4_1(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int8_t * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
 
     const int kbx  = k / QI4_1;
     const int kqsx = k % QI4_1;
@@ -2318,7 +2448,7 @@ static __device__ __forceinline__ void load_tiles_q4_1(
 }
 
 static __device__ __forceinline__ float vec_dot_q4_1_q8_1_mul_mat(
-    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int8_t * __restrict__ x_sc,
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
 
     const int kyqs = k % (QI8_1/2) + QI8_1 * (k / (QI8_1/2));
@@ -2327,6 +2457,8 @@ static __device__ __forceinline__ float vec_dot_q4_1_q8_1_mul_mat(
         x_ql[i * (WARP_SIZE + 1) + k], y_qs[j * (2*WARP_SIZE) + kyqs], y_qs[j * (2*WARP_SIZE) + kyqs + (QI8_1/2)],
         x_dm[i * (WARP_SIZE/QI4_1) + k/QI4_1], y_ds[j * (2*WARP_SIZE/QI8_1) + 2*k/QI8_1]);
 }
+
+#define VDR_q5_0_q8_1 1
 
 static __device__ __forceinline__ float vec_dot_q5_0_q8_1_impl(
     const int & qs, const int & qh, const int & ui0, const int & ui1, const half & d5, const half2 & ds8) {
@@ -2365,11 +2497,11 @@ static __device__ __forceinline__ float vec_dot_q5_0_q8_1(
     return vec_dot_q5_0_q8_1_impl(qs, qh, ui0, ui1, bq5_0->d, bq8_1->ds);
 }
 
-static __device__ __forceinline__ void allocate_tiles_q5_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int8_t ** x_sc) {
+static __device__ __forceinline__ void allocate_tiles_q5_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
 
-    __shared__ int  tile_x_ql[(2*WARP_SIZE) * (WARP_SIZE + 1)];
-    __shared__ int  tile_x_qh[(2*WARP_SIZE) * (WARP_SIZE/QI5_0)];
-    __shared__ half2 tile_x_d[(2*WARP_SIZE) * (WARP_SIZE/QI5_0)];
+    __shared__ int  tile_x_ql[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ int  tile_x_qh[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI5_0)];
+    __shared__ half2 tile_x_d[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI5_0)];
 
     *x_ql = tile_x_ql;
     *x_qh = tile_x_qh;
@@ -2378,7 +2510,7 @@ static __device__ __forceinline__ void allocate_tiles_q5_0(int ** x_ql, half2 **
 
 static __device__ __forceinline__ void load_tiles_q5_0(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int8_t * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
 
     const int kbx  = k / QI5_0;
     const int kqsx = k % QI5_0;
@@ -2391,7 +2523,7 @@ static __device__ __forceinline__ void load_tiles_q5_0(
 }
 
 static __device__ __forceinline__ float vec_dot_q5_0_q8_1_mul_mat(
-    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int8_t * __restrict__ x_sc,
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
 
     const int kyqs = k % (QI8_1/2) + QI8_1 * (k / (QI8_1/2));
@@ -2401,6 +2533,8 @@ static __device__ __forceinline__ float vec_dot_q5_0_q8_1_mul_mat(
         x_ql[i * (WARP_SIZE + 1) + k], x_qh[index_bx] >> (4 * (k % QI5_0)), y_qs[j * (2*WARP_SIZE) + kyqs],
         y_qs[j * (2*WARP_SIZE) + kyqs + (QI8_1/2)], x_dm[index_bx].x, y_ds[j * (2*WARP_SIZE/QI8_1) + 2*k/QI8_1]);
 }
+
+#define VDR_q5_1_q8_1 1
 
 static __device__ __forceinline__ float vec_dot_q5_1_q8_1_impl(
     const int & qs, const int & qh, const int & ui0, const int & ui1, const half2 & dm5, const half2 & ds8) {
@@ -2420,14 +2554,14 @@ static __device__ __forceinline__ float vec_dot_q5_1_q8_1_impl(
     vi1    |= (qh <<  9) & 0x10000000; // 19 -> 28
     sumi = __dp4a(vi1, ui1, sumi); // SIMD dot product of quantized values
 
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
     const half2 tmp = __hmul2(dm5, ds8);
     const float d5d8 = __half2float(tmp.x);
     const float m5s8 = __half2float(tmp.y);
 #else
     const float d5d8 = __half2float(dm5.x) * __half2float(ds8.x);
     const float m5s8 = __half2float(dm5.y) * __half2float(ds8.y);
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
 
     return sumi*d5d8 + m5s8/QI5_1; // scale sum by QI5_1 because there are QI5_1 threads working on this block
 
@@ -2449,11 +2583,11 @@ static __device__ __forceinline__ float vec_dot_q5_1_q8_1(
     return vec_dot_q5_1_q8_1_impl(qs, qh, ui0, ui1, bq5_1->dm, bq8_1->ds);
 }
 
-static __device__ __forceinline__ void allocate_tiles_q5_1(int ** x_ql, half2 ** x_dm, int ** x_qh, int8_t ** x_sc) {
+static __device__ __forceinline__ void allocate_tiles_q5_1(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
 
-    __shared__ int   tile_x_ql[(2*WARP_SIZE) * (WARP_SIZE + 1)];
-    __shared__ int   tile_x_qh[(2*WARP_SIZE) * (WARP_SIZE/QI5_1)];
-    __shared__ half2 tile_x_dm[(2*WARP_SIZE) * (WARP_SIZE/QI5_1)];
+    __shared__ int   tile_x_ql[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ int   tile_x_qh[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI5_1)];
+    __shared__ half2 tile_x_dm[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI5_1)];
 
     *x_ql = tile_x_ql;
     *x_qh = tile_x_qh;
@@ -2462,7 +2596,7 @@ static __device__ __forceinline__ void allocate_tiles_q5_1(int ** x_ql, half2 **
 
 static __device__ __forceinline__ void load_tiles_q5_1(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int8_t * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
 
     const int kbx  = k / QI5_1;
     const int kqsx = k % QI5_1;
@@ -2475,7 +2609,7 @@ static __device__ __forceinline__ void load_tiles_q5_1(
 }
 
 static __device__ __forceinline__ float vec_dot_q5_1_q8_1_mul_mat(
-    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int8_t * __restrict__ x_sc,
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
 
     const int kyqs = k % (QI8_1/2) + QI8_1 * (k / (QI8_1/2));
@@ -2485,6 +2619,8 @@ static __device__ __forceinline__ float vec_dot_q5_1_q8_1_mul_mat(
         x_ql[i * (WARP_SIZE + 1) + k], x_qh[index_bx] >> (4 * (k % QI5_1)), y_qs[j * (2*WARP_SIZE) + kyqs],
         y_qs[j * (2*WARP_SIZE) + kyqs + (QI8_1/2)], x_dm[index_bx], y_ds[j * (2*WARP_SIZE/QI8_1) + 2*k/QI8_1]);
 }
+
+#define VDR_q8_0_q8_1 1
 
 static __device__ __forceinline__ float vec_dot_q8_0_q8_1_impl(
     const int & vi, const int & ui, const half & d8_0, const half2 & ds8_1) {
@@ -2510,10 +2646,10 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     return vec_dot_q8_0_q8_1_impl(vi, ui, bq8_0->d, bq8_1->ds);
 }
 
-static __device__ __forceinline__ void allocate_tiles_q8_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int8_t ** x_sc) {
+static __device__ __forceinline__ void allocate_tiles_q8_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
 
-    __shared__ int  tile_x_qs[(2*WARP_SIZE) * (WARP_SIZE + 1)];
-    __shared__ half2 tile_x_d[(2*WARP_SIZE) * (WARP_SIZE/QI8_0)];
+    __shared__ int  tile_x_qs[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ half2 tile_x_d[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI8_0)];
 
     *x_ql = tile_x_qs;
     *x_dm = tile_x_d;
@@ -2521,7 +2657,7 @@ static __device__ __forceinline__ void allocate_tiles_q8_0(int ** x_ql, half2 **
 
 static __device__ __forceinline__ void load_tiles_q8_0(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int8_t * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
 
     const int kbx  = k / QI8_0;
     const int kqsx = k % QI8_0;
@@ -2533,7 +2669,7 @@ static __device__ __forceinline__ void load_tiles_q8_0(
 }
 
 static __device__ __forceinline__ float vec_dot_q8_0_q8_1_mul_mat(
-    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int8_t * __restrict__ x_sc,
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
 
     return vec_dot_q8_0_q8_1_impl(
@@ -2541,37 +2677,144 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1_mul_mat(
         x_dm[i * (WARP_SIZE/QI8_0) + k/QI8_0].x, y_ds[j * (WARP_SIZE/QI8_1) + k/QI8_1]);
 }
 
+#define VDR_q2_K_q8_1 1
+
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl(
+    const int & v, const int * __restrict__ u, const uint8_t * __restrict__ scales,
+    const half2 & dm, const float * __restrict__ d8) {
+
+#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+    for (int i = 0; i < QR2_K; ++i) {
+        const int sc = scales[2*i];
+
+        const int vi = (v >> (2*i)) & 0x03030303;
+
+        sumf_d += d8[i] * (__dp4a(vi, u[i], 0) * (sc & 0xF)); // SIMD dot product
+
+        int sc_high = sc >> 4;
+        sc_high |= sc_high <<  8;
+        sc_high |= sc_high << 16;
+        sumf_m += d8[i] * __dp4a(sc_high, u[i], 0); // multiply constant q2_K part with sum of q8_1 values
+    }
+
+    const float2 dmf = __half22float2(dm);
+
+    return dmf.x*sumf_d - dmf.y*sumf_m;
+#else
+    return 0.0f; // only to satisfy the compiler
+#endif // __CUDA_ARCH__ >= MIN_CC_DP4A
+}
+
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 
-#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
     const block_q2_K * bq2_K = (const block_q2_K *) vbq;
 
     const int bq8_offset = QR2_K * (iqs / QI8_1);
     const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
 
-    float sumf_d = 0.0f;
-    float sumf_m = 0.0f;
+    const uint8_t * scales = bq2_K->scales + scale_offset;
 
-    const float    d = bq2_K->d;
-    const float dmin = bq2_K->dmin;
+    const int v = get_int_from_uint8_aligned(bq2_K->qs, iqs);
+    int u[QR2_K];
+    float d8[QR2_K];
 
-    const int v = *((int *) &bq2_K->qs[sizeof(int) * iqs]);
-
-    for (int i = 0; i < QR2_K; ++i) {
-        const int sc = bq2_K->scales[scale_offset + 2*i];
-
-        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        const float d8i = bq8i->ds.x;
-
-        const int vi = (v >> (2*i)) & 0x03030303;
-        const int ui = *((int*) &bq8i->qs[sizeof(int) * (iqs % QI8_1)]);
-
-        sumf_d += d8i * (__dp4a(vi,         ui, 0) * (sc & 0xF)); // SIMD dot product
-        sumf_m += d8i * (__dp4a(0x01010101, ui, 0) * (sc >>  4)); // multiply constant q2_K part with sum of q8_1 values
+    for (int i = 0; i < QR2_K; ++ i) {
+        u[i]  = get_int_from_int8_aligned(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        d8[i] = bq8_1[bq8_offset + i].ds.x;
     }
 
-    return d*sumf_d - dmin*sumf_m;
+    return vec_dot_q2_K_q8_1_impl(v, u, scales, bq2_K->dm, d8);
+}
+
+static __device__ __forceinline__ void allocate_tiles_q2_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+
+    __shared__ int   tile_x_ql[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ half2 tile_x_dm[GGML_CUDA_MMQ_Y * (WARP_SIZE / QI2_K)];
+    __shared__ int   tile_x_sc[GGML_CUDA_MMQ_Y * (WARP_SIZE / 4)];
+
+    *x_ql = tile_x_ql;
+    *x_dm = tile_x_dm;
+    *x_sc = tile_x_sc;
+}
+
+static __device__ __forceinline__ void load_tiles_q2_K(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+
+    const int kbx  = k / QI2_K;
+    const int kqsx = k % QI2_K;
+
+    const block_q2_K * bx = ((block_q2_K *) vx) + i*blocks_per_row + kbx;
+
+    x_ql[i * (WARP_SIZE + 1)     + k]   = get_int_from_uint8_aligned(bx->qs, kqsx);
+    x_dm[i * (WARP_SIZE / QI2_K) + kbx] = bx->dm;
+    x_sc[i * (WARP_SIZE / 4)     + k/4] = get_int_from_uint8_aligned(bx->scales, kqsx / 4);
+}
+
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+
+    __builtin_assume(i < GGML_CUDA_MMQ_Y);
+    __builtin_assume(j < WARP_SIZE);
+    __builtin_assume(k < WARP_SIZE);
+
+    const int kbx  = k / QI2_K;
+    const int kqsx = k % QI2_K;
+
+    const int bq8_offset = QR2_K * (kqsx / QI8_1);
+    const int scale_offset = kqsx - kqsx % QI8_1 + (kqsx % QI8_1) / (QI8_1/2);
+
+    const uint8_t * scales = ((uint8_t *) (x_sc + i * (WARP_SIZE/4))) + kbx*16 + scale_offset;
+
+    int u[QR2_K];
+    float d8[QR2_K];
+
+    for (int l = 0; l < QR2_K; ++ l) {
+        const int y_qs_index = j * (QR2_K*WARP_SIZE) + kbx * (QR2_K*QI2_K) + (bq8_offset + l)*QI8_1 + kqsx % QI8_1;
+        u[l]  = y_qs[y_qs_index];
+        d8[l] = y_ds[y_qs_index / QI8_1].x;
+    }
+
+    return vec_dot_q2_K_q8_1_impl(x_ql[i * (WARP_SIZE + 1) + k], u, scales, x_dm[i * (WARP_SIZE/QI2_K) + kbx], d8);
+}
+
+#define VDR_q3_K_q8_1 1
+
+static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl(
+    const int & vl, const int & vh, const int * __restrict__ u, const uint8_t * __restrict__ scales,
+    const int & scale_offset, const float & d, const float * __restrict__ d8) {
+
+#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
+    float sumf = 0.0f;
+
+    for (int i = 0; i < QR3_K; ++i) {
+        const int isc = scale_offset + 2*i;
+
+        const int isc_low = isc % (QK_K/32);
+        const int sc_shift_low = 4 * (isc / (QK_K/32));
+        const int sc_low  = (scales[isc_low] >> sc_shift_low) & 0xF;
+
+        const int isc_high = isc % (QK_K/64);
+        const int sc_shift_high = 2 * (isc / (QK_K/64));
+        const int sc_high = ((scales[(QK_K/32) + isc_high] >> sc_shift_high) & 3) << 4;
+
+        const int sc = (sc_low | sc_high) - 32;
+
+        const int vil = (vl >> (2*i)) & 0x03030303;
+
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+
+        const int vi = __vsubss4(vil, vih);
+
+        sumf += d8[i] * (__dp4a(vi, u[i], 0) * sc); // SIMD dot product
+    }
+
+    return d*sumf;
 #else
     return 0.0f; // only to satisfy the compiler
 #endif // __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -2580,51 +2823,107 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 
-#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
     const block_q3_K * bq3_K = (const block_q3_K *) vbq;
 
     const int bq8_offset = QR3_K * (iqs / (QI3_K/2));
     const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
 
-    float sumf = 0.0f;
-
     const float d = bq3_K->d;
 
-    int vl;
-    memcpy(&vl, &bq3_K->qs[sizeof(int) * iqs], sizeof(int));
+    const int vl = get_int_from_uint8(bq3_K->qs, iqs);
 
-    int vh;
-    memcpy(&vh, &bq3_K->hmask[sizeof(int) * (iqs % (QI3_K/2))], sizeof(int));
-    vh = ~vh; // invert the mask so that a 0/1 results in 4/0 being subtracted
-    vh >>= bq8_offset;
+    // invert the mask with ~ so that a 0/1 results in 4/0 being subtracted
+    const int vh = ~get_int_from_uint8(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
+
+    int u[QR3_K];
+    float d8[QR3_K];
 
     for (int i = 0; i < QR3_K; ++i) {
-        const int isc = scale_offset + 2*i;
-
-        const int isc_low = isc % (QK_K/32);
-        const int sc_shift_low = 4 * (isc / (QK_K/32));
-        const int sc_low  = (bq3_K->scales[isc_low] >> sc_shift_low) & 0xF;
-
-        const int isc_high = isc % (QK_K/64);
-        const int sc_shift_high = 2 * (isc / (QK_K/64));
-        const int sc_high = ((bq3_K->scales[(QK_K/32) + isc_high] >> sc_shift_high) & 3) << 4;
-
-        const int sc = (sc_low | sc_high) - 32;
-
-        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        const int ui = *((int*) &bq8i->qs[sizeof(int) * (iqs % QI8_1)]);
-        const float d8i = bq8i->ds.x;
-
-        const int vil = (vl >> (2*i)) & 0x03030303;
-
-        const int vih = ((vh >> i) << 2) & 0x04040404;
-
-        const int vi = __vsubss4(vil, vih);
-
-        sumf += d8i * (__dp4a(vi, ui, 0) * sc); // SIMD dot product
+        u[i]  = get_int_from_int8_aligned(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        d8[i] = bq8_1[bq8_offset + i].ds.x;
     }
 
-    return d*sumf;
+    return vec_dot_q3_K_q8_1_impl(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+}
+
+static __device__ __forceinline__ void allocate_tiles_q3_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+
+    __shared__ int   tile_x_ql[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ half2 tile_x_dm[GGML_CUDA_MMQ_Y * (WARP_SIZE / QI2_K)];
+    __shared__ int   tile_x_qh[GGML_CUDA_MMQ_Y * (WARP_SIZE / 2)];
+    __shared__ int   tile_x_sc[GGML_CUDA_MMQ_Y * (WARP_SIZE / 4)];
+
+    *x_ql = tile_x_ql;
+    *x_dm = tile_x_dm;
+    *x_qh = tile_x_qh;
+    *x_sc = tile_x_sc;
+}
+
+static __device__ __forceinline__ void load_tiles_q3_K(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+
+    const int kbx  = k / QI3_K;
+    const int kqsx = k % QI3_K;
+
+    const block_q3_K * bx = ((block_q3_K *) vx) + i*blocks_per_row + kbx;
+
+    x_ql[i * (WARP_SIZE + 1)     + k]     = get_int_from_uint8(bx->qs, kqsx);
+    x_dm[i * (WARP_SIZE / QI3_K) + kbx].x = bx->d;
+    x_qh[i * (WARP_SIZE / 2)     + k/2]   = get_int_from_uint8(bx->hmask, kqsx / 2);
+    x_sc[i * (WARP_SIZE / 4)     + k/4]   = get_int_from_uint8(bx->scales, kqsx / 4);
+}
+
+static __device__ __forceinline__ float vec_dot_q3_K_q8_1_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+
+    const int kbx  = k / QI3_K;
+    const int kqsx = k % QI3_K;
+
+    const int bq8_offset = QR3_K * (kqsx / (QI3_K/2));
+    const int scale_offset = kqsx - kqsx % QI8_1 + (kqsx % QI8_1) / (QI8_1/2);
+
+    const uint8_t * scales = ((uint8_t *) (x_sc + i * (WARP_SIZE/4))) + kbx*16;
+
+    // invert the mask with ~ so that a 0/1 results in 4/0 being subtracted
+    const int vh = ~x_qh[i * (WARP_SIZE/2) + kbx * (QI3_K/2) + kqsx % (QI3_K/2)] >> bq8_offset;
+
+    int    u[QR3_K];
+    float d8[QR3_K];
+
+    for (int l = 0; l < QR3_K; ++ l) {
+        const int y_qs_index = j * (QR3_K*WARP_SIZE) + kbx * (QR3_K*QI3_K) + (bq8_offset + l)*QI8_1 + kqsx % QI8_1;
+        u[l]  = y_qs[y_qs_index];
+        d8[l] = y_ds[y_qs_index / QI8_1].x;
+    }
+
+    return vec_dot_q3_K_q8_1_impl(x_ql[i * (WARP_SIZE + 1) + k], vh, u, scales, scale_offset, x_dm[i * (WARP_SIZE/QI3_K) + kbx].x, d8);
+}
+
+#define VDR_q4_K_q8_1 2
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl(
+    const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
+    const uint8_t * __restrict__ m, const half2 & dm4, const float * __restrict__ d8) {
+
+#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+    for (int i = 0; i < QR4_K; ++i) {
+        const int v0i = (v[0] >> (4*i)) & 0x0F0F0F0F;
+        const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
+
+        const int dot1 = __dp4a(v1i, u[2*i+1], __dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
+        const int dot2 = __dp4a(0x01010101, u[2*i+1], __dp4a(0x01010101, u[2*i+0], 0)); // sum of u
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
+    }
+
+    return __half2float(dm4.x)*sumf_d - __half2float(dm4.y)*sumf_m;
+
 #else
     return 0.0f; // only to satisfy the compiler
 #endif // __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -2633,36 +2932,195 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 
-#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
+#ifndef GGML_QKK_64
     const block_q4_K * bq4_K = (const block_q4_K *) vbq;
 
-    const int bq8_offset = QR4_K * (iqs / QI8_1);
+    int    v[2];
+    int    u[2*QR4_K];
+    float d8[QR4_K];
+
+    // iqs is in 0...15. bq8_offset = 2 * (iqs/4) -> bq8_offset = 0, 2, 4, 6
+    const int bq8_offset = QR4_K * (iqs / (QI8_1/2));
+
+    // iqs = 0....3 -> bq8_offset = 0, want q4_offset = 0, 4, 8, 12
+    // iqs = 4....7 -> bq8_offset = 2, want q4_offset = 32, 36, 40, 44
+    // iqs = 8...11 -> bq8_offset = 4, want q4_offset = 64, 68, 72, 76
+    // iqs = 12..15 -> bq8_offset = 6, want q4_offset = 96, 100, 104, 108
+
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * (iqs%4));
+    v[0] = q4[0];
+    v[1] = q4[4];
+
+    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = bq8i->ds.x;
+
+        const int * q8 = (const int *)bq8i->qs + (iqs%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+
+    return vec_dot_q4_K_q8_1_impl(v, u, sc, m, bq4_K->dm, d8);
+
+#else
+
+#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq;
 
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
 
-    const float    d = bq4_K->d;
-    const float dmin = bq4_K->dmin;
+    uint16_t aux16[2];
+    const uint8_t * s = (const uint8_t *)aux16;
 
-    const int v = *((int *) &bq4_K->qs[sizeof(int) * iqs]);
+    const uint16_t * a = (const uint16_t *)bq4_K->scales;
+    aux16[0] = a[0] & 0x0f0f;
+    aux16[1] = (a[0] >> 4) & 0x0f0f;
 
-    for (int i = 0; i < QR4_K; ++i) {
-        const int isc = bq8_offset + i;
+    const float dall = bq4_K->d[0];
+    const float dmin = bq4_K->d[1];
 
-        uint8_t sc, m;
-        get_scale_min_k4(isc, bq4_K->scales, sc, m);
+    const float d8_1 = bq8_1[0].ds.x;
+    const float d8_2 = bq8_1[1].ds.x;
 
-        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        const int ui = *((int*) &bq8i->qs[sizeof(int) * (iqs % QI8_1)]);
-        const float d8i = bq8i->ds.x;
+    const int ui1 = *((const int *)bq8_1[0].qs + iqs);
+    const int ui2 = *((const int *)bq8_1[0].qs + iqs + 4);
+    const int ui3 = *((const int *)bq8_1[1].qs + iqs);
+    const int ui4 = *((const int *)bq8_1[1].qs + iqs + 4);
 
-        const int vi = (v >> (4*i)) & 0x0F0F0F0F;
+    const int * q4 = (const int *)bq4_K->qs + iqs;
+    const int v1 = q4[0];
+    const int v2 = q4[4];
 
-        sumf_d += d8i * (__dp4a(vi,         ui, 0) * sc); // SIMD dot product
-        sumf_m += d8i * (__dp4a(0x01010101, ui, 0) * m);  // multiply constant part of q4_K with sum of q8_1 values
+    const int dot1 = __dp4a(ui2, v2 & 0x0f0f0f0f, __dp4a(ui1, v1 & 0x0f0f0f0f, 0));
+    const int dot2 = __dp4a(ui4, (v2 >> 4) & 0x0f0f0f0f, __dp4a(ui3, (v1 >> 4) & 0x0f0f0f0f, 0));
+    const int dot3 = __dp4a(0x01010101, ui2, __dp4a(0x01010101, ui1, 0));
+    const int dot4 = __dp4a(0x01010101, ui4, __dp4a(0x01010101, ui3, 0));
+
+    sumf_d += d8_1 * (dot1 * s[0]) + d8_2 * (dot2 * s[1]);
+    sumf_m += d8_1 * (dot3 * s[2]) + d8_2 * (dot4 * s[3]);
+
+    return dall * sumf_d - dmin * sumf_m;
+
+#else
+    return 0.0f; // only to satisfy the compiler
+#endif // __CUDA_ARCH__ >= MIN_CC_DP4A
+
+#endif
     }
 
-    return d*sumf_d - dmin*sumf_m;
+static __device__ __forceinline__ void allocate_tiles_q4_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+
+    __shared__ int   tile_x_ql[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ half2 tile_x_dm[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI4_K)];
+    __shared__ int   tile_x_sc[GGML_CUDA_MMQ_Y * (3*WARP_SIZE/32)];
+
+    *x_ql = tile_x_ql;
+    *x_dm = tile_x_dm;
+    *x_sc = tile_x_sc;
+}
+
+static __device__ __forceinline__ void load_tiles_q4_K(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+
+    const int kbx  = k / QI4_K;
+    const int kqsx = k % QI4_K;
+
+    const block_q4_K * bx = ((block_q4_K *) vx) + i*blocks_per_row + kbx;
+
+    x_ql[i * (WARP_SIZE + 1)     + k]                    = get_int_from_uint8_aligned(bx->qs,     kqsx);
+    x_dm[i * (WARP_SIZE / QI6_K) + kbx]                  = bx->dm;
+    x_sc[i * (3*WARP_SIZE/32)    + k % (3*WARP_SIZE/32)] = get_int_from_uint8_aligned(bx->scales, k % (3*WARP_SIZE/32));
+}
+
+static __device__ __forceinline__ float vec_dot_q4_K_q8_1_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+
+    __builtin_assume(i < GGML_CUDA_MMQ_Y);
+    __builtin_assume(j < WARP_SIZE);
+    __builtin_assume(k < WARP_SIZE);
+
+    const int kbx  = k / QI6_K; // == 0 if QK_K == 256
+    const int kqsx = k % QI6_K; // == k if QK_K == 256
+
+    int    v[2];
+    int    u[2*QR4_K];
+    float d8[QR4_K];
+
+    // iqs is in 0...15. bq8_offset = 2 * (iqs/4) -> bq8_offset = 0, 2, 4, 6
+    const int bq8_offset = QR4_K * (kqsx / (QI8_1/2));
+
+    v[0] = x_ql[i * (WARP_SIZE + 1) + 4 * bq8_offset + kqsx % 4 + 0];
+    v[1] = x_ql[i * (WARP_SIZE + 1) + 4 * bq8_offset + kqsx % 4 + 4];
+
+    const uint16_t * scales = (const uint16_t *) &x_sc[i * (3*WARP_SIZE/32) + kbx * (3*WARP_SIZE/32)];
+    uint16_t aux[2];
+    const int l = bq8_offset/2;
+    if (l < 2) {
+        aux[0] = scales[l+0] & 0x3f3f;
+        aux[1] = scales[l+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[l+2] >> 0) & 0x0f0f) | ((scales[l-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[l+2] >> 4) & 0x0f0f) | ((scales[l-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+    for (int l = 0; l < QR4_K; ++l) {
+        const int kqsy = j * (QR4_K*WARP_SIZE) + kbx * (QR4_K*QI4_K) + (bq8_offset + l) * QI8_1 + kqsx % (QI8_1/2);
+        u[2*l+0] = y_qs[kqsy + 0*(QI8_1/2)];
+        u[2*l+1] = y_qs[kqsy + 1*(QI8_1/2)];
+        d8[l] = y_ds[kqsy / QI8_1].x;
+    }
+
+    return vec_dot_q4_K_q8_1_impl(v, u, sc, m, x_dm[i * (WARP_SIZE/QI4_K) + kbx], d8);
+}
+
+#define VDR_q5_K_q8_1 2
+
+static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl(
+    const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const uint8_t * __restrict__ sc,
+    const uint8_t * __restrict__ m, const half2 & dm5, const float * __restrict__ d8) {
+
+#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+    for (int i = 0; i < QR5_K; ++i) {
+        const int vl0i = (vl[0] >> (4*i)) & 0x0F0F0F0F;
+        const int vl1i = (vl[1] >> (4*i)) & 0x0F0F0F0F;
+
+        const int vh0i = ((vh[0] >> i) << 4) & 0x10101010;
+        const int vh1i = ((vh[1] >> i) << 4) & 0x10101010;
+
+        const int v0i = vl0i | vh0i;
+        const int v1i = vl1i | vh1i;
+
+        const int dot1 = __dp4a(v0i, u[2*i+0], __dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
+        const int dot2 = __dp4a(0x01010101, u[2*i+0], __dp4a(0x01010101, u[2*i+1], 0)); // sum of u
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * m[i]);
+
+    }
+
+    return __half2float(dm5.x)*sumf_d - __half2float(dm5.y)*sumf_m;
+
 #else
     return 0.0f; // only to satisfy the compiler
 #endif // __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -2671,81 +3129,185 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 
+#ifndef GGML_QKK_64
+    const block_q5_K * bq5_K = (const block_q5_K *) vbq;
+
+    int   vl[2];
+    int   vh[2];
+    int    u[2*QR5_K];
+    float d8[QR5_K];
+
+    const int bq8_offset = QR5_K * (iqs / (QI8_1/2));
+    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * (iqs%4));
+    const int * qh = (const int *)(bq5_K->qh + 4 * (iqs%4));
+
+    vl[0] = ql[0];
+    vl[1] = ql[4];
+
+    vh[0] = qh[0] >> bq8_offset;
+    vh[1] = qh[4] >> bq8_offset;
+
+    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+    for (int i = 0; i < QR5_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = bq8i->ds.x;
+
+        const int * q8 = (const int *)bq8i->qs + (iqs%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+
+    return vec_dot_q5_K_q8_1_impl(vl, vh, u, sc, m, bq5_K->dm, d8);
+
+#else
+
 #if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
     const block_q5_K * bq5_K = (const block_q5_K *) vbq;
 
-    const int bq8_offset = QR5_K * (iqs / QI8_1);
+    const int8_t * s = bq5_K->scales;
 
-    float sumf_d = 0.0f;
-    float sumf_m = 0.0f;
+    const float d = bq5_K->d;
 
-    const float    d = bq5_K->d;
-    const float dmin = bq5_K->dmin;
+    const float d8_1 = bq8_1[0].ds.x;
+    const float d8_2 = bq8_1[1].ds.x;
 
-    const int vl = *((int *) &bq5_K->qs[sizeof(int) * iqs]);
+    const int ui1 = *((const int *)bq8_1[0].qs + iqs);
+    const int ui2 = *((const int *)bq8_1[0].qs + iqs + 4);
+    const int ui3 = *((const int *)bq8_1[1].qs + iqs);
+    const int ui4 = *((const int *)bq8_1[1].qs + iqs + 4);
 
-    const int vh = (*((int *) &bq5_K->qh[sizeof(int) * (iqs % (QI5_K/4))])) >> bq8_offset;
+    const int * ql = (const int *)bq5_K->qs + iqs;
+    const int vl1 = ql[0];
+    const int vl2 = ql[4];
 
-    for (int i = 0; i < QR5_K; ++i) {
-        const int isc = bq8_offset + i;
+    const int step = 4 * iqs; // 0, 4, 8, 12
+    const int im = step/8; // = 0 for iqs = 0, 1, = 1 for iqs = 2, 3
+    const int in = step%8; // 0, 4, 0, 4
+    const int vh = (*((const int *)(bq5_K->qh + in))) >> im;
 
-        uint8_t sc, m;
-        get_scale_min_k4(isc, bq5_K->scales, sc, m);
+    const int v1 = (((vh << 4) & 0x10101010) ^ 0x10101010) | ((vl1 >> 0) & 0x0f0f0f0f);
+    const int v2 = (((vh << 2) & 0x10101010) ^ 0x10101010) | ((vl2 >> 0) & 0x0f0f0f0f);
+    const int v3 = (((vh >> 0) & 0x10101010) ^ 0x10101010) | ((vl1 >> 4) & 0x0f0f0f0f);
+    const int v4 = (((vh >> 2) & 0x10101010) ^ 0x10101010) | ((vl2 >> 4) & 0x0f0f0f0f);
 
-        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        const int ui = *((int*) &bq8i->qs[sizeof(int) * (iqs % QI8_1)]);
-        const float d8i = bq8i->ds.x;
+    const float sumf_d = d8_1 * (__dp4a(ui1, v1, 0) * s[0] + __dp4a(ui2, v2, 0) * s[1])
+                       + d8_2 * (__dp4a(ui3, v3, 0) * s[2] + __dp4a(ui4, v4, 0) * s[3]);
 
-        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+    return d * sumf_d;
 
-        const int vih = ((vh >> i) << 4) & 0x10101010;
-
-        const int vi = vil | vih;
-
-        sumf_d += d8i * (__dp4a(vi,         ui, 0) * sc); // SIMD dot product
-        sumf_m += d8i * (__dp4a(0x01010101, ui, 0) * m);  // multiply constant part of q5_K with sum of q8_1 values
-    }
-
-    return d*sumf_d - dmin*sumf_m;
 #else
     return 0.0f; // only to satisfy the compiler
 #endif // __CUDA_ARCH__ >= MIN_CC_DP4A
+
+#endif
 }
 
-static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
-    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+static __device__ __forceinline__ void allocate_tiles_q5_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+
+    __shared__ int   tile_x_ql[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ half2 tile_x_dm[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI4_K)];
+    __shared__ int   tile_x_qh[GGML_CUDA_MMQ_Y * (WARP_SIZE/4)];
+    __shared__ int   tile_x_sc[GGML_CUDA_MMQ_Y * (3*WARP_SIZE/32)];
+
+    *x_ql = tile_x_ql;
+    *x_dm = tile_x_dm;
+    *x_qh = tile_x_qh;
+    *x_sc = tile_x_sc;
+}
+
+static __device__ __forceinline__ void load_tiles_q5_K(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+
+    const int kbx  = k / QI5_K;
+    const int kqsx = k % QI5_K;
+
+    const block_q5_K * bx = ((block_q5_K *) vx) + i*blocks_per_row + kbx;
+
+    x_ql[i * (WARP_SIZE + 1)     + k]                    = get_int_from_uint8_aligned(bx->qs,     kqsx);
+    x_dm[i * (WARP_SIZE / QI6_K) + kbx]                  = bx->dm;
+    x_qh[i * (WARP_SIZE / 4)     + k/4]                  = get_int_from_uint8_aligned(bx->qh,     kqsx/4);
+    x_sc[i * (3*WARP_SIZE/32)    + k % (3*WARP_SIZE/32)] = get_int_from_uint8_aligned(bx->scales, k % (3*WARP_SIZE/32));
+}
+
+static __device__ __forceinline__ float vec_dot_q5_K_q8_1_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+
+    __builtin_assume(i < 2*WARP_SIZE);
+    __builtin_assume(j < WARP_SIZE);
+    __builtin_assume(k < WARP_SIZE);
+
+    const int kbx  = k / QI6_K; // == 0 if QK_K == 256
+    const int kqsx = k % QI6_K; // == k if QK_K == 256
+
+    int   vl[2];
+    int   vh[2];
+    int    u[2*QR4_K];
+    float d8[QR4_K];
+
+    const int bq8_offset = QR5_K * (kqsx / (QI8_1/2));
+
+    vl[0] = x_ql[i * (WARP_SIZE + 1) + 4 * bq8_offset + kqsx % 4 + 0];
+    vl[1] = x_ql[i * (WARP_SIZE + 1) + 4 * bq8_offset + kqsx % 4 + 4];
+
+    vh[0] = x_qh[i * (WARP_SIZE/4) + kqsx % 4 + 0] >> bq8_offset;
+    vh[1] = x_qh[i * (WARP_SIZE/4) + kqsx % 4 + 4] >> bq8_offset;
+
+    const uint16_t * scales = (const uint16_t *) &x_sc[i * (3*WARP_SIZE/32) + kbx * (3*WARP_SIZE/32)];
+    uint16_t aux[2];
+    const int l = bq8_offset/2;
+    if (l < 2) {
+        aux[0] = scales[l+0] & 0x3f3f;
+        aux[1] = scales[l+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[l+2] >> 0) & 0x0f0f) | ((scales[l-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[l+2] >> 4) & 0x0f0f) | ((scales[l-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+    for (int l = 0; l < QR5_K; ++l) {
+        const int kqsy = j * (QR5_K*WARP_SIZE) + kbx * (QR5_K*QI5_K) + (bq8_offset + l) * QI8_1 + kqsx % (QI8_1/2);
+        u[2*l+0] = y_qs[kqsy + 0*(QI8_1/2)];
+        u[2*l+1] = y_qs[kqsy + 1*(QI8_1/2)];
+        d8[l] = y_ds[kqsy / QI8_1].x;
+    }
+
+    return vec_dot_q5_K_q8_1_impl(vl, vh, u, sc, m, x_dm[i * (WARP_SIZE/QI4_K) + kbx], d8);
+}
+
+#define VDR_q6_K_q8_1 1
+
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl(
+    const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
+    const float & d, const float * __restrict__ d8) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
-    const block_q6_K * bq6_K = (const block_q6_K *) vbq;
-
-    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
-    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
-    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
-
     float sumf = 0.0f;
 
-    const float d = bq6_K->d;
-
-    int vl;
-    memcpy(&vl, &bq6_K->ql[sizeof(int) * iqs], sizeof(int));
-
-    int vh;
-    memcpy(&vh, &bq6_K->qh[sizeof(int) * ((QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4))], sizeof(int));
-
     for (int i = 0; i < QR6_K; ++i) {
-        const int sc = bq6_K->scales[scale_offset + 4*i];
-
-        const block_q8_1 * bq8i = bq8_1 + bq8_offset + 2*i;
-        const int ui = *((int*) &bq8i->qs[sizeof(int) * (iqs % (QI8_1))]);
-        const float d8i = bq8i->ds.x;
+        const int sc = scales[4*i];
 
         const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
 
-        const int vih = ((vh >> (vh_shift + 4*i)) << 4) & 0x30303030;
+        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
-        sumf += d8i * (__dp4a(vi, ui, 0) * sc); // SIMD dot product
+        sumf += d8[i] * (__dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
 
     return d*sumf;
@@ -2754,16 +3316,102 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 #endif // __CUDA_ARCH__ >= MIN_CC_DP4A
 }
 
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq;
+
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int vl = get_int_from_uint8(bq6_K->ql, iqs);
+    const int vh = get_int_from_uint8(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    int    u[QR6_K];
+    float d8[QR6_K];
+
+    for (int i = 0; i < QR6_K; ++i) {
+        u[i]  = get_int_from_int8_aligned(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+        d8[i] = bq8_1[bq8_offset + 2*i].ds.x;
+    }
+
+    return vec_dot_q6_K_q8_1_impl(vl, vh, u, scales, bq6_K->d, d8);
+}
+
+static __device__ __forceinline__ void allocate_tiles_q6_K(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
+
+    __shared__ int   tile_x_ql[GGML_CUDA_MMQ_Y * (WARP_SIZE + 1)];
+    __shared__ half2 tile_x_dm[GGML_CUDA_MMQ_Y * (WARP_SIZE/QI6_K)];
+    __shared__ int   tile_x_qh[GGML_CUDA_MMQ_Y * (WARP_SIZE/2)];
+    __shared__ int   tile_x_sc[GGML_CUDA_MMQ_Y * (WARP_SIZE/8)];
+
+    *x_ql = tile_x_ql;
+    *x_dm = tile_x_dm;
+    *x_qh = tile_x_qh;
+    *x_sc = tile_x_sc;
+}
+
+static __device__ __forceinline__ void load_tiles_q6_K(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i, const int & k, const int & blocks_per_row) {
+
+    const int kbx  = k / QI6_K;
+    const int kqsx = k % QI6_K;
+
+    const block_q6_K * bx = ((block_q6_K *) vx) + i*blocks_per_row + kbx;
+
+    x_ql[i * (WARP_SIZE + 1)     + k]     = get_int_from_uint8(bx->ql,    kqsx);
+    x_dm[i * (WARP_SIZE / QI6_K) + kbx].x = bx->d;
+    x_qh[i * (WARP_SIZE / 2)     + k/2]   = get_int_from_uint8(bx->qh,    kqsx/2);
+    x_sc[i * (WARP_SIZE / 8)     + k/8]   = get_int_from_int8(bx->scales, kqsx/8);
+    }
+
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1_mul_mat(
+    const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
+    const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
+
+    __builtin_assume(i < GGML_CUDA_MMQ_Y);
+    __builtin_assume(j < WARP_SIZE);
+    __builtin_assume(k < WARP_SIZE);
+
+    const int kbx  = k / QI6_K; // == 0 if QK_K == 256
+    const int kqsx = k % QI6_K; // == k if QK_K == 256
+
+    const int bq8_offset = 2 * QR6_K * (kqsx / (QI6_K/2)) + (kqsx % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (kqsx / (QI6_K/2)) + (kqsx % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((kqsx % (QI6_K/2)) / (QI6_K/4));
+
+    const int vh = x_qh[i * (WARP_SIZE/2) + kbx * (QI6_K/2) + (QI6_K/4) * (kqsx / (QI6_K/2)) + kqsx % (QI6_K/4)] >> vh_shift;
+
+    const int x_sc_offset = i * (WARP_SIZE/8) + kbx * (QI6_K/8);
+    const int8_t * scales = ((int8_t *) (x_sc + x_sc_offset)) + scale_offset;
+
+    int    u[QR6_K];
+    float d8[QR6_K];
+
+    for (int l = 0; l < QR6_K; ++l) {
+        const int kqsy = j * (QR6_K*WARP_SIZE) + kbx * (QR6_K*QI6_K) + (bq8_offset + 2*l)*QI8_1 + kqsx % QI8_1;
+        u[l]  = y_qs[kqsy];
+        d8[l] = y_ds[kqsy / QI8_1].x;
+}
+
+    return vec_dot_q6_K_q8_1_impl(x_ql[i * (WARP_SIZE + 1) + k], vh, u, scales, x_dm[i * (WARP_SIZE/QI6_K) + kbx].x, d8);
+}
+
 template <int qk, int qr, int qi, typename block_q_t,
-              allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, vec_dot_q_mul_mat_cuda_t vec_dot>
+              allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
 static __global__ void mul_mat_q(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
-    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_dst) {
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
     const block_q_t  * x = (const block_q_t  *) vx;
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
-    const int blocks_per_row = ncols_x / qk;
+    const int blocks_per_row_x = ncols_x / qk;
+    const int blocks_per_col_y = nrows_y / QK8_1;
     const int blocks_per_warp = WARP_SIZE / qi;
 
     const int & ncols_dst = ncols_y;
@@ -2771,33 +3419,33 @@ static __global__ void mul_mat_q(
     const int tid_x = threadIdx.x;
     const int tid_y = threadIdx.y;
 
-    const int row_dst_0 = 2*blockIdx.x*WARP_SIZE;
+    const int row_dst_0 = blockIdx.x*GGML_CUDA_MMQ_Y;
     const int & row_x_0 = row_dst_0;
     const int row_dst = row_dst_0 + tid_x;
 
     const int col_dst_0 = blockIdx.y*WARP_SIZE;
     const int & col_y_0 = col_dst_0;
 
-    int    * tile_x_ql = nullptr;
-    half2  * tile_x_dm = nullptr;
-    int    * tile_x_qh = nullptr;
-    int8_t * tile_x_sc = nullptr;
+    int   * tile_x_ql = nullptr;
+    half2 * tile_x_dm = nullptr;
+    int   * tile_x_qh = nullptr;
+    int   * tile_x_sc = nullptr;
 
     allocate_tiles(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc);
 
+    const int blocks_per_tile_y_col = qr*WARP_SIZE/QI8_1;
+
     __shared__ int    tile_y_qs[(WARP_SIZE) * (qr*WARP_SIZE)];
-    __shared__ half2  tile_y_ds[(WARP_SIZE) * (qr*WARP_SIZE/QI8_1)];
+    __shared__ half2  tile_y_ds[(WARP_SIZE) * blocks_per_tile_y_col];
 
-    float sum[2][4] = {0.0f};
+    float sum[GGML_CUDA_MMQ_Y/WARP_SIZE][4] = {0.0f};
 
-    for (int ib0 = 0; ib0 < blocks_per_row; ib0 += blocks_per_warp) {
+    for (int ib0 = 0; ib0 < blocks_per_row_x; ib0 += blocks_per_warp) {
 
-        for (int i = 0; i < 2*WARP_SIZE; i += 8) {
-            load_tiles(x + row_x_0*blocks_per_row + ib0, tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc,
-                       i + tid_y, tid_x, blocks_per_row);
+        for (int i = 0; i < GGML_CUDA_MMQ_Y; i += 8) {
+            load_tiles(x + row_x_0*blocks_per_row_x + ib0, tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc,
+                       i + tid_y, tid_x, blocks_per_row_x);
         }
-
-        const int iqsy = sizeof(int) * (tid_x % QI8_1);
 
         for (int ir = 0; ir < qr; ++ir) {
             const int kqs = ir*WARP_SIZE + tid_x;
@@ -2806,22 +3454,33 @@ static __global__ void mul_mat_q(
             for (int i = 0; i < WARP_SIZE; i += 8) {
                 const int col_y_eff = min(col_y_0 + tid_y + i, ncols_y-1); // to prevent out-of-bounds memory accesses
 
-                const block_q8_1 * by0 = &y[col_y_eff*blocks_per_row + ib0 + kby];
+                const block_q8_1 * by0 = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + kby];
 
-                tile_y_qs[(tid_y + i) * (qr*WARP_SIZE)       + kqs] = *((int *) &by0->qs[iqsy]);
-                tile_y_ds[(tid_y + i) * (qr*WARP_SIZE/QI8_1) + kby] = by0->ds;
+                tile_y_qs[(tid_y + i) * (qr*WARP_SIZE) + kqs] = get_int_from_int8_aligned(by0->qs, tid_x % QI8_1);
             }
+        }
+
+        for (int ids0 = 0; ids0 < WARP_SIZE; ids0 += 8 * (WARP_SIZE/blocks_per_tile_y_col)) {
+            const int ids = (ids0 + tid_y * (WARP_SIZE/blocks_per_tile_y_col) + tid_x / blocks_per_tile_y_col) % WARP_SIZE;
+            const int kby = tid_x % blocks_per_tile_y_col;
+            const int col_y_eff = min(col_y_0 + ids, ncols_y-1);
+            tile_y_ds[ids * (qr*WARP_SIZE/QI8_1) + kby] = y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + kby].ds;
         }
 
         __syncthreads();
 
-        for (int k = 0; k < WARP_SIZE; ++k) {
+#if __CUDA_ARCH__ >= 700 // TODO: actually test this with compute capability 7.X cards
+#pragma unroll
+#endif // __CUDA_ARCH__ >= 700
+        for (int k = 0; k < WARP_SIZE/vdr; ++k) {
+#pragma unroll
             for (int j = 0; j < WARP_SIZE; j += 8) {
-                sum[0][j/8] += vec_dot(tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, tile_y_qs, tile_y_ds,
-                                       tid_x,             tid_y + j, k);
-                sum[1][j/8] += vec_dot(tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, tile_y_qs, tile_y_ds,
-                                       tid_x + WARP_SIZE, tid_y + j, k);
+#pragma unroll
+                for (int i = 0; i < GGML_CUDA_MMQ_Y; i += WARP_SIZE) {
+                    sum[i/WARP_SIZE][j/8] += vec_dot(tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, tile_y_qs, tile_y_ds,
+                                                     tid_x + i, tid_y + j, k);
             }
+        }
         }
 
         __syncthreads();
@@ -2839,12 +3498,13 @@ static __global__ void mul_mat_q(
             return;
         }
 
-        dst[col_dst*nrows_dst + row_dst] = sum[0][j/8];
-        dst[col_dst*nrows_dst + row_dst + WARP_SIZE] = sum[1][j/8];
+        for (int i = 0; i < GGML_CUDA_MMQ_Y; i += WARP_SIZE) {
+            dst[col_dst*nrows_dst + row_dst + i] = sum[i/WARP_SIZE][j/8];
     }
 }
+}
 
-template <int qk, int qi, typename block_q_t, vec_dot_q_cuda_t vec_dot_q_cuda>
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 static __global__ void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst, const int ncols, const int nrows) {
     const int row = blockIdx.y*blockDim.y + threadIdx.y;
 
@@ -2853,7 +3513,7 @@ static __global__ void mul_mat_vec_q(const void * __restrict__ vx, const void * 
     }
 
     const int blocks_per_row = ncols / qk;
-    const int blocks_per_warp = WARP_SIZE / qi;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
 
 // partial sum for each thread
     float tmp = 0.0f;
@@ -2862,11 +3522,11 @@ static __global__ void mul_mat_vec_q(const void * __restrict__ vx, const void * 
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
     for (int i = 0; i < blocks_per_row; i += blocks_per_warp) {
-        const int ibx = row*blocks_per_row + i + threadIdx.x / qi; // x block index
+        const int ibx = row*blocks_per_row + i + threadIdx.x / (qi/vdr); // x block index
 
-        const int iby = (i + threadIdx.x / qi) * qk/QK8_1; // y block index that aligns with ibx
+        const int iby = (i + threadIdx.x / (qi/vdr)) * qk/QK8_1; // y block index that aligns with ibx
 
-        const int iqs  = threadIdx.x % qi; // x block quant index when casting the quants to int
+        const int iqs  = threadIdx.x % (qi/vdr); // x block quant index when casting the quants to int
 
         tmp += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
     }
@@ -2899,11 +3559,11 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
     const int y_offset = qr == 1 ? 1 : qk/2;
 
 // partial sum for each thread
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
     half2 tmp = {0.0f, 0.0f}; // two sums for f16 to take advantage of half2 intrinsics
 #else
     float tmp = 0.0f;
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
 
     for (int i = 0; i < ncols; i += iter_stride) {
         const int col = i + vals_per_iter*tid;
@@ -2923,7 +3583,7 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
 
             // matrix multiplication
             // for qr = 2 the y index needs to increase by 1 per j iter because of y_offset = qk/2
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
             tmp += __hmul2(v, {
                 y[iybs + iqs + j/qr + 0],
                 y[iybs + iqs + j/qr + y_offset]
@@ -2931,7 +3591,7 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
 #else
             tmp += v.x * y[iybs + iqs + j/qr + 0];
             tmp += v.y * y[iybs + iqs + j/qr + y_offset];
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
         }
     }
 
@@ -2942,19 +3602,23 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
     }
 
     if (tid == 0) {
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
         dst[row] = tmp.x + tmp.y;
 #else
         dst[row] = tmp;
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
     }
 }
 
-static __global__ void mul_mat_p021_f16_f32(const void * __restrict__ vx, const float * __restrict__ y, float * __restrict__ dst, const int ncols_x, const int nrows_x, const int nchannels_x) {
+static __global__ void mul_mat_p021_f16_f32(
+    const void * __restrict__ vx, const float * __restrict__ y, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nchannels_x, const int nchannels_y) {
+
     const half * x = (const half *) vx;
 
     const int row_x = blockDim.y*blockIdx.y + threadIdx.y;
     const int channel = blockDim.z*blockIdx.z + threadIdx.z;
+    const int channel_x = channel / (nchannels_y / nchannels_x);
 
     const int nrows_y = ncols_x;
     const int nrows_dst = nrows_x;
@@ -2970,7 +3634,7 @@ static __global__ void mul_mat_p021_f16_f32(const void * __restrict__ vx, const 
         }
 
         // x is transposed and permuted
-        const int ix = row_x*nchannels_x*ncols_x + channel*ncols_x + col_x;
+        const int ix = row_x*nchannels_x*ncols_x + channel_x*ncols_x + col_x;
         const float xi = __half2float(x[ix]);
 
         const int row_y = col_x;
@@ -2998,12 +3662,13 @@ static __global__ void mul_mat_p021_f16_f32(const void * __restrict__ vx, const 
 
 static __global__ void mul_mat_vec_nc_f16_f32( // nc == non-contiguous
     const void * __restrict__ vx, const float * __restrict__ y, float * __restrict__ dst, const int ncols_x, const int nrows_x,
-    const int row_stride_x, const int channel_stride_x) {
+    const int row_stride_x, const int channel_stride_x, const int channel_x_divisor) {
 
     const half * x = (const half *) vx;
 
     const int row_x = blockDim.y*blockIdx.y + threadIdx.y;
     const int channel = blockDim.z*blockIdx.z + threadIdx.z;
+    const int channel_x = channel / channel_x_divisor;
 
     const int nrows_y = ncols_x;
     const int nrows_dst = nrows_x;
@@ -3020,7 +3685,7 @@ static __global__ void mul_mat_vec_nc_f16_f32( // nc == non-contiguous
             break;
         }
 
-        const int ix = channel*channel_stride_x + row_x*row_stride_x + col_x;
+        const int ix = channel_x*channel_stride_x + row_x*row_stride_x + col_x;
         const float xi = __half2float(x[ix]);
 
         const int row_y = col_x;
@@ -3079,9 +3744,6 @@ static __global__ void cpy_f32_f16(const char * cx, char * cdst, const int ne,
 
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
-
-
-
 
 // rope == RoPE == rotary positional embedding
 static __global__ void rope_f32(const float * x, float * dst, const int ncols, const float p, const float theta_scale) {
@@ -3235,10 +3897,10 @@ static void norm_f32_cuda(const float * x, float * dst, const int ncols, const i
     norm_f32<<<nrows, block_dims, 0, stream>>>(x, dst, ncols);
 }
 
-static void rms_norm_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, cudaStream_t stream) {
+static void rms_norm_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     GGML_ASSERT(ncols % WARP_SIZE == 0);
     const dim3 block_dims(WARP_SIZE, 1, 1);
-    rms_norm_f32<<<nrows, block_dims, 0, stream>>>(x, dst, ncols);
+    rms_norm_f32<<<nrows, block_dims, 0, stream>>>(x, dst, ncols, eps);
 }
 
 static void quantize_row_q8_1_cuda(const float * x, void * vy, const int kx, const int ky, const int kx_padded, cudaStream_t stream) {
@@ -3246,6 +3908,21 @@ static void quantize_row_q8_1_cuda(const float * x, void * vy, const int kx, con
     const dim3 num_blocks(block_num_x, ky, 1);
     const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
     quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(x, vy, kx, kx_padded);
+}
+
+static void quantize_row_q8_0_cuda(const float * x, void * vy, const int kx, const int ky, const int kx_padded, cudaStream_t stream) {
+    const int block_num_x = (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const dim3 num_blocks(block_num_x, ky, 1);
+    const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
+    quantize_q8_0<<<num_blocks, block_size, 0, stream>>>(x, vy, kx, kx_padded);
+}
+
+// untested f16 variant
+static void quantize_row_q8_1_cuda_f16(const __half * x, void * vy, const int kx, const int ky, const int kx_padded, cudaStream_t stream) {
+    const int block_num_x = (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    const dim3 num_blocks(block_num_x, ky, 1);
+    const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
+    quantize_q8_1_f16<<<num_blocks, block_size, 0, stream>>>(x, vy, kx, kx_padded);
 }
 
 static void dequantize_row_q4_0_cuda(const void * vx, float * y, const int k, cudaStream_t stream) {
@@ -3547,7 +4224,7 @@ static void mul_mat_vec_q4_0_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK4_0, QI4_0, block_q4_0, vec_dot_q4_0_q8_1>
+    mul_mat_vec_q<QK4_0, QI4_0, block_q4_0, VDR_q4_0_q8_1, vec_dot_q4_0_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3556,7 +4233,7 @@ static void mul_mat_vec_q4_1_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK4_0, QI4_1, block_q4_1, vec_dot_q4_1_q8_1>
+    mul_mat_vec_q<QK4_0, QI4_1, block_q4_1, VDR_q4_1_q8_1, vec_dot_q4_1_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3565,7 +4242,7 @@ static void mul_mat_vec_q5_0_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK5_0, QI5_0, block_q5_0, vec_dot_q5_0_q8_1>
+    mul_mat_vec_q<QK5_0, QI5_0, block_q5_0, VDR_q5_0_q8_1, vec_dot_q5_0_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3574,7 +4251,7 @@ static void mul_mat_vec_q5_1_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK5_1, QI5_1, block_q5_1, vec_dot_q5_1_q8_1>
+    mul_mat_vec_q<QK5_1, QI5_1, block_q5_1, VDR_q5_1_q8_1, vec_dot_q5_1_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3583,7 +4260,7 @@ static void mul_mat_vec_q8_0_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK8_0, QI8_0, block_q8_0, vec_dot_q8_0_q8_1>
+    mul_mat_vec_q<QK8_0, QI8_0, block_q8_0, VDR_q8_0_q8_1, vec_dot_q8_0_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3592,7 +4269,7 @@ static void mul_mat_vec_q2_K_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK_K, QI2_K, block_q2_K, vec_dot_q2_K_q8_1>
+    mul_mat_vec_q<QK_K, QI2_K, block_q2_K, VDR_q2_K_q8_1, vec_dot_q2_K_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3601,7 +4278,7 @@ static void mul_mat_vec_q3_K_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK_K, QI3_K, block_q3_K, vec_dot_q3_K_q8_1>
+    mul_mat_vec_q<QK_K, QI3_K, block_q3_K, VDR_q3_K_q8_1, vec_dot_q3_K_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3610,7 +4287,7 @@ static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK_K, QI4_K, block_q4_K, vec_dot_q4_K_q8_1>
+    mul_mat_vec_q<QK_K, QI4_K, block_q4_K, VDR_q4_K_q8_1, vec_dot_q4_K_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3619,7 +4296,7 @@ static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK_K, QI5_K, block_q5_K, vec_dot_q5_K_q8_1>
+    mul_mat_vec_q<QK_K, QI5_K, block_q5_K, VDR_q5_K_q8_1, vec_dot_q5_K_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3628,7 +4305,7 @@ static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, float *
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
     const dim3 block_nums(1, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<QK_K, QI6_K, block_q6_K, vec_dot_q6_K_q8_1>
+    mul_mat_vec_q<QK_K, QI6_K, block_q6_K, VDR_q6_K_q8_1, vec_dot_q6_K_q8_1>
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows);
 }
 
@@ -3652,7 +4329,6 @@ static void convert_mul_mat_vec_f16_cuda(const void * vx, const dfloat * y, floa
     dequantize_mul_mat_vec<1, 1, convert_f16>
         <<<block_nums, block_dims, 0, stream>>>(vx, y, dst, ncols, nrows);
 }
-
 
 static to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
     switch (type) {
@@ -3682,8 +4358,8 @@ static to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return nullptr;
     }
 }
-// warning: no support for 64 blocks yet
 static to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+    // warning: no support for 64 blocks yet
     switch (type) {
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda_f16;
@@ -3741,60 +4417,144 @@ static to_fp8e4_cuda_t ggml_get_to_fp8e4_cuda(ggml_type type) {
     }
 }
 
-static void ggml_mul_mat_q4_0_q8_1_cuda(const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_dst, cudaStream_t stream){
-    const int block_num_x = (nrows_x + 2*WARP_SIZE - 1) / (2*WARP_SIZE);
+
+static void ggml_mul_mat_q4_0_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
     const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
     const dim3 block_nums(block_num_x, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
-    mul_mat_q<QK4_0, QR4_0, QI4_0, block_q4_0, allocate_tiles_q4_0, load_tiles_q4_0, vec_dot_q4_0_q8_1_mul_mat><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_dst);
+    mul_mat_q<QK4_0, QR4_0, QI4_0, block_q4_0, allocate_tiles_q4_0, load_tiles_q4_0, VDR_q4_0_q8_1, vec_dot_q4_0_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-static void ggml_mul_mat_q4_1_q8_1_cuda(const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_dst, cudaStream_t stream){
-    const int block_num_x = (nrows_x + 2*WARP_SIZE - 1) / (2*WARP_SIZE);
+static void ggml_mul_mat_q4_1_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
     const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
     const dim3 block_nums(block_num_x, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
-    mul_mat_q<QK4_1, QR4_1, QI4_1, block_q4_1, allocate_tiles_q4_1, load_tiles_q4_1, vec_dot_q4_1_q8_1_mul_mat><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_dst);
+    mul_mat_q<QK4_1, QR4_1, QI4_1, block_q4_1, allocate_tiles_q4_1, load_tiles_q4_1, VDR_q4_1_q8_1, vec_dot_q4_1_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-static void ggml_mul_mat_q5_0_q8_1_cuda(const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_dst, cudaStream_t stream){
-    const int block_num_x = (nrows_x + 2*WARP_SIZE - 1) / (2*WARP_SIZE);
+static void ggml_mul_mat_q5_0_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
     const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
     const dim3 block_nums(block_num_x, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
-    mul_mat_q<QK5_0, QR5_0, QI5_0, block_q5_0, allocate_tiles_q5_0, load_tiles_q5_0, vec_dot_q5_0_q8_1_mul_mat><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_dst);
+    mul_mat_q<QK5_0, QR5_0, QI5_0, block_q5_0, allocate_tiles_q5_0, load_tiles_q5_0, VDR_q5_0_q8_1, vec_dot_q5_0_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-static void ggml_mul_mat_q5_1_q8_1_cuda(const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_dst, cudaStream_t stream){
-    const int block_num_x = (nrows_x + 2*WARP_SIZE - 1) / (2*WARP_SIZE);
+static void ggml_mul_mat_q5_1_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
     const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
     const dim3 block_nums(block_num_x, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
-    mul_mat_q<QK5_1, QR5_1, QI5_1, block_q5_1, allocate_tiles_q5_1, load_tiles_q5_1, vec_dot_q5_1_q8_1_mul_mat><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_dst);
+    mul_mat_q<QK5_1, QR5_1, QI5_1, block_q5_1, allocate_tiles_q5_1, load_tiles_q5_1, VDR_q5_1_q8_1, vec_dot_q5_1_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-static void ggml_mul_mat_q8_0_q8_1_cuda(const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_dst, cudaStream_t stream){
-    const int block_num_x = (nrows_x + 2*WARP_SIZE - 1) / (2*WARP_SIZE);
+static void ggml_mul_mat_q8_0_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
     const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
     const dim3 block_nums(block_num_x, block_num_y, 1);
     const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
-    mul_mat_q<QK8_0, QR8_0, QI8_0, block_q8_0, allocate_tiles_q8_0, load_tiles_q8_0, vec_dot_q8_0_q8_1_mul_mat><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_dst);
+    mul_mat_q<QK8_0, QR8_0, QI8_0, block_q8_0, allocate_tiles_q8_0, load_tiles_q8_0, VDR_q8_0_q8_1, vec_dot_q8_0_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-static void ggml_mul_mat_p021_f16_f32_cuda(const void * vx, const float * y, float * dst, const int ncols_x, const int nrows_x, const int nchannels_x, cudaStream_t stream) {
-    const dim3 block_nums(1, nrows_x, nchannels_x);
+static void ggml_mul_mat_q2_K_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
+    const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
+    mul_mat_q<QK_K, QR2_K, QI2_K, block_q2_K, allocate_tiles_q2_K, load_tiles_q2_K, VDR_q2_K_q8_1, vec_dot_q2_K_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+static void ggml_mul_mat_q3_K_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
+    const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
+    mul_mat_q<QK_K, QR3_K, QI3_K, block_q3_K, allocate_tiles_q3_K, load_tiles_q3_K, VDR_q3_K_q8_1, vec_dot_q3_K_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+static void ggml_mul_mat_q4_K_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
+    const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
+    mul_mat_q<QK_K, QR4_K, QI4_K, block_q4_K, allocate_tiles_q4_K, load_tiles_q4_K, VDR_q4_K_q8_1, vec_dot_q4_K_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+static void ggml_mul_mat_q5_K_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
+    const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
+    mul_mat_q<QK_K, QR5_K, QI5_K, block_q5_K, allocate_tiles_q5_K, load_tiles_q5_K, VDR_q5_K_q8_1, vec_dot_q5_K_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+static void ggml_mul_mat_q6_K_q8_1_cuda(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+
+    const int block_num_x = (nrows_x + GGML_CUDA_MMQ_Y - 1) / GGML_CUDA_MMQ_Y;
+    const int block_num_y = (ncols_y + WARP_SIZE - 1) / WARP_SIZE;
+    const dim3 block_nums(block_num_x, block_num_y, 1);
+    const dim3 block_dims(WARP_SIZE, WARP_SIZE/4, 1);
+    mul_mat_q<QK_K, QR6_K, QI6_K, block_q6_K, allocate_tiles_q6_K, load_tiles_q6_K, VDR_q6_K_q8_1, vec_dot_q6_K_q8_1_mul_mat>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+static void ggml_mul_mat_p021_f16_f32_cuda(
+    const void * vx, const float * y, float * dst, const int ncols_x, const int nrows_x,
+    const int nchannels_x, const int nchannels_y, cudaStream_t stream) {
+
+    const dim3 block_nums(1, nrows_x, nchannels_y);
     const dim3 block_dims(WARP_SIZE, 1, 1);
-    mul_mat_p021_f16_f32<<<block_nums, block_dims, 0, stream>>>(vx, y, dst, ncols_x, nrows_x, nchannels_x);
+    mul_mat_p021_f16_f32<<<block_nums, block_dims, 0, stream>>>(vx, y, dst, ncols_x, nrows_x, nchannels_x, nchannels_y);
 }
 
 static void ggml_mul_mat_vec_nc_f16_f32_cuda(
     const void * vx, const float * y, float * dst, const int ncols_x, const int nrows_x, const int row_stride_x,
-    const int nchannels_x, const int channel_stride_x, cudaStream_t stream) {
+    const int nchannels_x, const int nchannels_y, const int channel_stride_x, cudaStream_t stream) {
 
-    const dim3 block_nums(1, nrows_x, nchannels_x);
+    const dim3 block_nums(1, nrows_x, nchannels_y);
     const dim3 block_dims(WARP_SIZE, 1, 1);
     mul_mat_vec_nc_f16_f32<<<block_nums, block_dims, 0, stream>>>
-        (vx, y, dst, ncols_x, nrows_x, row_stride_x, channel_stride_x);
+        (vx, y, dst, ncols_x, nrows_x, row_stride_x, channel_stride_x, nchannels_y/nchannels_x);
 }
 
 static void ggml_cpy_f32_f32_cuda(
@@ -4082,7 +4842,7 @@ void ggml_cuda_pool_reset_all_counters(int device_id) {
 
 
 
-void ggml_cuda_tensor_split_custom(int64_t n_rows, int device_id, int &row_low, int &row_high, uint8_t &padding_required)
+void ggml_cuda_tensor_split_custom(int64_t n_rows, int device_id, int &row_low, int &row_high, int &padding_required)
 {
     
     int parts = int(n_rows / MATRIX_SPLIT_DIVISIBLE);
@@ -4098,8 +4858,8 @@ void ggml_cuda_tensor_split_custom(int64_t n_rows, int device_id, int &row_low, 
             row_high = int(g_tensor_split[device_id+1] * parts) * MATRIX_SPLIT_DIVISIBLE;
     }
     if (device_id == g_device_count-1) {
-        row_high += r;
-        padding_required = 1;
+        // row_high += r;
+        padding_required = r;
     }
     // printf("device %d: low %d, high %d, diff %d, nrows %d, parts %d, r %d\n", device_id, row_low, row_high, row_high-row_low, n_rows, parts, r);
 }
@@ -4257,8 +5017,29 @@ bool ggml_init_cublas(bool check_only) {
 
             // create cublas handle
             CUBLAS_CHECK(cublasCreate(&g_cublas_handles[id]));
-            // CUBLAS_CHECK(cublasSetMathMode(g_cublas_handles[id], CUBLAS_TF32_TENSOR_OP_MATH));
+            CUBLAS_CHECK(cublasSetMathMode(g_cublas_handles[id], CUBLAS_TF32_TENSOR_OP_MATH));
         }
+
+        for (int id = 0; id < g_device_count; ++id) {
+            CUDA_CHECK(cudaSetDevice(id));
+
+            for (int id_other = 0; id_other < g_device_count; ++id_other) {
+                if (id == id_other) {
+                    continue;
+                }
+                if (id != g_main_device && id_other != g_main_device) {
+                    continue;
+                }
+
+                int canAccessPeer;
+                CUDA_CHECK(cudaDeviceCanAccessPeer(&canAccessPeer, id, id_other));
+                if (canAccessPeer) {
+                    // FIXME for some reason enabling peer access makes prompt processing slightly slower
+                    CUDA_CHECK(cudaDeviceEnablePeerAccess(id_other, 0));
+                }
+            }
+        }
+
         CUDA_CHECK(cudaSetDevice(currentDevice));
 
         // configure logging to stdout
@@ -4277,6 +5058,9 @@ void ggml_cuda_set_tensor_split_prepare(const float * tensor_split, int num_devi
 }
 // expect array of float proportions where to split each device id, if all 0.0 then no change to default split
 void ggml_cuda_set_tensor_split(const float * tensor_split) {
+    if (tensor_split == nullptr) {
+        return;
+    }
     bool all_zero = true;
     for (int i = 0; i < g_system_gpu_status.num_devices; ++i) {
         if (tensor_split[i] != 0.0f) {
@@ -4424,6 +5208,7 @@ inline void ggml_cuda_op_mul(
     (void) dst;
     (void) src0_ddq_i;
     (void) i02;
+    (void) i1;
 }
 
 inline void ggml_cuda_op_gelu(
@@ -4503,8 +5288,12 @@ inline void ggml_cuda_op_rms_norm(
     const int64_t ne00 = src0->ne[0];
     const int64_t i01_diff = i01_high - i01_low;
 
+    const float eps = 1e-6f;
+    // float eps;
+    // memcpy(&eps, dst->op_params, sizeof(float));
+
     // compute
-    rms_norm_f32_cuda(src0_ddf_i, dst_ddf_i, ne00, i01_diff, cudaStream_main);
+    rms_norm_f32_cuda(src0_ddf_i, dst_ddf_i, ne00, i01_diff, eps, cudaStream_main);
 
     (void) src1;
     (void) dst;
@@ -4514,12 +5303,130 @@ inline void ggml_cuda_op_rms_norm(
     (void) i1;
 }
 
+
+/**
+ * Matrix multiplication (CUDA Kernel) on the device: C = A * B
+ * wA is A's width and wB is B's width
+ */
+template <int BLOCK_SIZE> __global__ void MatrixMulCUDA(float *C, float *A,
+    float *B, int wA,
+    int wB) {
+  // Block index
+  int bx = blockIdx.x;
+  int by = blockIdx.y;
+
+  // Thread index
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+
+  // Index of the first sub-matrix of A processed by the block
+  int aBegin = wA * BLOCK_SIZE * by;
+
+  // Index of the last sub-matrix of A processed by the block
+  int aEnd   = aBegin + wA - 1;
+
+  // Step size used to iterate through the sub-matrices of A
+  int aStep  = BLOCK_SIZE;
+
+  // Index of the first sub-matrix of B processed by the block
+  int bBegin = BLOCK_SIZE * bx;
+
+  // Step size used to iterate through the sub-matrices of B
+  int bStep  = BLOCK_SIZE * wB;
+
+  // Csub is used to store the element of the block sub-matrix
+  // that is computed by the thread
+  float Csub = 0;
+
+  // Loop over all the sub-matrices of A and B
+  // required to compute the block sub-matrix
+  for (int a = aBegin, b = bBegin;
+       a <= aEnd;
+       a += aStep, b += bStep) {
+    // Declaration of the shared memory array As used to
+    // store the sub-matrix of A
+    __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+
+    // Declaration of the shared memory array Bs used to
+    // store the sub-matrix of B
+    __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
+
+    // Load the matrices from device memory
+    // to shared memory; each thread loads
+    // one element of each matrix
+    As[ty][tx] = A[a + wA * ty + tx];
+    Bs[ty][tx] = B[b + wB * ty + tx];
+
+    // Synchronize to make sure the matrices are loaded
+    __syncthreads();
+
+    // Multiply the two matrices together;
+    // each thread computes one element
+    // of the block sub-matrix
+#pragma unroll
+
+    for (int k = 0; k < BLOCK_SIZE; ++k) {
+      Csub += As[ty][k] * Bs[k][tx];
+    }
+
+    // Synchronize to make sure that the preceding
+    // computation is done before loading two new
+    // sub-matrices of A and B in the next iteration
+    __syncthreads();
+  }
+
+  // Write the block sub-matrix to device memory;
+  // each thread writes one element
+  int c = wB * BLOCK_SIZE * by + BLOCK_SIZE * bx;
+  C[c + wB * ty + tx] = Csub;
+}
+
+void ggml_cuda_op_mul_mat_interleaved(
+    const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    
+    // Cast input pointers to float pointers
+    float *d_A = (float *)vx;
+    float *d_B = (float *)vy;
+    float *d_C = dst;
+
+  // Determine block size based on ncols_x and nrows_x
+  int block_size = 16;
+  if (ncols_x > 16 || nrows_x > 16) {
+      block_size = 32;
+  }
+
+  // Make sure the dimensions are correct
+  assert(ncols_x == nrows_y);
+  assert(nrows_dst == nrows_x);
+
+  // Setup execution parameters
+  dim3 threads(block_size, block_size);
+  dim3 grid((ncols_y + threads.x - 1) / threads.x, (nrows_x + threads.y - 1) / threads.y);
+
+  // Execute the kernel
+  if (block_size == 16) {
+    MatrixMulCUDA<16>
+        <<<grid, threads, 0, stream>>>(d_C, d_A, d_B, ncols_x, ncols_y);
+  } else {
+    MatrixMulCUDA<32>
+        <<<grid, threads, 0, stream>>>(d_C, d_A, d_B, ncols_x, ncols_y);
+  }
+
+  // Check for any errors launching the kernel
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+      printf("Error launching kernel: %s\n", cudaGetErrorString(err));
+  }
+}
+
 inline void ggml_cuda_op_mul_mat_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, char * src0_ddq_i,
-    float * src0_ddf_i, float * src1_ddf_i, float * dst_ddf_i, int64_t i02, int64_t i01_low, int64_t i01_high, int i1,
+    float * src0_ddf_i, float * src1_ddf_i, float * dst_ddf_i, 
+    int64_t i02, int64_t i01_low, int64_t i01_high, int i1, 
     cudaStream_t & cudaStream_main){
 
-    GGML_ASSERT(src0_ddq_i != nullptr);
+    // GGML_ASSERT(src0_ddq_i != nullptr);
     GGML_ASSERT(src1_ddf_i != nullptr);
     GGML_ASSERT(dst_ddf_i != nullptr);
 
@@ -4540,32 +5447,73 @@ inline void ggml_cuda_op_mul_mat_q(
     // nrows_dst == nrows of the matrix that the dequantize_mul_mat kernel writes into
     const int64_t nrows_dst = dst->backend == GGML_BACKEND_GPU && id == g_main_device ? ne0 : i01_diff;
 
-    int64_t padded_row_size = ne10 + MATRIX_ROW_PADDING - 1;
-    padded_row_size -= padded_row_size % MATRIX_ROW_PADDING;
+    const int64_t padded_row_size = ne10 % MATRIX_ROW_PADDING == 0 ?
+        ne10 : ne10 - ne10 % MATRIX_ROW_PADDING + MATRIX_ROW_PADDING;
     size_t as;
     void * src1_q8_1 = ggml_cuda_pool_malloc(padded_row_size*ne11*sizeof(block_q8_1)/QK8_1, &as);
     quantize_row_q8_1_cuda(src1_ddf_i, src1_q8_1, ne10, ne11, padded_row_size, cudaStream_main);
 
+    void * src0_q8_0;
+    size_t as0;
+    int64_t padded_row_size_0;
+    if (src0->type == GGML_TYPE_F32) 
+    {
+            padded_row_size_0 = ne00 % MATRIX_ROW_PADDING == 0 ?
+               ne00 : ne00 - ne00 % MATRIX_ROW_PADDING + MATRIX_ROW_PADDING;
+            padded_row_size_0=ne00; // actually cols for the multiplication
+            src0_q8_0 = ggml_cuda_pool_malloc(padded_row_size_0*i01_diff*sizeof(block_q8_0)/QK8_0, &as0);
+            quantize_row_q8_0_cuda(src0_ddf_i, src0_q8_0, ne00, i01_diff, padded_row_size_0, cudaStream_main);
+    }
+     
     switch (src0->type) {
+        case GGML_TYPE_F32:
+            dst->meta.cuda_perf_mal_mul_type=8;
+            // ggml_cuda_op_mul_mat_interleaved(src0_ddf_i, src1_ddf_i, dst_ddf_i, ne00, i01_diff, ne11,ne10,nrows_dst, cudaStream_main);
+            //                                                           ncols_x,          nrows_x,  ncols_y, nrows_y,        nrows_dst
+            ggml_mul_mat_q8_0_q8_1_cuda(src0_q8_0, src1_q8_1, dst_ddf_i, padded_row_size_0, i01_diff, ne11,   padded_row_size, nrows_dst, cudaStream_main);
+            // if (dst->meta.layer_id == 0)            printf("GGML_TYPE_F32: X ROWS: %d, X COLS: %d (%d), Y ROWS: %d, Y COLS: %d (%d)\n", i01_diff, ne00,padded_row_size_0, ne10,padded_row_size, ne11);
+            ggml_cuda_pool_free(src0_q8_0, as0);
+        break;
+
         case GGML_TYPE_Q4_0:
             dst->meta.cuda_perf_mal_mul_type=4;
-            ggml_mul_mat_q4_0_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, nrows_dst, cudaStream_main);
+            ggml_mul_mat_q4_0_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
             break;
         case GGML_TYPE_Q4_1:
             dst->meta.cuda_perf_mal_mul_type=4;
-            ggml_mul_mat_q4_1_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, nrows_dst, cudaStream_main);
+            ggml_mul_mat_q4_1_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
             break;
         case GGML_TYPE_Q5_0:
             dst->meta.cuda_perf_mal_mul_type=5;
-            ggml_mul_mat_q5_0_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, nrows_dst, cudaStream_main);
+            ggml_mul_mat_q5_0_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
             break;
         case GGML_TYPE_Q5_1:
             dst->meta.cuda_perf_mal_mul_type=5;
-            ggml_mul_mat_q5_1_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, nrows_dst, cudaStream_main);
+            ggml_mul_mat_q5_1_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
             break;
         case GGML_TYPE_Q8_0:
             dst->meta.cuda_perf_mal_mul_type=8;
-            ggml_mul_mat_q8_0_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, nrows_dst, cudaStream_main);
+            ggml_mul_mat_q8_0_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
+            break;
+        case GGML_TYPE_Q2_K:
+            dst->meta.cuda_perf_mal_mul_type=2;
+            ggml_mul_mat_q2_K_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
+            break;
+        case GGML_TYPE_Q3_K:
+            dst->meta.cuda_perf_mal_mul_type=3;
+            ggml_mul_mat_q3_K_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
+            break;
+        case GGML_TYPE_Q4_K:
+            dst->meta.cuda_perf_mal_mul_type=4;
+            ggml_mul_mat_q4_K_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
+            break;
+        case GGML_TYPE_Q5_K:
+            dst->meta.cuda_perf_mal_mul_type=5;
+            ggml_mul_mat_q5_K_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
+            break;
+        case GGML_TYPE_Q6_K:
+            dst->meta.cuda_perf_mal_mul_type=6;
+            ggml_mul_mat_q6_K_q8_1_cuda(src0_ddq_i, src1_q8_1, dst_ddf_i, ne00, i01_diff, ne11, padded_row_size, nrows_dst, cudaStream_main);
             break;
         default:
             GGML_ASSERT(false);
@@ -4618,8 +5566,8 @@ inline void ggml_cuda_op_mul_mat_vec(
 #endif
 
     if (use_mul_mat_vec_q) {
-        int64_t padded_row_size = ne00 + MATRIX_ROW_PADDING - 1;
-        padded_row_size -= padded_row_size % MATRIX_ROW_PADDING;
+        const int64_t padded_row_size = ne00 % MATRIX_ROW_PADDING == 0 ?
+            ne00 : ne00 - ne00 % MATRIX_ROW_PADDING + MATRIX_ROW_PADDING;
         size_t as;
         void * src1_q8_1 = ggml_cuda_pool_malloc(padded_row_size*sizeof(block_q8_1)/QK8_1, &as);
         quantize_row_q8_1_cuda(src1_ddf_i, src1_q8_1, ne00, 1, padded_row_size, cudaStream_main);
@@ -4663,7 +5611,7 @@ inline void ggml_cuda_op_mul_mat_vec(
         ggml_cuda_pool_free(src1_q8_1, as);
     } else {
         // on some GPUs it is faster to convert src1 to half and to use half precision intrinsics
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
         size_t ash;
         dfloat * src1_dfloat = nullptr; // dfloat == half
 
@@ -4679,7 +5627,7 @@ inline void ggml_cuda_op_mul_mat_vec(
         }
 #else
         dfloat * src1_dfloat = src1_ddf_i; // dfloat == float, no conversion
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
 
         switch (src0->type) {
             case GGML_TYPE_Q4_0:
@@ -4720,11 +5668,11 @@ inline void ggml_cuda_op_mul_mat_vec(
                 break;
         }
 
-#ifdef GGML_CUDA_DMMV_F16
+#ifdef GGML_CUDA_F16
         if (src1_convert_f16) {
             ggml_cuda_pool_free(src1_dfloat, ash);
         }
-#endif // GGML_CUDA_DMMV_F16
+#endif // GGML_CUDA_F16
     }
 
     (void) src1;
@@ -5102,6 +6050,9 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     const int64_t ne11 = use_src1 ? src1->ne[1] : 1;
     const int64_t ne12 = use_src1 ? src1->ne[2] : 1;
     const int64_t ne13 = use_src1 ? src1->ne[3] : 1;
+    const int64_t nrows1 = use_src1 ? ggml_nrows(src1) : 1;
+
+    GGML_ASSERT(ne03 == ne13);
 
     const int64_t ne0 = dst->ne[0];
     const int64_t ne1 = dst->ne[1];
@@ -5110,6 +6061,7 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     const int nb3  = dst->nb[3];
     int min_capability_major = 0;
     int min_capability_minor = 0;
+    bool src0_needs_ddq = false;
 
     // force-adapt flags as needed for special operations
     if (op == ggml_cuda_op_mul_mat_cublas)
@@ -5129,7 +6081,12 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     if (op == ggml_cuda_op_mul_mat_q)
     {
         min_capability_major = 6; min_capability_minor = 1;
-        src0_needs_f32=false; flatten_rows=false; src0_needs_f16=false; src0_needs_f8e4=false;
+        src0_needs_f32=false; flatten_rows=false; src0_needs_f16=false; src0_needs_f8e4=false;src0_needs_ddq=true;
+        if (dst->meta.cuda_choice_blas==CUDA_CHOICE_BLAS_ILBC)
+        {
+            src0_needs_f32=true; src0_needs_ddq=false; // TODO !
+
+        }
     } 
 
     GGML_ASSERT((src0_needs_f32 + src0_needs_f16 + src0_needs_f8e4) <= 1); // for non quantized operations
@@ -5140,11 +6097,18 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     GGML_ASSERT(!use_src1 || src1->backend != GGML_BACKEND_GPU_SPLIT);
 
     // strides for iteration over dims 3 and 2
-    const int64_t num_iters = flatten_rows ? 1 : ne02 * ne03;
-    const int64_t stride_mod = flatten_rows ? ne02 * ne03 : 1;
+    const int64_t num_iters_0 = ne02 >= ne12 ? ne02*ne03 : ne12*ne13;
+    const int64_t num_iters = flatten_rows ? 1 : num_iters_0;
+    const int64_t stride_mod = flatten_rows ? num_iters_0 : 1;
     const int64_t src0_stride = ne00 * ne01 * stride_mod;
     const int64_t src1_stride = ne10 * ne11 * stride_mod;
     const int64_t dst_stride = ne0 * ne1 * stride_mod;
+
+    const int64_t rows_per_iter = flatten_rows ? nrows0 : ne01;
+    const int64_t i03_max = flatten_rows ? 1 : ne03;
+    const int64_t i02_max = flatten_rows ? 1 : (ne02 >= ne12 ? ne02 : ne12);
+    const int64_t i02_divisor = ne02 >= ne12 ? 1 : ne12 / ne02;
+    GGML_ASSERT(!(flatten_rows && ne02 < ne12));
 
     const size_t src0_ts = ggml_type_size(src0->type);
     const size_t src0_bs = ggml_blck_size(src0->type);
@@ -5153,6 +6117,13 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
         struct ggml_tensor_extra_gpu * extra = new struct ggml_tensor_extra_gpu;
         memset(extra, 0, sizeof(*extra));
         *(struct ggml_tensor_extra_gpu **)&src0->extra = extra;
+        for (int id = 0; id < g_device_count; ++id) 
+        {
+            cudaSetDevice(id);
+            CUDA_CHECK(cudaEventCreateWithFlags(&extra->events[id], cudaEventDisableTiming));
+        }
+        cudaSetDevice(g_main_device);
+        // ggml_cuda_assign_extra_to_tensor(src0);
     }
     struct ggml_tensor_extra_gpu * src0_extra =            (ggml_tensor_extra_gpu *) src0->extra;
     struct ggml_tensor_extra_gpu * src1_extra = use_src1 ? (ggml_tensor_extra_gpu *) src1->extra : nullptr;
@@ -5161,7 +6132,7 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
 
     // TODO: Split without offloaded layers optional (on demand offloading needs to split)
     bool split = src0->backend == GGML_BACKEND_GPU_SPLIT;
-    if (min_capability_major )
+    if (min_capability_major ) // (todo) this forces the use of split on cpu imports
         if (g_device_count > 1) split = true;
     // const bool src0_on_device = false; src0->backend == GGML_BACKEND_CPU;
     const bool src0_on_device = src0->backend == GGML_BACKEND_GPU || src0->backend == GGML_BACKEND_GPU_SPLIT;
@@ -5221,7 +6192,7 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
         const bool dst_on_device = dst->backend == GGML_BACKEND_GPU && id == g_main_device;
         int row_low, row_high;
         if (split) {
-            uint8_t padding_req = 0;
+            int padding_req = 0;
             ggml_cuda_tensor_split_custom(nrows0, id, row_low, row_high, padding_req);
             //row_low = (id == 0) ? 0 : nrows0*g_tensor_split[id];
             // row_high = (id == g_device_count - 1) ? nrows0 : nrows0*g_tensor_split[id + 1];
@@ -5260,6 +6231,8 @@ static void ggml_cuda_op(const ggml_tensor * src0, const ggml_tensor * src1, ggm
             } else {
                 if (!(src0_needs_f16 && src0_extra->data_device_secondary[id]) && !(src0_needs_f8e4 && src0_extra->data_device_secondary[id]))
                     src0_ddq[id] = (char *) ggml_cuda_pool_malloc(row_diff*ne00 * src0_ts/src0_bs, &src0_asize_q[id]);
+                else
+                    GGML_ASSERT(false);
             }
         }
 
@@ -5618,6 +6591,8 @@ void ggml_cuda_mul_mat_vec_p021(const ggml_tensor * src0, const ggml_tensor * sr
     const int64_t ne01 = src0->ne[1];
     const int64_t ne02 = src0->ne[2];
 
+    const int64_t ne12 = src1->ne[2];
+
     CUDA_CHECK(cudaSetDevice(g_main_device));
     cudaStream_t cudaStream_main = g_cudaStreams_main[g_main_device];
 
@@ -5630,7 +6605,7 @@ void ggml_cuda_mul_mat_vec_p021(const ggml_tensor * src0, const ggml_tensor * sr
     struct ggml_tensor_extra_gpu * dst_extra = (ggml_tensor_extra_gpu *) dst->extra;
     float * dst_ddf = (float *) dst_extra->data_device[g_main_device];
 
-    ggml_mul_mat_p021_f16_f32_cuda(src0_ddq, src1_ddf, dst_ddf, ne00, ne01, ne02, cudaStream_main);
+    ggml_mul_mat_p021_f16_f32_cuda(src0_ddq, src1_ddf, dst_ddf, ne00, ne01, ne02, ne12, cudaStream_main);
 }
 
 void ggml_cuda_mul_mat_vec_nc(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst){
@@ -5643,6 +6618,8 @@ void ggml_cuda_mul_mat_vec_nc(const ggml_tensor * src0, const ggml_tensor * src1
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
     const int64_t ne02 = src0->ne[2];
+
+    const int64_t ne12 = src1->ne[2];
 
     const int64_t nb01 = src0->nb[1];
     const int64_t nb02 = src0->nb[2];
@@ -5662,7 +6639,7 @@ void ggml_cuda_mul_mat_vec_nc(const ggml_tensor * src0, const ggml_tensor * src1
     const int row_stride_x = nb01 / sizeof(half);
     const int channel_stride_x = nb02 / sizeof(half);
 
-    ggml_mul_mat_vec_nc_f16_f32_cuda(src0_ddq, src1_ddf, dst_ddf, ne00, ne01, row_stride_x, ne02, channel_stride_x, cudaStream_main);
+    ggml_mul_mat_vec_nc_f16_f32_cuda(src0_ddq, src1_ddf, dst_ddf, ne00, ne01, row_stride_x, ne02, ne12, channel_stride_x, cudaStream_main);
 }
 
 void ggml_cuda_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -5683,9 +6660,8 @@ void ggml_cuda_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1, ggml_
             mm_kernel_choice = ggml_cuda_op_mul_mat_cublas_f8e4_f32_wrapper;
             break;
         case CUDA_CHOICE_BLAS_QMM:
-            if ( (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q5_0 ||
-                src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_0) )
-                mm_kernel_choice = ggml_cuda_op_mul_mat_q;
+        case CUDA_CHOICE_BLAS_ILBC:
+            mm_kernel_choice = ggml_cuda_op_mul_mat_q;
             break;
         default:
             mm_kernel_choice = ggml_cuda_op_mul_mat_cublas;
@@ -5707,37 +6683,14 @@ void ggml_cuda_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1, ggml_
             if (src1->ne[1] == 1 && src0->ne[0] % GGML_CUDA_DMMV_X == 0)
                 ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_vec, false, false,false,false);
             else
+            {
                 ggml_cuda_op(src0, src1, dst, mm_kernel_choice, true, true,true,true);
+                // fprintf(stderr,"DEBUG: ggml_cuda_mul_mat: %s was lost in vector branch\n",dst->name);
+            }
         } else 
             GGML_ASSERT(false);
     }
     
-   /*
-    if (all_on_device && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
-        ggml_cuda_mul_mat_vec_p021(src0, src1, dst);
-    } else if (all_on_device && !ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && src1->ne[1] == 1) {
-        ggml_cuda_mul_mat_vec_nc(src0, src1, dst);
-    }else if (src0->type == GGML_TYPE_F32) {
-        ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, true, false,false,false);
-    } else if (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16) {
-        if (src1->ne[1] == 1 && src0->ne[0] % GGML_CUDA_DMMV_X == 0) {
-            ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_vec, false, false,false,false);
-        } else {
-            if ( (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q5_0 ||
-                src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_0) ) {
-                 ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_q, false, false,false,false);
-                //  ggml_tensor_printf(dst, "DST QQ",0,true,true);
-            } else {
-                // ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, true, false,false);
-                //ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas_f16_f32_wrapper, false, false, true,false);
-                 ggml_cuda_op(src0, src1, dst, ggml_cuda_op_mul_mat_cublas_f8e4_f32_wrapper, false, false,false,true);
-
-            }
-        }
-    } else {
-        GGML_ASSERT(false);
-    }
-    */
 }
 
 void ggml_cuda_scale(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -5864,7 +6817,7 @@ void ggml_cuda_transform_tensor(void * data, struct ggml_tensor * tensor) {
             extra->row_low[id] = row_low;
             extra->row_high[id] = row_high;
         } else if (backend == GGML_BACKEND_GPU_SPLIT) {
-            uint8_t padding_req = 0;
+            int padding_req = 0;
             ggml_cuda_tensor_split_custom(nrows, id, row_low, row_high, padding_req);
             extra->row_low[id] = row_low;
             extra->row_high[id] = row_high;
@@ -5883,7 +6836,7 @@ void ggml_cuda_transform_tensor(void * data, struct ggml_tensor * tensor) {
         size_t size = ggml_nbytes_split(tensor, nrows_split);
         const size_t original_size = size;
 
-        // pad last row to a multiple of 256 elements to avoid out-of-bounds memory accesses
+        // pad last row to a multiple of 512 elements to avoid out-of-bounds memory accesses
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             size += (MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING)
                 * ggml_type_size(tensor->type)/ggml_blck_size(tensor->type);
@@ -5899,7 +6852,7 @@ void ggml_cuda_transform_tensor(void * data, struct ggml_tensor * tensor) {
         }
 
 
-        CUDA_CHECK(cudaMemcpy(buf, buf_host, size, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buf, buf_host, original_size, cudaMemcpyHostToDevice));
 
         extra->data_device[id] = buf;
 
@@ -5922,6 +6875,11 @@ void ggml_cuda_free_data(struct ggml_tensor * tensor) {
         if (extra->data_device[id] != nullptr) {
             CUDA_CHECK(cudaSetDevice(id));
             CUDA_CHECK(cudaFree(extra->data_device[id]));
+        }
+        if (extra->data_device_secondary[id] != nullptr) {
+            CUDA_CHECK(cudaSetDevice(id));
+            // CUDA_CHECK(cudaFree(extra->data_device_secondary[id]));
+            ggml_cuda_pool_unallocate(extra->data_device_secondary[id]);
         }
 
         if (extra->events[id] != nullptr) {

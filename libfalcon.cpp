@@ -1710,25 +1710,29 @@ static falcon_model * falcon_model_load_internal(falcon_loader_config &config) {
         {
             // if lm_head is not offloaded we'd save vram_overhead += (1016+144)*MB; 
             if (model.hparams.ftype != LLAMA_FTYPE_ALL_F32)
-            { 
-                if (n_batch > 1)
+            {
+                if (config.cublas_enabled)
                 {
-                    if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
-                        vram_overhead += (1016+512+144+50)/2*MB; 
-                    else
-                        vram_overhead += (1016+512+144+50)*MB; 
-                    fprintf(stderr, "%s: INFO: using n_batch larger than 1 requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
-                } else
-                {
-                    if (hparams.n_vocab%2)
+                    if (n_batch > 1)
                     {
                         if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
-                            vram_overhead += (1016+512+144+50)/2*MB;
+                            vram_overhead += (1016+512+144+50)/2*MB; 
                         else
-                            vram_overhead += (1016+512+144+50)*MB;
-                        fprintf(stderr, "%s: INFO: unoptimized fine-tune weights requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
+                            vram_overhead += (1016+512+144+50)*MB; 
+                        fprintf(stderr, "%s: INFO: using n_batch larger than 1 requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
+                    } else
+                    {
+                        if (hparams.n_vocab%2)
+                        {
+                            if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
+                                vram_overhead += (1016+512+144+50)/2*MB;
+                            else
+                                vram_overhead += (1016+512+144+50)*MB;
+                            fprintf(stderr, "%s: INFO: unoptimized fine-tune weights requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
+                        }
                     }
                 }
+                
             }
             
         } 
@@ -1737,22 +1741,25 @@ static falcon_model * falcon_model_load_internal(falcon_loader_config &config) {
             // if lm_head is not offloaded we'd save vram_overhead += (563+41)*MB; 
             if (model.hparams.ftype != LLAMA_FTYPE_ALL_F32)
             { 
-                if (n_batch > 1)
+                if (config.cublas_enabled)  
                 {
-                    if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
-                        vram_overhead += (157+563+41)/2*MB; 
-                    else
-                        vram_overhead += (157+563+41)*MB; 
-                    fprintf(stderr, "%s: INFO: using n_batch larger than 1 will require additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
-                } else
-                {
-                    if (hparams.n_vocab%2)
+                    if (n_batch > 1)
                     {
                         if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
                             vram_overhead += (157+563+41)/2*MB; 
                         else
                             vram_overhead += (157+563+41)*MB; 
-                        fprintf(stderr, "%s: INFO: unoptimized fine-tune weights requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
+                        fprintf(stderr, "%s: INFO: using n_batch larger than 1 will require additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
+                    } else
+                    {
+                        if (hparams.n_vocab%2)
+                        {
+                            if (system_gpu_status->device_props->major > 8 || (system_gpu_status->device_props->major == 8 && system_gpu_status->device_props->minor >= 9))
+                                vram_overhead += (157+563+41)/2*MB; 
+                            else
+                                vram_overhead += (157+563+41)*MB; 
+                            fprintf(stderr, "%s: INFO: unoptimized fine-tune weights requires additional VRAM per device: %7.2f MB\n", __func__, vram_overhead/MB*1.0);
+                        }
                     }
                 }
             }
@@ -2137,15 +2144,21 @@ static bool falcon_eval_internal(
     struct ggml_context * ctx0 = ggml_init(params);
     ggml_tensor_default_meta_change()->cuda_op_force = CUDA_OPT_OP_FORCE_CPU; // we default to CPU for all operations
     #ifdef GGML_USE_CUBLAS
-    ggml_tensor_default_meta_change()->ggml_cuda_no_secondary_offload = !configuration.secondary_cuda_offload;
-    if (ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major >8 || ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major ==8 && ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].minor >=9)
-        ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_8E4;
-    else if (ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major >6 || ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major ==6 && ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].minor >=1)
-        ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_F16;
+    if (configuration.cublas_enabled)
+    {
+        ggml_tensor_default_meta_change()->ggml_cuda_no_secondary_offload = !configuration.secondary_cuda_offload;
+        if (ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major >8 || ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major ==8 && ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].minor >=9)
+            ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_8E4;
+        else if (ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major >6 || ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].major ==6 && ggml_cuda_get_system_gpu_status()->device_props[ggml_cuda_get_system_gpu_status()->main_device_id].minor >=1)
+            ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_F16;
+    } else
+    {
+        ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_QMM;
+        ggml_tensor_default_meta_change()->ggml_cuda_no_secondary_offload = false;
+    }
     #endif
-    //  ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_8E4;
-    //  ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_F16;
-    //  ggml_tensor_default_meta_change()->cuda_choice_blas= CUDA_CHOICE_BLAS_CUBLAS_F32;
+    
+        
 
 
 
@@ -2388,7 +2401,7 @@ static bool falcon_eval_internal(
                 0, 2, 1, 3);
 
             // K * Q
-            if(!use_broadcasting)
+            if(!use_broadcasting )
             {
                 // interleaved repeat for multiplication (now broadcasted)
                 struct ggml_tensor* repeat_dummy = ggml_new_tensor_3d(ctx0, inpL->type, head_dim, N + n_past, n_head);
@@ -2403,7 +2416,10 @@ static bool falcon_eval_internal(
             KQ->meta.cuda_op_force = CUDA_OPT_OP_FORCE_DEFAULT;
             if (use_broadcasting) 
                 KQ->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU; // disable cuda for KQ when broadcasting (todo)
-    // TODO
+            //  KQ->meta.cuda_op_force=CUDA_OPT_OP_FORCE_BLAS;
+            //  KQ->meta.cuda_choice_blas = CUDA_CHOICE_BLAS_ILBC;
+            //  KQ->meta.cuda_choice_blas = CUDA_CHOICE_BLAS_CUBLAS_F32;
+    
             ggml_set_name(KQ, "KQ");
             
 

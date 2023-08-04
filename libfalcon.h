@@ -94,6 +94,7 @@ extern "C" {
         // cuda related
         bool secondary_cuda_offload = false; // enable dynamic offloading of fp16/fp8 tensors for cuBLAS during batch processing phase
         bool use_cuda = false;  // use cuda
+        bool cublas_enabled = false;  // use cublas fp8/fp16 instead of multmat kernel
         int n_gpu_layers = 0;   // number of layers to store in VRAM
         int i_gpu_start;        // first gpu layer
         int i_gpu_last;         // last gpu layer
@@ -123,6 +124,7 @@ extern "C" {
         /* memory_type = */ ggml_type::GGML_TYPE_F32,
         /* secondary_cuda_offload = */ false,
         /* use_cuda = */ false,
+        /* cublas_enabled = */ false,
         /* n_gpu_layers = */ 0,
         /* i_gpu_start = */ -1,
         /* i_gpu_last = */ -1,
@@ -143,6 +145,7 @@ extern "C" {
 
         // cuda related
         bool secondary_cuda_offload = false; // enable dynamic offloading of fp16/fp8 tensors for cuBLAS during batch processing phase
+        bool cublas_enabled = false; // use fp8 cublas (with offloading) instead of custom kernel
 
         // optional
         const char *cgraph_fname = nullptr; // path to the cgraph export file
@@ -152,29 +155,6 @@ extern "C" {
         int debug_timings = 0;  // 0 (none), 1(first token), 2(first,last), 3(every token)
         bool verbose = false;  
     };
-
-    // struct falcon_context_params {
-    //     int n_ctx;                             // text context
-    //     int n_batch;                           // prompt processing batch size
-    //     int n_gpu_layers;                      // number of layers to store in VRAM
-    //     int i_gpu_start;                       // first gpu layer
-    //     int i_gpu_last;                         // last gpu layer
-    //     int main_gpu;                          // the GPU that is used for scratch and small tensors
-    //     float tensor_split[LLAMA_MAX_DEVICES]; // how to split layers across multiple GPUs
-    //     int seed;                              // RNG seed, -1 for random
-
-    //     bool f16_kv;     // use fp16 for KV cache
-    //     bool logits_all; // the llama_eval() call computes all logits, not just the last one
-    //     bool vocab_only; // only load the vocabulary, no weights
-    //     bool use_mmap;   // use mmap if possible
-    //     bool use_mlock;  // force system to keep model in RAM
-    //     bool embedding;  // embedding mode only
-
-    //     // called with a progress value between 0 and 1, pass NULL to disable
-    //     falcon_progress_callback progress_callback;
-    //     // context pointer passed to the progress callback
-    //     void * progress_callback_user_data;
-    // };
 
     // model file types
     enum llama_ftype {

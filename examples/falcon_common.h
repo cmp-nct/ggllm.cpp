@@ -92,6 +92,7 @@ struct gpt_params {
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool verbose           = false; // print additional verbose information
     int debug_timings      = 0;     // print timings (required for GGML_PERF=1)
+    bool cublas_enabled    = false;  // use cuBLAS fp8/fp16 instead of multmat kernel
     bool _cuda_offload_secondary = true; // enable dynamic offloading of fp16/fp8 tensors for cuBLAS during batch processing phase
     bool _sampling_not_default = false; // readonly, true if any sampling change is requested
     bool _kvmem_not_default = false; // readonly
