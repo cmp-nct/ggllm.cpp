@@ -1504,7 +1504,8 @@ t_finetune_type falcon_detect_finetune(falcon_context * ctx, std::string model_p
             return FINETUNE_OPENASSISTANT;
         }
     }
-    if (ctx->vocab.id_to_token.size() == 70144)
+    auto vocabSize = ctx->vocab.id_to_token.size();
+    if ((vocabSize == 70144) || (vocabSize == 70656))
     {
         return FINETUNE_OPENBUDDY;
     }
