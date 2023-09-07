@@ -1578,6 +1578,7 @@ static falcon_model * falcon_model_load_internal(
         switch (hparams.n_layer) {
             case 32: model.type = e_model::FALCON_7B; break;
             case 60: model.type = e_model::FALCON_40B; break;
+            case 80: model.type = e_model::FALCON_40B; break;
             default:
                 {
                     if (hparams.n_falcon_type == 7) {
