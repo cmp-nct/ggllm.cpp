@@ -182,6 +182,15 @@ falcon_print_timings:        eval time = 16719.48 ms /   769 runs   (   21.74 ms
 falcon_print_timings:       total time = 16930.51 ms
 ```
 
+**Falcon 180B on 3090/4090 combination (partial offload):**  
+```
+falcon_print_timings:        load time = 68642.10 ms
+falcon_print_timings:      sample time =    17.99 ms /    70 runs   (    0.26 ms per token,  3891.92 tokens per second)
+falcon_print_timings: batch eval time =  2731.63 ms /     9 tokens (  303.51 ms per token,     3.29 tokens per second)
+falcon_print_timings:        eval time = 70280.08 ms /    69 runs   ( 1018.55 ms per token,     0.98 tokens per second)
+```
+
+
 CUDA sidenote:  
 1) try to use less threads than you have physical processor cores 
 
