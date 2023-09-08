@@ -65,7 +65,14 @@ _update ggllm.cpp, download the HF directory into openbuddy-7b, then `python fal
 **Conversion of HF models and quantization:**
 1) use falcon_convert.py to produce a GGML v1 binary from HF - not recommended to be used directly
 2) use examples/falcon_quantize to convert these into memory aligned GGCC v10 binaries of your choice including mmap support from there on  
-_The Falcon 7B model features tensor sizes which are not yet supported by K-type quantizers - use the traditional quantization for those_  
+_The Falcon 7B model features tensor sizes which are not yet supported by K-type quantizers - use the traditional quantization for those_
+
+**Conversion of Falcon 180B:**  
+The latest falcon_convert.py script supports "safetensors", you will need to upgrade your python transformers libs:  
+```
+pip install --upgrade transformers
+pip install --upgrade accelerate
+```
   
 **Status/Bugs:**  
 - nothing major
