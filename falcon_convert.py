@@ -16,6 +16,7 @@ import json
 import code
 import torch
 import numpy as np
+from safetensors import safe_open
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
@@ -56,11 +57,14 @@ dir_out = sys.argv[2]   # output directory
 
 # make sure the output directory exists
 os.makedirs(dir_out, exist_ok=True)
-
+safetensors = False
 num_parts = 0 
 for file_name in os.listdir(dir_model): 
     if "pytorch_model" in file_name and '-' in file_name and '.' in file_name: 
         num_parts = max(num_parts, int(file_name.split('-')[-1].split('.')[0]))
+    elif "safetensors" in file_name and '-' in file_name and '.' in file_name: 
+        num_parts = max(num_parts, int(file_name.split('-')[-1].split('.')[0]))
+        safetensors = True
 num_parts = int(num_parts)
 
 # possible data types
@@ -77,9 +81,12 @@ tokenizer = AutoTokenizer.from_pretrained(dir_model)
 # print(tokenizer)
 config = AutoConfig.from_pretrained(dir_model, trust_remote_code=True)
 hparams = config.to_dict()
+# if n_head not found, use num_attention_heads (make sure no python error key access)
+# old: n_head = hparams["n_head"]
+n_head = hparams.get("n_head", hparams.get("num_attention_heads"))
 
-n_head = hparams["n_head"]
-n_head_kv = hparams["n_head_kv"] if "n_head_kv" in hparams else 1
+n_hidden_layers = hparams.get("num_hidden_layers", hparams.get("n_layer"))
+n_head_kv = hparams.get("num_kv_heads", hparams.get("n_head_kv", 1))
 head_dim = hparams["hidden_size"] // n_head
 print("* Loading model from: ", dir_model)
 
@@ -91,14 +98,14 @@ fout.write(struct.pack("i", hparams["vocab_size"]))
 fout.write(struct.pack("i", hparams["hidden_size"]))
 fout.write(struct.pack("i", n_head))
 fout.write(struct.pack("i", n_head_kv))
-fout.write(struct.pack("i", hparams["n_layer"]))
+fout.write(struct.pack("i", n_hidden_layers))
 fout.write(struct.pack("i", 40 if "n_head_kv" in hparams else 7)) # obsolete field that breaks ggml compatibility - todo again remove one day
 fout.write(struct.pack("i", ftype))
 
 print(f'Vocab size: {hparams["vocab_size"]}')
 print(f'Hidden size: {hparams["hidden_size"]}')
 print(f'Number of heads: {n_head}')
-print(f'Number of layers: {hparams["n_layer"]}')
+print(f'Number of layers: {n_hidden_layers}')
 print(f'Number of head_kv: {n_head_kv}')
 print(f'Number of head_dim: {head_dim}')
 
@@ -128,11 +135,21 @@ for i in range(hparams["vocab_size"]):
 if num_parts == 0:
     partnames= ('pytorch_model.bin',)
 else:
-    partnames = (f'pytorch_model-{n:05}-of-{num_parts:05}.bin' for n in range(1, num_parts + 1))
+    if safetensors == True:
+        partnames = ([f'model-{n:05}-of-{num_parts:05}.safetensors' for n in range(1, num_parts + 1)])
+    else:
+        partnames = (f'pytorch_model-{n:05}-of-{num_parts:05}.bin' for n in range(1, num_parts + 1))
+
 for partname in partnames:
     filename = f'{dir_model}/{partname}'
+    if not os.path.isfile(filename):
+        continue
+
     print(f'\n* Loading part: {partname}')
-    model = torch.load(filename, map_location = 'cpu')
+    if safetensors == True:
+        model = safe_open(filename, framework="pt", device="cpu")
+    else:
+        model = torch.load(filename, map_location = 'cpu')
     for name in model.keys():
         src = name
         # The original query_key_value tensor contains n_head_kv "kv groups",
@@ -142,21 +159,36 @@ for partname in partnames:
         # So we rearrange them here,, so that we have n_head query weights
         # followed by n_head_kv key weights followed by n_head_kv value weights,
         # in contiguous fashion.
+        if safetensors == True:
+            data = model.get_tensor(name)
+        else:
+            data = model[src]
+        old_dtype = data.dtype
+        if data.dtype != torch.float16 and data.dtype != torch.float32:
+            data = data.to(torch.float32)
 
         if "query_key_value" in src:
-            qkv = model[src].view(
+            qkv = data.view(
                 n_head_kv, n_head // n_head_kv + 2, head_dim, head_dim * n_head)
 
             q = qkv[:, :-2 ].reshape(n_head * head_dim, head_dim * n_head)
             k = qkv[:, [-2]].reshape(n_head_kv * head_dim, head_dim * n_head)
             v = qkv[:, [-1]].reshape(n_head_kv * head_dim, head_dim * n_head)
 
-            model[src] = torch.cat((q,k,v)).reshape_as(model[src])
-        data = model[src].squeeze()
+            # model[src] = torch.cat((q,k,v)).reshape_as(model[src])
+            data = torch.cat((q,k,v)).reshape_as(data)
+        data = data.squeeze().numpy()
         n_dims = len(data.shape)
-        # default type is fp32
         ftype_cur = 1 if ftype == 1 and n_dims > 1 else 0
-        data = data.to(dtype = torch.float16 if ftype_cur == 1 else torch.float32).numpy()
+
+        data_dtype = data.dtype
+        if ftype == 0 and data_dtype == np.float16:
+            data = data.astype(np.float32)
+        if ftype == 1 and data_dtype == np.float16 and n_dims == 1:
+            data = data.astype(np.float32)
+        if ftype == 1 and data_dtype == np.float32 and name.endswith(".weight") and n_dims == 2:
+            data = data.astype(np.float16)
+        
         print(f'  |', name, data.shape, '->', data.dtype)
         # header
         str = name.encode('utf-8')

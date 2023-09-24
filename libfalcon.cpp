@@ -1501,7 +1501,8 @@ t_finetune_type falcon_detect_finetune(falcon_context * ctx, std::string model_p
             return FINETUNE_OPENASSISTANT;
         }
     }
-    if (ctx->vocab.id_to_token.size() == 70144 || ctx->vocab.id_to_token.size() == 70656)
+    auto vocabSize = ctx->vocab.id_to_token.size();
+    if ((vocabSize == 70144) || (vocabSize == 70656))
     {
         // todo: best to do a token match instead
         return FINETUNE_OPENBUDDY;
@@ -1594,6 +1595,7 @@ static falcon_model * falcon_model_load_internal(falcon_loader_config &config) {
         switch (hparams.n_layer) {
             case 32: model.type = e_model::FALCON_7B; break;
             case 60: model.type = e_model::FALCON_40B; break;
+            case 80: model.type = e_model::FALCON_40B; break;
             default:
                 {
                     if (hparams.n_falcon_type == 7) {
@@ -2172,7 +2174,6 @@ static bool falcon_eval_internal(
             //1. create a 16k tensor filled with 0.5 values as Qcur
             //2. run rope_inplace and then dump the resulting tensor for a plot
             // test dimensions: n_embeddings (col), n_heads (rows=1), n_past (previous tokens calculated)
-            // can't we just calculate only the current one and copy the previous from cache ??            
             // create a vector of 10k tensors, then run the same rope for npast 0-9999
             // we want to see how clean the rotation is
             struct ggml_tensor *test_tensor[100];
@@ -2250,6 +2251,8 @@ static bool falcon_eval_internal(
         if (n_gpu_layers > n_layer + 1) {
             offload_func_kqv  = ggml_cuda_assign_buffers;
         }
+        // TODO: use proper flags to control that
+        offload_func_kqv  = ggml_cuda_assign_buffers;
 #endif // GGML_USE_CUBLAS
 
     for (int il = 0; il < n_layer; ++il) {
@@ -2401,25 +2404,31 @@ static bool falcon_eval_internal(
                 0, 2, 1, 3);
 
             // K * Q
-            if(!use_broadcasting )
+            if(!use_broadcasting)
             {
                 // interleaved repeat for multiplication (now broadcasted)
                 struct ggml_tensor* repeat_dummy = ggml_new_tensor_3d(ctx0, inpL->type, head_dim, N + n_past, n_head);
                 K = ggml_repeat2(ctx0, ggml_cont(ctx0, K),repeat_dummy); 
             }
-            
+            K = ggml_cont(ctx0, K); // only needed on cuda side
             
             ggml_set_name(K, "K");
             struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
             ggml_set_name(Q, "Q");
+            // offload_func_kqv(K);
             struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
             KQ->meta.cuda_op_force = CUDA_OPT_OP_FORCE_DEFAULT;
             if (use_broadcasting) 
                 KQ->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU; // disable cuda for KQ when broadcasting (todo)
-            //  KQ->meta.cuda_op_force=CUDA_OPT_OP_FORCE_BLAS;
+            else
+            {
+                    KQ->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
+                    KQ->meta.cuda_choice_blas = CUDA_CHOICE_BLAS_CUBLAS_F16;
+            }
+            //  KQ->meta.ggml_cuda_broadcast_ilv = true; // TODO: use_broadcasting instead of hardcoded
             //  KQ->meta.cuda_choice_blas = CUDA_CHOICE_BLAS_ILBC;
             //  KQ->meta.cuda_choice_blas = CUDA_CHOICE_BLAS_CUBLAS_F32;
-    
+            // offload_func_kqv(K);
             ggml_set_name(KQ, "KQ");
             
 
@@ -2470,6 +2479,8 @@ static bool falcon_eval_internal(
             KQV->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
             if (use_broadcasting) 
                 KQV->meta.cuda_op_force=CUDA_OPT_OP_FORCE_CPU;
+            else
+                KQV->meta.cuda_op_force=CUDA_OPT_OP_FORCE_DEFAULT;
             ggml_set_name(KQV, "KQV");
             
 
@@ -2594,10 +2605,10 @@ static bool falcon_eval_internal(
     // run the computation
     ggml_build_forward_expand(&gf, cur);
     
-    ggml_backend lm_head_backend = model.lm_head->backend;
     // uneven lm_head from manually added tokens causes cublas errors with 7B
-     if (model.type == FALCON_7B && (configuration.n_tokens > 1) && model.lm_head->ne[1]%2 != 0)
-         model.lm_head->backend = GGML_BACKEND_CPU;  // cublas fails // todo - better use the new force flag, and check WHY this is necessary
+    //  if (model.type == FALCON_7B && (configuration.n_tokens > 1) && model.lm_head->ne[1]%2 != 0)
+        //  model.lm_head->backend = GGML_BACKEND_CPU;  // cublas fails // todo - better use the new force flag, and check WHY this is necessary
+    ggml_backend lm_head_backend = model.lm_head->backend;
         
 #ifdef GGML_USE_METAL
     if (lctx.ctx_metal && N == 1) {

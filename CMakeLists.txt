@@ -266,6 +266,7 @@ if (LLAMA_CUBLAS)
             set(CMAKE_CUDA_ARCHITECTURES "60;61")
         else()
             set(CMAKE_CUDA_ARCHITECTURES "61;89") # 86 = rtx30 ; 89 = rtx 40 fp8
+            # set(CMAKE_CUDA_ARCHITECTURES "89") 
         endif()
 
     else()
@@ -531,11 +532,11 @@ target_link_libraries(falcon PRIVATE
 #     cmpnct_cuda_122.cu
 #     cmpnct_cuda_122.h
 # )
-add_executable(aurora
-    aurora_main.cpp
+add_executable(ggfalcon
+    ggfalcon_main.cpp
     # cmpnct_cuda_122.cu
 )
-target_link_libraries(aurora
+target_link_libraries(ggfalcon
     # cmpnct_cuda_122
     falcon_common falcon
     ${LLAMA_EXTRA_LIBS}

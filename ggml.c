@@ -9982,6 +9982,68 @@ static void ggml_compute_forward_repeat2_f32(
     }
     // if (ne01 == 100)     ggml_tensor_printf(dst, __func__, __LINE__, true,true);
 }
+static void ggml_compute_forward_repeat2_f16(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        struct ggml_tensor * dst) {
+    GGML_ASSERT(params->ith == 0);
+    GGML_ASSERT(ggml_can_repeat(src0, dst));
+
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    const int64_t ne0  = dst->ne[0];
+    const int64_t ne1  = dst->ne[1];
+    const int64_t ne2  = dst->ne[2];
+    const int64_t ne3  = dst->ne[3];
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+
+    const size_t nb0  = dst->nb[0];
+    const size_t nb1  = dst->nb[1];
+    const size_t nb2  = dst->nb[2];
+    const size_t nb3  = dst->nb[3];
+
+    const size_t nb00 = src0->nb[0];
+    const size_t nb01 = src0->nb[1];
+    const size_t nb02 = src0->nb[2];
+    const size_t nb03 = src0->nb[3];
+
+    // guaranteed to be an integer due to the check in ggml_can_repeat
+    const int nr0 = (int)(ne0/ne00);
+    const int nr1 = (int)(ne1/ne01);
+    const int nr2 = (int)(ne2/ne02);
+    const int nr3 = (int)(ne3/ne03);
+
+    // TODO: support for transposed / permuted tensors
+    GGML_ASSERT(nb0  == sizeof(ggml_fp16_t));
+    GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
+
+    int i2k2 = 0;
+
+    // TODO: maybe this is not optimal?
+    for                         (int i3 = 0; i3 < nr3;  i3++) {
+        for                     (int k3 = 0; k3 < ne03; k3++, i2k2 = 0) {
+            for                 (int i2 = 0; i2 < nr2;  i2++) {
+                for             (int k2 = 0; k2 < ne02; k2++, i2k2++) {
+                    for         (int i1 = 0; i1 < nr1;  i1++) {
+                        for     (int k1 = 0; k1 < ne01; k1++) {
+                            for (int i0 = 0; i0 < nr0;  i0++) {
+                                ggml_vec_cpy_f16(ne00,
+                                        (ggml_fp16_t *) ((char *)  dst->data + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0),
+                                        (ggml_fp16_t *) ((char *) src0->data + (          k3)*nb03 + (i2k2   / nr2)*nb02 + (          k1)*nb01));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 static void ggml_compute_forward_repeat2(
         const struct ggml_compute_params * params,
@@ -9994,7 +10056,7 @@ static void ggml_compute_forward_repeat2(
             } break;
         default:
             {
-                GGML_ASSERT(false);
+                ggml_compute_forward_repeat2_f16(params, src0, dst);
             } break;
     }
 }
@@ -11104,9 +11166,14 @@ static void ggml_compute_forward_mul_mat(
 
     // src1 rows
     const int64_t nr1 = ne11*ne12*ne13;
+    //  if (strcmp(dst->name,"KQ")==0 && dst->meta.layer_id == 0) printf("nr1 = %d, ne11 = %d, ne12 = %d, ne13 = %d\n", nr1, ne11, ne12, ne13);
 
     const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ne10*GGML_TYPE_SIZE[vec_dot_type]/GGML_BLCK_SIZE[vec_dot_type];
+    // if (strcmp(dst->name,"KQ")==0 && dst->meta.layer_id == 0) printf("row_size = %d\n", row_size);
+    // if (strcmp(dst->name,"KQ")==0 && dst->meta.layer_id == 0) printf("nr1 = %d\n", nr1);
+    // if (strcmp(dst->name,"KQ")==0 && dst->meta.layer_id == 0) printf("ir11 = %d\n", ir11);
+
 
     for (int64_t ir1 = 0; ir1 < nr1; ++ir1) {
         const int64_t i13 = (ir1/(ne12*ne11));
@@ -11117,11 +11184,8 @@ static void ggml_compute_forward_mul_mat(
         const int64_t i03 = (ir0/(ne02));
         // Hack for "Falcon multi-query-attention key stutter" / alternative to ggml_repeat2.
         // See https://github.com/ggerganov/llama.cpp/issues/1602#issuecomment-1606087470:
-        // GG: this is likely the correct way to broadcast, though need some more thought
-        //     therefore leaving the comments to remind us for now
-        const int64_t i02 = (i12 / (ne12 / ne02));
-        // Original from PR/224 (and also essential/correct for non-broadcast matmuls in Falcon)
-        // const int64_t i02 = (ir0 - i03*ne02);
+        //const int64_t i02 = (ir0 - i03*ne02); // broadcasing for block-type repeat
+        const int64_t i02 = (i12 / (ne12 / ne02)); // broadcasing for interleaved repeat2 - TODO: handle this by a switch
 
         const int64_t i1 = i11;
         const int64_t i2 = i12;
@@ -11141,7 +11205,12 @@ static void ggml_compute_forward_mul_mat(
         float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2 + i3*nb3));
 
         for (int64_t ir = ir10; ir < ir11; ++ir) {
+            //typedef void (*ggml_vec_dot_t)   (const int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT x, const void * GGML_RESTRICT y);
+            //for (int i = 0; i < n; ++i)
+                //sumf += (ggml_float)(x[i]*y[i]);
             vec_dot(ne00, &dst_col[ir], src0_row + ir*nb01, src1_col);
+            // if (strcmp(dst->name,"KQ")==0 && dst->meta.layer_id == 0)
+            //  printf("vec_dot for %s %d: n=%d, dst_col[ir]=%f, src0_row[ir*nb01]=%f, src1_col=%f\n", dst->name, dst->meta.layer_id, ne00, dst_col[ir], src0_row[ir*nb01], src1_col[0]);
         }
     }
 
