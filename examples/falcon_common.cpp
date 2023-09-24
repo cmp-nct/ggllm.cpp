@@ -814,9 +814,9 @@ std::vector<falcon_token> falcon_tokenize(struct falcon_context * ctx, const std
 falcon_loader_config falcon_loader_config_create(const gpt_params &params)
 {
     falcon_loader_config config;
-    config = FALCON_LOADER_CONFIG_DEFAULT;
-
-    config.fname = params.model.c_str();
+    // config = FALCON_LOADER_CONFIG_DEFAULT; // linux incompatibility of brace initialization
+    config = falcon_loader_config_default();
+    strncpy(config.fname,params.model.c_str(),255);
     config.n_ctx = params.n_ctx;
     config.n_batch = params.n_batch;
     config.n_max_real_ctx = params.n_ctx; // should be n_predict + combined prompt size

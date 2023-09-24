@@ -77,7 +77,7 @@ extern "C" {
     typedef void (*falcon_progress_callback)(float progress, void *ctx, const char *status);
 
     struct falcon_loader_config {
-        std::string fname;      // path to the model file or empty
+        char fname[256];      // path to the model file or empty
 
         int n_ctx = 0;          // context size
         int n_batch = 0;        // batch size
@@ -111,7 +111,7 @@ extern "C" {
         // context pointer passed to the progress callback
         void * progress_callback_user_data;
     };
-
+#if 0
     const static falcon_loader_config FALCON_LOADER_CONFIG_DEFAULT = {
         /* fname = */ "",
         /* n_ctx = */ 2048,
@@ -136,6 +136,9 @@ extern "C" {
         /* progress_callback = */ nullptr,
         /* progress_callback_user_data = */ nullptr
     };
+#endif
+    LLAMA_API struct falcon_loader_config falcon_loader_config_default();    
+
 
     struct falcon_evaluation_config {
         // mandatory configuration

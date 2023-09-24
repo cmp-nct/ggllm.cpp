@@ -126,7 +126,7 @@ typedef void * thread_ret_t;
 static pthread_mutex_t mutex;
 static pthread_cond_t cond_wakeup_party; // experimental addition for cmp-nct/ggllm.cpp 
 static pthread_cond_t cond_wakeup_master; // experimental addition for cmp-nct/ggllm.cpp 
-static volatile LONG shared_node_n; 
+// static volatile LONG shared_node_n; 
 
 // __FMA__ and __F16C__ are not defined in MSVC, however they are implied with AVX2/AVX512
 #if defined(_MSC_VER) && (defined(__AVX2__) || defined(__AVX512F__))

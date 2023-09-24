@@ -587,7 +587,8 @@ struct falcon_context {
     int32_t n_eval   = 0; // number of eval calls
     int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
 
-    falcon_loader_config loader_config = FALCON_LOADER_CONFIG_DEFAULT;
+    // falcon_loader_config loader_config = FALCON_LOADER_CONFIG_DEFAULT;
+    falcon_loader_config loader_config = falcon_loader_config_default();
     falcon_model &model;
     falcon_vocab &vocab;
 
@@ -1414,6 +1415,34 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
 
     return result;
 }
+struct falcon_loader_config falcon_loader_config_default()
+{
+    struct falcon_loader_config config;
+    config.fname[0] = '\0';
+    config.n_ctx = 2048;
+    config.n_batch = 512;
+    config.n_max_real_ctx = 2048;
+    config.seed = -1;
+    config.n_threads = 1;
+    config.use_mmap = true;
+    config.use_mlock = false;
+    config.memory_type = ggml_type::GGML_TYPE_F32;
+    config.secondary_cuda_offload = false;
+    config.use_cuda = false;
+    config.cublas_enabled = false;
+    config.n_gpu_layers = 0;
+    config.i_gpu_start = -1;
+    config.i_gpu_last = -1;
+    // /* tensor_split = */ {0},
+    config.embedding = false;
+    config.logits_all = false;
+    config.vocab_only = false;
+    config.verbose = false;
+    config.progress_callback = nullptr;
+    config.progress_callback_user_data = nullptr;
+    return config;
+}
+
 
 bool llama_mmap_supported() {
     return llama_mmap::SUPPORTED;
@@ -2542,7 +2571,7 @@ static bool falcon_eval_internal(
     ggml_set_current_layer_id(-1);
     lctx.use_buf(ctx0, 0);
     // ggml_cuda_set_scratch_size(0);
-    ggml_cuda_set_scratch_size((size_t)5*1024*1024*1024); // DEBUG
+    // ggml_cuda_set_scratch_size((size_t)5*1024*1024*1024); // DEBUG
 
     // used at the end to optionally extract the embeddings
     struct ggml_tensor * embeddings = NULL;
@@ -3974,7 +4003,7 @@ struct falcon_model * falcon_get_falcon_model(falcon_context * ctx)
 }
 
 struct falcon_context * falcon_init_from_file( struct falcon_loader_config &loader_config) {
-    const char * path_model = loader_config.fname.c_str();
+    const char * path_model = loader_config.fname;
     ggml_time_init();
 
     unsigned cur_percentage = 0;

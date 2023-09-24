@@ -1,5 +1,5 @@
 # Define the default target now so that it is always the first target
-BUILD_TARGETS = falcon_main falcon_quantize falcon_perplexity # main quantize quantize-stats perplexity embedding vdot train-text-from-scratch simple
+BUILD_TARGETS = ggfalcon falcon_quantize falcon_perplexity # main quantize quantize-stats perplexity embedding vdot train-text-from-scratch simple
 
 ifdef LLAMA_BUILD_SERVER
 	BUILD_TARGETS += server
@@ -288,10 +288,10 @@ simple: examples/simple/simple.cpp                            build-info.h ggml.
 quantize: examples/quantize/quantize.cpp                      build-info.h ggml.o llama.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 
-falcon_main: examples/falcon/falcon_main.cpp                                  build-info.h ggml.o libfalcon.o cmpnct_unicode.o falcon_common.o $(OBJS)
+ggfalcon: ggfalcon_main.cpp                                  build-info.h ggml.o libfalcon.o cmpnct_unicode.o falcon_common.o $(OBJS)
 	$(CXX) $(CXXFLAGS) $(filter-out %.h,$^) -o $@ $(LDFLAGS)
 	@echo
-	@echo '====  Run ./falcon_main -h for help.  ===='
+	@echo '====  Run ./ggfalcon -h for help.  ===='
 	@echo 'Read the readme file for important parameters and usage'
 	@echo
 

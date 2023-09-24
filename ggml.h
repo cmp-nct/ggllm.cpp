@@ -270,6 +270,9 @@ extern "C" {
     typedef volatile long atomic_int;
     typedef atomic_int atomic_bool;
     #endif
+    #ifndef LONG
+    typedef long LONG; 
+    #endif
 #endif
     // convert FP16 <-> FP32
     GGML_API float       ggml_fp16_to_fp32(ggml_fp16_t x);
