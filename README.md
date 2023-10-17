@@ -4,7 +4,7 @@ For growing examples and help check the new Wiki:
 https://github.com/cmp-nct/ggllm.cpp/wiki  
 
 **Features that differentiate from llama.cpp for now:**
-- Support for Falcon 7B and 40B models (inference, quantization and perplexity tool)
+- Support for Falcon 7B, 40B and 180B models (inference, quantization and perplexity tool)
 - Fully automated CUDA-GPU offloading based on available and total VRAM
 - Run any Falcon Model at up to 16k context without losing sanity
 - Current Falcon inference speed on consumer GPU: up to 54+ tokens/sec for 7B and 18-25 tokens/sec for 40B 3-6 bit, roughly 38/sec and 16/sec at at 1000 tokens generated
@@ -18,6 +18,7 @@ https://github.com/cmp-nct/ggllm.cpp/wiki
 - Optimized RAM and VRAM calculation with batch processing support
 - More command line selective features (like disabling GPUs, system prompt, stopwords)
 
+Use the gg_falcon branch for the latest version - roughly 30% faster with a lot of improvements but not completely ready
   
 **What is missing/being worked on:**
 - priority: performance
