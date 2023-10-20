@@ -6763,7 +6763,7 @@ static void ggml_cuda_op(char *op_name, const ggml_tensor * src0, const ggml_ten
     bool src0_needs_ddq = false;
 
     // choose requirement flags based on custom operations
-    if (!strcmp(op_name, "ggml_cuda_op_mul_mat_cublas"))
+    if (!strcmp(op_name, "ggml_cuda_mul_mat_cublas"))
     {
         src0_needs_f32=true; flatten_rows=false; src0_needs_f16=false; src0_needs_f8e4=false;
     } else
@@ -6777,7 +6777,7 @@ static void ggml_cuda_op(char *op_name, const ggml_tensor * src0, const ggml_ten
         min_capability_major = 8; min_capability_minor = 9;
         src0_needs_f32=false; flatten_rows=false; src0_needs_f16=false; src0_needs_f8e4=true;
     } else
-    if (!strcmp(op_name, "ggml_cuda_op_mul_mat_q"))
+    if (!strcmp(op_name, "ggml_cuda_mul_mat_q"))
     {
         min_capability_major = 6; min_capability_minor = 1;
         src0_needs_f32=false; flatten_rows=false; src0_needs_f16=false; src0_needs_f8e4=false;src0_needs_ddq=true;
