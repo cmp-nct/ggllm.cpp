@@ -121,7 +121,7 @@ The speed can be seen at 35 tokens/sec start gradually lowering over context - t
 #Choose a current distro:
 wsl.exe --list --online
 wsl --install -d distro
-# cmake 3.16 is required and the cuda toolset
+# cmake 3.17 is required and the cuda toolset
 # If you run an old distro you can upgrade (like apt update; apt upgrade; apt full-upgrade; pico /etc/apt/sources.list/; apt update; apt upgrade; apt full-upgrade; apt autoremove; lsb_release -a); then wsl --shutdown and restart it
 # install cuda WSL toolkit
 wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.0-1_all.deb
