@@ -5,7 +5,7 @@
 #
 #   python3 models/convert-h5-to-ggml.py
 #
-# This script is similar to "convert-pt-to-ggml.py"
+# This script is similar to "convert-pt-to-ggml.py" 
 #
 
 import io
